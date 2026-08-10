@@ -1,0 +1,155 @@
+{
+  "name": "aiops-sql-json",
+  "displayName": "AIOps SQL JSON",
+  "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
+  "version": "0.0.1",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "spark",
+    "sql",
+    "json",
+    "aiops"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "sql-json",
+        "aliases": [
+          "SQL JSON",
+          "sql-json"
+        ],
+        "extensions": [
+          ".sql.json"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "sql-json",
+        "scopeName": "source.sql-json",
+        "path": "./syntaxes/sql-json.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[sql-json]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "configuration": {
+      "title": "AIOps SQL JSON",
+      "properties": {
+        "aiopsSqlJson.keyPatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "*Sql"
+          ],
+          "scope": "resource",
+          "markdownDescription": "Case-sensitive glob patterns used to identify SQL properties. `*` matches any number of characters, `?` matches one character, and multiple patterns are combined with OR semantics."
+        },
+        "aiopsSqlJson.dialect": {
+          "type": "string",
+          "enum": [
+            "spark",
+            "hive",
+            "flink",
+            "mysql",
+            "postgresql",
+            "trino",
+            "impala",
+            "generic"
+          ],
+          "enumDescriptions": [
+            "Spark SQL",
+            "Hive SQL",
+            "Flink SQL",
+            "MySQL",
+            "PostgreSQL",
+            "Trino SQL",
+            "Impala SQL",
+            "Generic SQL"
+          ],
+          "default": "spark",
+          "scope": "resource",
+          "markdownDescription": "The SQL dialect used for both embedded SQL and regular `.sql` files."
+        },
+        "aiopsSqlJson.plainSql.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "markdownDescription": "Whether this extension provides syntax validation and semantic highlighting for regular `.sql` files."
+        },
+        "aiopsSqlJson.placeholderPatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "\\$\\{[^}]+\\}",
+            "\\$\\w+"
+          ],
+          "scope": "resource",
+          "markdownDescription": "Regular expression sources for template placeholders to mask with equal-length text before parsing. Expressions run in global Unicode mode; SQL validation is strict by default."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "check:types": "tsc --noEmit && tsc -p tsconfig.unit.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint .",
+    "check": "npm run check:types && npm run lint",
+    "test:unit": "vitest run",
+    "compile:test": "tsc -p tsconfig.test.json",
+    "pretest:integration": "npm run build && npm run compile:test",
+    "test:integration": "node out-test/integration/runTest.js",
+    "test": "npm run check && npm run test:unit && npm run test:integration",
+    "vscode:prepublish": "npm run build",
+    "package": "npm run test && vsce package --out aiops-sql-json.vsix"
+  },
+  "dependencies": {
+    "dt-sql-parser": "4.5.0",
+    "vscode-json-languageservice": "5.7.2",
+    "vscode-languageserver-textdocument": "1.0.12"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.19.9",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.39.0",
+    "@typescript-eslint/parser": "^8.39.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.28.2",
+    "eslint": "^9.32.0",
+    "mocha": "^11.7.1",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^3.2.4"
+  },
+  "publisher": "fredbill1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FredBill1/aiops-sql-json"
+  }
+}

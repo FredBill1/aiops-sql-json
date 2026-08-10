@@ -1,0 +1,33 @@
+import { describe, expect, it } from 'vitest';
+
+import { compilePlaceholderPatterns } from '../../src/patterns';
+import { analyzeSql, lineColumnToOffset, SQL_DIALECTS } from '../../src/sql';
+
+describe('SQL analysis', () => {
+  it.each(SQL_DIALECTS)('validates valid and invalid %s SQL', (dialect) => {
+    expect(analyzeSql('SELECT 1;', dialect, []).issues).toEqual([]);
+    expect(analyzeSql('SELEC 1;', dialect, []).issues.length).toBeGreaterThan(0);
+  });
+
+  it('classifies common SQL tokens', () => {
+    const analysis = analyzeSql("SELECT sum(price), 42, 'x' FROM sales -- note", 'spark', []);
+    expect(analysis.tokens.some((token) => token.type === 'keyword')).toBe(true);
+    expect(analysis.tokens.some((token) => token.type === 'function')).toBe(true);
+    expect(analysis.tokens.some((token) => token.type === 'number')).toBe(true);
+    expect(analysis.tokens.some((token) => token.type === 'string')).toBe(true);
+    expect(analysis.tokens.some((token) => token.type === 'comment')).toBe(true);
+  });
+
+  it('supports configurable placeholder masking', () => {
+    const placeholders = compilePlaceholderPatterns(['\\$\\{[^}]+\\}']).patterns;
+    const strict = analyzeSql('SELECT * FROM ${table};', 'spark', []);
+    const templated = analyzeSql('SELECT * FROM ${table};', 'spark', placeholders);
+    expect(strict.issues.length).toBeGreaterThan(0);
+    expect(templated.issues).toEqual([]);
+  });
+
+  it('converts one-based SQL positions into UTF-16 offsets', () => {
+    expect(lineColumnToOffset('a\r\nbc\nd', 2, 2)).toBe(4);
+    expect(lineColumnToOffset('a\r\nbc\nd', 3, 1)).toBe(6);
+  });
+});
