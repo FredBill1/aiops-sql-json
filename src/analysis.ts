@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { Diagnostic as LspDiagnostic } from 'vscode-json-languageservice';
 
 import type { ExtensionConfiguration } from './config';
 import { toVscodeDiagnostic, spanToRange } from './lspConverters';
@@ -40,22 +41,24 @@ export async function analyzeSqlJsonDocument(
         schemaRequest: 'warning',
       },
     )
-  ).map((diagnostic) => toVscodeDiagnostic(
+  ).filter((diagnostic) => !shouldSuppressJsonDiagnostic(projected, diagnostic)).map((diagnostic) => toVscodeDiagnostic(
     document,
     projected.textDocument,
     projected.projection,
     diagnostic,
   ));
 
-  for (const lineBreak of findIllegalStringLineBreaks(projected.projection, projected.jsonDocument, sqlRegions)) {
-    diagnostics.push(createDiagnostic(
-      document,
-      lineBreak,
-      'Physical line breaks are allowed only in string values whose property names match aiopsSqlJson.keyPatterns.',
-      vscode.DiagnosticSeverity.Error,
-      'JSON',
-      'illegal-multiline-string',
-    ));
+  if (!configuration.allowAllMultilineStrings) {
+    for (const lineBreak of findIllegalStringLineBreaks(projected.projection, projected.jsonDocument, sqlRegions)) {
+      diagnostics.push(createDiagnostic(
+        document,
+        lineBreak,
+        'Physical line breaks are allowed only in string values whose property names match aiopsSqlJson.keyPatterns.',
+        vscode.DiagnosticSeverity.Error,
+        'JSON',
+        'illegal-multiline-string',
+      ));
+    }
   }
 
   for (const lineBreak of findWordJoinLineBreaks(projected.projection, sqlRegions)) {
@@ -73,6 +76,35 @@ export async function analyzeSqlJsonDocument(
     appendSqlDiagnostics(document, projected, configuration, regionAnalysis, diagnostics);
   }
   return { diagnostics, regions };
+}
+
+function shouldSuppressJsonDiagnostic(
+  projected: ProjectedJsonDocument,
+  diagnostic: LspDiagnostic,
+): boolean {
+  if (!isSchemaDiagnostic(diagnostic)) {
+    return false;
+  }
+  const start = projected.textDocument.offsetAt(diagnostic.range.start);
+  const end = projected.textDocument.offsetAt(diagnostic.range.end);
+  if (projected.placeholders.some((placeholder) => overlaps(
+    start,
+    end,
+    placeholder.token.start,
+    placeholder.token.end,
+  ))) {
+    return true;
+  }
+  return projected.dynamicKeyObjectOffsets.has(start);
+}
+
+function isSchemaDiagnostic(diagnostic: LspDiagnostic): boolean {
+  return diagnostic.source !== 'json'
+    && (diagnostic.code === undefined || diagnostic.code === 1 || diagnostic.code === 2);
+}
+
+function overlaps(leftStart: number, leftEnd: number, rightStart: number, rightEnd: number): boolean {
+  return leftStart < rightEnd && rightStart < leftEnd;
 }
 
 export function analyzeSqlJsonRegions(

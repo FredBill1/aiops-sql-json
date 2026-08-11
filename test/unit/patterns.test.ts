@@ -27,6 +27,12 @@ describe('patterns', () => {
     expect(result.ranges).toHaveLength(2);
   });
 
+  it('uses a numeric mask when a placeholder is the integer part of a decimal', () => {
+    const patterns = compilePlaceholderPatterns(['\\$\\w+', '\\$\\{[^}]+\\}']).patterns;
+    expect(maskPlaceholders('value > $limit.0', patterns).text).toBe('value > 000000.0');
+    expect(maskPlaceholders('FROM ${table}', patterns).text).toBe('FROM xxxxxxxx');
+  });
+
   it('rejects invalid and empty-matching placeholder expressions', () => {
     const compiled = compilePlaceholderPatterns(['[', '.*']);
     expect(compiled.patterns).toHaveLength(0);

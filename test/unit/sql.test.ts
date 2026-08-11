@@ -26,6 +26,22 @@ describe('SQL analysis', () => {
     expect(templated.issues).toEqual([]);
   });
 
+  it('accepts a numeric placeholder followed by a decimal fraction', () => {
+    const placeholders = compilePlaceholderPatterns(['\\$\\w+']).patterns;
+    expect(analyzeSql('SELECT data FROM mytable WHERE value > $limit.0', 'spark', placeholders).issues).toEqual([]);
+  });
+
+  it('reports high-confidence structural errors missed by the Spark grammar', () => {
+    const issues = analyzeSql('select data from where and', 'spark', []).issues;
+    expect(issues.length).toBeGreaterThan(0);
+    expect(issues.some((issue) => issue.message.includes('relation after FROM'))).toBe(true);
+  });
+
+  it('does not confuse valid boolean and quoted-identifier syntax with structural gaps', () => {
+    const sql = 'SELECT * FROM `where` WHERE value BETWEEN 1 AND 2 AND enabled = true';
+    expect(analyzeSql(sql, 'spark', []).issues).toEqual([]);
+  });
+
   it('converts one-based SQL positions into UTF-16 offsets', () => {
     expect(lineColumnToOffset('a\r\nbc\nd', 2, 2)).toBe(4);
     expect(lineColumnToOffset('a\r\nbc\nd', 3, 1)).toBe(6);

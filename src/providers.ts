@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 
 import { getExtensionConfiguration } from './config';
+import { rangeContainsOffset } from './jsonProjection';
 import type { JsonServiceManager } from './jsonService';
 import { originalPositionToLsp, toVscodeCompletionItem, toVscodeHover } from './lspConverters';
 import { extractSqlRegions, findSqlRegionAtProjectedOffset } from './regions';
@@ -13,9 +14,12 @@ export class JsonCompletionProvider implements vscode.CompletionItemProvider {
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.CompletionList | undefined> {
-    const projected = this.jsonServices.createDocument(document);
     const configuration = getExtensionConfiguration(document.uri);
+    const projected = this.jsonServices.createDocument(document, configuration);
     const projectedOffset = projected.projection.toProjectedOffset(document.offsetAt(position));
+    if (projected.placeholders.some((placeholder) => rangeContainsOffset(placeholder.token, projectedOffset))) {
+      return undefined;
+    }
     const regions = extractSqlRegions(projected.projection, projected.jsonDocument, configuration.keyPatterns);
     if (findSqlRegionAtProjectedOffset(regions, projectedOffset)) {
       return undefined;
@@ -49,9 +53,12 @@ export class JsonHoverProvider implements vscode.HoverProvider {
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.Hover | undefined> {
-    const projected = this.jsonServices.createDocument(document);
     const configuration = getExtensionConfiguration(document.uri);
+    const projected = this.jsonServices.createDocument(document, configuration);
     const projectedOffset = projected.projection.toProjectedOffset(document.offsetAt(position));
+    if (projected.placeholders.some((placeholder) => rangeContainsOffset(placeholder.token, projectedOffset))) {
+      return undefined;
+    }
     const regions = extractSqlRegions(projected.projection, projected.jsonDocument, configuration.keyPatterns);
     if (findSqlRegionAtProjectedOffset(regions, projectedOffset)) {
       return undefined;

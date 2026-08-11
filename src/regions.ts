@@ -106,6 +106,22 @@ export function mapDecodedRange(decoded: DecodedSqlText, start: number, end: num
   return merged;
 }
 
+export function decodedOffsetAtOriginalOffset(decoded: DecodedSqlText, originalOffset: number): number {
+  for (let index = 0; index < decoded.spans.length; index += 1) {
+    const span = decoded.spans[index];
+    if (!span) {
+      continue;
+    }
+    if (originalOffset <= span.start) {
+      return index;
+    }
+    if (originalOffset < span.end) {
+      return index + 1;
+    }
+  }
+  return decoded.spans.length;
+}
+
 function decodeJsonString(projection: PlatformProjection, node: StringASTNode): DecodedSqlText {
   const raw = projection.text.slice(node.offset, node.offset + node.length);
   const output: string[] = [];

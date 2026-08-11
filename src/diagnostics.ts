@@ -77,7 +77,7 @@ export class DiagnosticController implements vscode.Disposable {
 
     let diagnostics: vscode.Diagnostic[];
     if (document.languageId === 'sql-json') {
-      const projected = this.jsonServices.createDocument(document);
+      const projected = this.jsonServices.createDocument(document, configuration);
       diagnostics = (await analyzeSqlJsonDocument(document, projected, configuration)).diagnostics;
     } else if (document.languageId === 'sql' && configuration.plainSqlEnabled) {
       diagnostics = analyzePlainSqlDocument(document, configuration).diagnostics;

@@ -2,7 +2,8 @@
   "name": "aiops-sql-json",
   "displayName": "AIOps SQL JSON",
   "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
-  "version": "0.0.1",
+  "version": "0.0.2",
+  "icon": "images/icon.png",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
@@ -37,7 +38,14 @@
         "extensions": [
           ".sql.json"
         ],
-        "configuration": "./language-configuration.json"
+        "filenamePatterns": [
+          "*.sql.json"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./images/sql-json.svg",
+          "dark": "./images/sql-json.svg"
+        }
       }
     ],
     "grammars": [
@@ -48,10 +56,51 @@
       }
     ],
     "configurationDefaults": {
+      "files.associations": {
+        "*.sql.json": "sql-json"
+      },
       "[sql-json]": {
         "editor.semanticHighlighting.enabled": true
       }
     },
+    "commands": [
+      {
+        "command": "aiopsSqlJson.jumpToMatchingSqlBracket",
+        "title": "AIOps SQL JSON: Go to Matching SQL Bracket"
+      },
+      {
+        "command": "aiopsSqlJson.toggleSqlLineComment",
+        "title": "AIOps SQL JSON: Toggle Safe SQL Comment"
+      },
+      {
+        "command": "aiopsSqlJson.toggleSqlBlockComment",
+        "title": "AIOps SQL JSON: Toggle Safe SQL Block Comment"
+      }
+    ],
+    "keybindings": [
+      {
+        "key": "backspace",
+        "command": "aiopsSqlJson.deleteLeft",
+        "when": "editorTextFocus && editorLangId == sql-json && !editorReadonly"
+      },
+      {
+        "key": "ctrl+shift+\\",
+        "mac": "cmd+shift+\\",
+        "command": "aiopsSqlJson.jumpToMatchingSqlBracket",
+        "when": "editorTextFocus && editorLangId == sql-json && !editorReadonly"
+      },
+      {
+        "key": "ctrl+/",
+        "mac": "cmd+/",
+        "command": "aiopsSqlJson.toggleSqlLineComment",
+        "when": "editorTextFocus && editorLangId == sql-json && !editorReadonly"
+      },
+      {
+        "key": "shift+alt+a",
+        "command": "aiopsSqlJson.toggleSqlBlockComment",
+        "when": "editorTextFocus && editorLangId == sql-json && !editorReadonly"
+      }
+    ],
     "configuration": {
       "title": "AIOps SQL JSON",
       "properties": {
@@ -65,6 +114,12 @@
           ],
           "scope": "resource",
           "markdownDescription": "Case-sensitive glob patterns used to identify SQL properties. `*` matches any number of characters, `?` matches one character, and multiple patterns are combined with OR semantics."
+        },
+        "aiopsSqlJson.multilineStrings.allowAll": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "markdownDescription": "Whether physical line breaks are allowed in every JSON string. When disabled, only direct string values whose property names match `aiopsSqlJson.keyPatterns` may span physical lines."
         },
         "aiopsSqlJson.dialect": {
           "type": "string",
@@ -109,6 +164,12 @@
           ],
           "scope": "resource",
           "markdownDescription": "Regular expression sources for template placeholders to mask with equal-length text before parsing. Expressions run in global Unicode mode; SQL validation is strict by default."
+        },
+        "aiopsSqlJson.placeholders.allowEverywhere": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "markdownDescription": "Whether placeholder patterns may appear in strings, unquoted property keys, and bare JSON tokens throughout `.sql.json` files. When disabled, placeholders are masked only while validating recognized SQL strings and regular `.sql` files."
         }
       }
     }

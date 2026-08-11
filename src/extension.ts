@@ -1,6 +1,10 @@
 import * as vscode from 'vscode';
 
 import { DiagnosticController } from './diagnostics';
+import { SqlBracketDecorationController } from './bracketDecorations';
+import { SqlEditingController } from './editing';
+import { SqlEditingCommands } from './editingCommands';
+import { SqlEditingContextService } from './editingContext';
 import { JsonServiceManager } from './jsonService';
 import { JsonCompletionProvider, JsonHoverProvider } from './providers';
 import { SEMANTIC_TOKEN_LEGEND, SqlSemanticTokensProvider } from './semanticTokens';
@@ -19,12 +23,19 @@ const SQL_SELECTOR: vscode.DocumentFilter[] = [
 
 export function activate(context: vscode.ExtensionContext): void {
   const jsonServices = new JsonServiceManager();
+  const editingContexts = new SqlEditingContextService(jsonServices);
   const semanticTokens = new SqlSemanticTokensProvider(jsonServices);
   const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh());
+  const editing = new SqlEditingController(editingContexts);
+  const bracketDecorations = new SqlBracketDecorationController(editingContexts);
+  const editingCommands = new SqlEditingCommands(editingContexts);
 
   context.subscriptions.push(
     semanticTokens,
     diagnostics,
+    editing,
+    bracketDecorations,
+    editingCommands,
     vscode.languages.registerDocumentSemanticTokensProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
       semanticTokens,

@@ -8,6 +8,8 @@ export interface MaskedSql {
   ranges: Array<{ start: number; end: number }>;
 }
 
+export type PlaceholderRange = { start: number; end: number };
+
 export function compileGlob(pattern: string): RegExp {
   let source = '^';
   for (const character of pattern) {
@@ -51,7 +53,21 @@ export function compilePlaceholderPatterns(sources: readonly string[]): Compiled
 }
 
 export function maskPlaceholders(text: string, patterns: readonly RegExp[]): MaskedSql {
-  const ranges: Array<{ start: number; end: number }> = [];
+  const mergedRanges = findPlaceholderRanges(text, patterns);
+  const characters = text.split('');
+  for (const range of mergedRanges) {
+    const replacement = /^\.\d/u.test(text.slice(range.end)) ? '0' : 'x';
+    for (let index = range.start; index < range.end; index += 1) {
+      if (characters[index] !== '\r' && characters[index] !== '\n') {
+        characters[index] = replacement;
+      }
+    }
+  }
+  return { text: characters.join(''), ranges: mergedRanges };
+}
+
+export function findPlaceholderRanges(text: string, patterns: readonly RegExp[]): PlaceholderRange[] {
+  const ranges: PlaceholderRange[] = [];
   for (const pattern of patterns) {
     pattern.lastIndex = 0;
     for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
@@ -60,17 +76,7 @@ export function maskPlaceholders(text: string, patterns: readonly RegExp[]): Mas
       }
     }
   }
-
-  const mergedRanges = mergeRanges(ranges);
-  const characters = text.split('');
-  for (const range of mergedRanges) {
-    for (let index = range.start; index < range.end; index += 1) {
-      if (characters[index] !== '\r' && characters[index] !== '\n') {
-        characters[index] = 'x';
-      }
-    }
-  }
-  return { text: characters.join(''), ranges: mergedRanges };
+  return mergeRanges(ranges);
 }
 
 function mergeRanges(ranges: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> {

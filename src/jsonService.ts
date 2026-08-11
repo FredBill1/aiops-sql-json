@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import {
   getLanguageService,
+  type ASTNode,
   type JSONDocument,
   type JSONSchema,
   type LanguageService,
@@ -8,6 +9,11 @@ import {
 } from 'vscode-json-languageservice';
 import { TextDocument as LspTextDocument } from 'vscode-languageserver-textdocument';
 
+import type { ExtensionConfiguration } from './config';
+import {
+  projectJsonPlaceholders,
+  type JsonPlaceholderOccurrence,
+} from './jsonProjection';
 import { PlatformProjection } from './projection';
 
 interface JsonSchemaSetting {
@@ -26,25 +32,36 @@ export interface ProjectedJsonDocument {
   textDocument: LspTextDocument;
   jsonDocument: JSONDocument;
   service: LanguageService;
+  placeholders: readonly JsonPlaceholderOccurrence[];
+  dynamicKeyObjectOffsets: ReadonlySet<number>;
 }
 
 export class JsonServiceManager {
   private readonly services = new Map<string, LanguageService>();
 
-  createDocument(document: vscode.TextDocument): ProjectedJsonDocument {
+  createDocument(
+    document: vscode.TextDocument,
+    configuration: ExtensionConfiguration,
+  ): ProjectedJsonDocument {
     const projection = new PlatformProjection(document.getText());
+    const placeholders = configuration.allowPlaceholdersEverywhere
+      ? projectJsonPlaceholders(projection.text, configuration.placeholderPatterns)
+      : { text: projection.text, occurrences: [] };
     const textDocument = LspTextDocument.create(
       document.uri.toString(true),
       'json',
       document.version,
-      projection.text,
+      placeholders.text,
     );
     const service = this.getService(document.uri);
+    const jsonDocument = service.parseJSONDocument(textDocument);
     return {
       projection,
       textDocument,
-      jsonDocument: service.parseJSONDocument(textDocument),
+      jsonDocument,
       service,
+      placeholders: placeholders.occurrences,
+      dynamicKeyObjectOffsets: findDynamicKeyObjectOffsets(jsonDocument, placeholders.occurrences),
     };
   }
 
@@ -80,6 +97,43 @@ export class JsonServiceManager {
     this.services.set(cacheKey, service);
     return service;
   }
+}
+
+function findDynamicKeyObjectOffsets(
+  jsonDocument: JSONDocument,
+  placeholders: readonly JsonPlaceholderOccurrence[],
+): ReadonlySet<number> {
+  const offsets = new Set<number>();
+  walkAst(jsonDocument.root, (node) => {
+    if (node.type !== 'property' || node.parent?.type !== 'object') {
+      return;
+    }
+    const keyStart = node.keyNode.offset;
+    const keyEnd = keyStart + node.keyNode.length;
+    const isDynamic = placeholders.some((placeholder) => (
+      placeholder.kind === 'key'
+        ? overlaps(keyStart, keyEnd, placeholder.token.start, placeholder.token.end)
+        : overlaps(keyStart, keyEnd, placeholder.match.start, placeholder.match.end)
+    ));
+    if (isDynamic) {
+      offsets.add(node.parent.offset);
+    }
+  });
+  return offsets;
+}
+
+function walkAst(node: ASTNode | undefined, visitor: (node: ASTNode) => void): void {
+  if (!node) {
+    return;
+  }
+  visitor(node);
+  for (const child of node.children ?? []) {
+    walkAst(child, visitor);
+  }
+}
+
+function overlaps(leftStart: number, leftEnd: number, rightStart: number, rightEnd: number): boolean {
+  return leftStart < rightEnd && rightStart < leftEnd;
 }
 
 function collectSchemaConfigurations(resource: vscode.Uri): SchemaConfiguration[] {

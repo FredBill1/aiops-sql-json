@@ -41,7 +41,7 @@ export class SqlSemanticTokensProvider implements vscode.DocumentSemanticTokensP
     const pending: PendingToken[] = [];
 
     if (document.languageId === 'sql-json') {
-      const projected = this.jsonServices.createDocument(document);
+      const projected = this.jsonServices.createDocument(document, configuration);
       const regions = analyzeSqlJsonRegions(projected, configuration);
       if (cancellation.isCancellationRequested) {
         return new vscode.SemanticTokens(new Uint32Array());

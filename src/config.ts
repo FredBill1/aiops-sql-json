@@ -6,11 +6,13 @@ import { isSqlDialect, type SqlDialect } from './sql';
 export interface ExtensionConfiguration {
   keyPatternSources: string[];
   keyPatterns: RegExp[];
+  allowAllMultilineStrings: boolean;
   dialect: SqlDialect;
   plainSqlEnabled: boolean;
   placeholderSources: string[];
   placeholderPatterns: RegExp[];
   placeholderIssues: string[];
+  allowPlaceholdersEverywhere: boolean;
 }
 
 export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfiguration {
@@ -22,20 +24,24 @@ export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfig
   return {
     keyPatternSources,
     keyPatterns: compileGlobs(keyPatternSources),
+    allowAllMultilineStrings: configuration.get<boolean>('multilineStrings.allowAll', true),
     dialect: isSqlDialect(configuredDialect) ? configuredDialect : 'spark',
     plainSqlEnabled: configuration.get<boolean>('plainSql.enabled', true),
     placeholderSources,
     placeholderPatterns: placeholders.patterns,
     placeholderIssues: placeholders.issues,
+    allowPlaceholdersEverywhere: configuration.get<boolean>('placeholders.allowEverywhere', true),
   };
 }
 
 export function configurationSignature(configuration: ExtensionConfiguration): string {
   return JSON.stringify({
     keys: configuration.keyPatternSources,
+    multilineStrings: configuration.allowAllMultilineStrings,
     dialect: configuration.dialect,
     plainSql: configuration.plainSqlEnabled,
     placeholders: configuration.placeholderSources,
+    placeholdersEverywhere: configuration.allowPlaceholdersEverywhere,
   });
 }
 

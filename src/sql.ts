@@ -79,7 +79,11 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
     };
   }
 
-  const issues = deduplicateIssues(errors.map((error) => parseErrorToIssue(text, error)));
+  const parserIssues = errors.map((error) => parseErrorToIssue(text, error));
+  const structuralIssues = findStructuralIssues(antlrTokens).filter((issue) => (
+    !parserIssues.some((parserIssue) => rangesOverlap(issue, parserIssue))
+  ));
+  const issues = deduplicateIssues([...parserIssues, ...structuralIssues]);
   const tokens = antlrTokens.flatMap((token, index) => {
     if (token.start < 0 || token.stop < token.start) {
       return [];
@@ -90,6 +94,79 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
   });
 
   return { issues, tokens };
+}
+
+function findStructuralIssues(tokens: readonly Token[]): SqlIssue[] {
+  const significant = tokens.filter((token) => token.channel === 0 && token.start >= 0 && token.stop >= token.start);
+  const issues: SqlIssue[] = [];
+  const seen = new Set<string>();
+  const relationBoundaries = new Set([
+    'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
+    'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', 'AND', 'OR', ';', ')',
+  ]);
+  const expressionBoundaries = new Set([
+    'AND', 'OR', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT',
+    'EXCEPT', 'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', ';', ')',
+  ]);
+  const clauseBoundaries = new Set([
+    'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
+    'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', ';', ')',
+  ]);
+
+  for (let index = 0; index < significant.length; index += 1) {
+    const token = significant[index]!;
+    const current = structuralTokenName(token);
+    const nextToken = significant[index + 1];
+    const next = nextToken ? structuralTokenName(nextToken) : undefined;
+    const previousToken = significant[index - 1];
+    const previous = previousToken ? structuralTokenName(previousToken) : undefined;
+
+    if (current === 'SELECT' && next === 'FROM' && nextToken) {
+      appendStructuralIssue(issues, seen, nextToken, 'Expected a select expression before FROM.');
+    }
+    if ((current === 'FROM' || current === 'JOIN') && (!next || relationBoundaries.has(next))) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, `Expected a relation after ${current}.`);
+    }
+    if ((current === 'WHERE' || current === 'HAVING' || current === 'ON' || current === 'QUALIFY')
+      && (!next || expressionBoundaries.has(next))) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, `Expected an expression after ${current}.`);
+    }
+    if ((current === 'AND' || current === 'OR')
+      && (!next || clauseBoundaries.has(next) || previous === undefined
+        || previous === '(' || previous === ',' || previous === 'AND' || previous === 'OR'
+        || previous === ';'
+        || previous === 'WHERE' || previous === 'HAVING' || previous === 'ON' || previous === 'QUALIFY')) {
+      appendStructuralIssue(issues, seen, token, `Boolean operator ${current} is missing an operand.`);
+    }
+  }
+  return issues;
+}
+
+function structuralTokenName(token: Token): string {
+  const symbolicName = getSymbolicName(token).toUpperCase();
+  if (symbolicName.startsWith('KW_')) {
+    return symbolicName.slice(3);
+  }
+  return (token.text ?? '').toUpperCase();
+}
+
+function appendStructuralIssue(
+  issues: SqlIssue[],
+  seen: Set<string>,
+  token: Token,
+  message: string,
+): void {
+  const start = token.start;
+  const end = token.stop + 1;
+  const key = `${start}:${end}`;
+  if (!seen.has(key)) {
+    seen.add(key);
+    issues.push({ start, end, message });
+  }
+}
+
+function rangesOverlap(left: SqlIssue, right: SqlIssue): boolean {
+  return left.start < right.end && right.start < left.end;
 }
 
 export function lineColumnToOffset(text: string, oneBasedLine: number, oneBasedColumn: number): number {
