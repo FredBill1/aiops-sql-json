@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.3
+
 - Fixed regular `.sql` files not activating diagnostics when opened before any `sql-json` document.
 - Added context-aware keyword, built-in function, UDF, table, and field completion for all eight SQL dialects in `.sql` and recognized `.sql.json` strings.
 - Added optional, hot-reloaded offline Schema indexing from configurable DDL globs, with strict table, field, function, scope, projection-count, and inferable type diagnostics.
