@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed regular `.sql` files not activating diagnostics when opened before any `sql-json` document.
+
 ## 0.0.2
 
 - Made `*.sql.json` default to the `sql-json` language without workspace configuration.

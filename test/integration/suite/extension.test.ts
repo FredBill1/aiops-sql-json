@@ -14,7 +14,6 @@ suite('AIOps SQL JSON extension', () => {
     const discoveredExtension = vscode.extensions.getExtension('fredbill1.aiops-sql-json');
     assert.ok(discoveredExtension, 'Extension must be discoverable in the extension host.');
     extension = discoveredExtension;
-    await extension.activate();
   });
 
   suiteTeardown(async () => {
@@ -25,6 +24,20 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('keyPatterns', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('autoClosingBrackets', undefined, vscode.ConfigurationTarget.Global);
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  test('activates when a regular SQL file is opened first', async () => {
+    assert.equal(extension.isActive, false, 'The extension must start inactive for this regression test.');
+
+    const document = await openFile('cold-start.sql', 'SELEC 1;');
+    assert.equal(document.languageId, 'sql');
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) => items.some((diagnostic) => diagnostic.source?.includes('SQL')),
+    );
+    assert.equal(extension.isActive, true, 'Opening an SQL document should activate the extension.');
+    assert.ok(diagnostics.some((diagnostic) => diagnostic.source?.includes('SQL')));
   });
 
   test('associates .sql.json and accepts an indented multiline SQL string', async () => {

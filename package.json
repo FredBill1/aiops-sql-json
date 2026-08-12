@@ -19,6 +19,9 @@
     "aiops"
   ],
   "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:sql"
+  ],
   "extensionKind": [
     "workspace"
   ],
