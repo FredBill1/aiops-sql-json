@@ -108,11 +108,12 @@ function buildCompletionItems(
   );
   const catalog = getSqlCatalog(configuration.dialect);
   const syntaxTypes = new Set(suggestions?.syntax.map((item) => item.syntaxContextType.toString()) ?? []);
-  const expressionContext = syntaxTypes.has('column') || syntaxTypes.has('function') || looksLikeExpressionContext(
-    context.sqlText,
-    context.sqlOffset,
+  const relationContext = syntaxTypes.has('table') || syntaxTypes.has('view');
+  const expressionContext = !relationContext && (
+    syntaxTypes.has('column')
+    || syntaxTypes.has('function')
+    || looksLikeExpressionContext(context.sqlText, context.sqlOffset)
   );
-  const tableContext = syntaxTypes.has('table') || syntaxTypes.has('view');
   const items: vscode.CompletionItem[] = [];
   const contextualKeywords = suggestions?.keywords ?? [];
   const keywordCandidates = prefix.length > 0
@@ -149,7 +150,7 @@ function buildCompletionItems(
   }
 
   if (configuration.schemaValidationEnabled) {
-    appendSchemaItems(items, context, configuration, snapshot, expressionContext, tableContext, prefix, range);
+    appendSchemaItems(items, context, configuration, snapshot, expressionContext, relationContext, prefix, range);
   } else if (expressionContext) {
     for (const field of context.allFieldNames) {
       if (!matchesPrefix(field, prefix)) continue;
@@ -170,7 +171,7 @@ function appendSchemaItems(
   configuration: ReturnType<typeof getExtensionConfiguration>,
   snapshot: SchemaSnapshot,
   expressionContext: boolean,
-  tableContext: boolean,
+  relationContext: boolean,
   prefix: string,
   range: vscode.Range,
 ): void {
@@ -182,7 +183,7 @@ function appendSchemaItems(
     snapshot,
     configuration.udfs,
   );
-  if (tableContext) {
+  if (relationContext) {
     for (const table of effectiveSnapshot.tables) {
       if (!matchesPrefix(table.name, prefix)) continue;
       const item = new vscode.CompletionItem(table.name, vscode.CompletionItemKind.Class);
@@ -208,6 +209,7 @@ function appendSchemaItems(
   const relations = qualifier
     ? scope.relations.filter((relation) => relationMatches(relation, qualifier))
     : scope.relations;
+  const offeredFieldNames = new Set<string>();
   const counts = new Map<string, number>();
   for (const relation of relations) {
     for (const column of relation.columns) {
@@ -220,6 +222,7 @@ function appendSchemaItems(
       const ambiguous = !qualifier && (counts.get(column.normalizedName) ?? 0) > 1;
       const relationPrefix = relation.aliases[0]?.split('.').at(-1) ?? relation.name;
       const insertText = ambiguous ? `${relationPrefix}.${column.name}` : column.name;
+      offeredFieldNames.add(column.name.toLocaleLowerCase());
       const item = new vscode.CompletionItem(
         ambiguous ? `${relationPrefix}.${column.name}` : column.name,
         vscode.CompletionItemKind.Field,
@@ -227,9 +230,39 @@ function appendSchemaItems(
       item.range = range;
       item.insertText = insertText;
       item.detail = column.type ? `${relation.name}.${column.name}: ${column.type}` : `${relation.name}.${column.name}`;
-      item.sortText = `0-${column.name}`;
+      item.sortText = `0-0-${column.name}`;
       items.push(item);
     }
+  }
+  const needsFallbackFields = !qualifier && (
+    scope.relations.length === 0 || scope.relations.some((relation) => relation.unresolved)
+  );
+  if (!needsFallbackFields) {
+    return;
+  }
+  for (const table of effectiveSnapshot.tables) {
+    for (const column of table.columns) {
+      const normalized = column.name.toLocaleLowerCase();
+      if (offeredFieldNames.has(normalized) || !matchesPrefix(column.name, prefix)) continue;
+      offeredFieldNames.add(normalized);
+      const item = new vscode.CompletionItem(column.name, vscode.CompletionItemKind.Field);
+      item.range = range;
+      item.insertText = column.name;
+      item.detail = column.type ? `${table.name}.${column.name}: ${column.type}` : `${table.name}.${column.name}`;
+      item.sortText = `0-1-${column.name}`;
+      items.push(item);
+    }
+  }
+  for (const field of context.allFieldNames) {
+    const normalized = field.toLocaleLowerCase();
+    if (offeredFieldNames.has(normalized) || !matchesPrefix(field, prefix)) continue;
+    offeredFieldNames.add(normalized);
+    const item = new vscode.CompletionItem(field, vscode.CompletionItemKind.Field);
+    item.range = range;
+    item.insertText = field;
+    item.detail = 'Field seen in this file';
+    item.sortText = `0-2-${field}`;
+    items.push(item);
   }
 }
 

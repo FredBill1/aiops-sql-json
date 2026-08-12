@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.0.4
+
+- Added DDL and current-file field fallback while a SELECT source is absent or unresolved.
+- Removed scalar functions, UDFs, and fields from table/view completion positions such as `FROM` and `JOIN`.
+
 ## 0.0.3
 
 - Fixed regular `.sql` files not activating diagnostics when opened before any `sql-json` document.

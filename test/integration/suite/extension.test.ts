@@ -25,6 +25,7 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaValidation.enabled', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaFiles', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('udfs', undefined, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update('dialect', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('autoClosingBrackets', undefined, vscode.ConfigurationTarget.Global);
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   });
@@ -547,6 +548,177 @@ suite('AIOps SQL JSON extension', () => {
     );
   });
 
+  test('falls back to known fields and keeps relation completions free of functions', async () => {
+    const schemaDirectory = path.join(temporaryDirectory, 'completion-schemas');
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(
+      path.join(schemaDirectory, 'catalog.sql'),
+      `CREATE TABLE sales.orders (OrderId INTEGER, Amount INTEGER);
+CREATE TABLE sales.customers (CustomerName VARCHAR(32));
+CREATE TABLE archive.orders (ArchiveCode INTEGER);
+CREATE VIEW sales.order_ids AS SELECT OrderId FROM sales.orders;`,
+      'utf8',
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      ['completion-schemas/*.sql'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'udfs',
+      ['score_udf'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+
+    const noSourceDocument = await openFile(
+      'completion-schema-fallback.sql',
+      'SELECT FileOnlySymbol FROM missing_history;\nSELECT ',
+    );
+    const noSourceItems = await completionItemsAtEnd(noSourceDocument);
+    assert.ok(noSourceItems.some((item) => completionLabel(item) === 'OrderId'));
+    assert.ok(noSourceItems.some((item) => completionLabel(item) === 'CustomerName'));
+    assert.ok(noSourceItems.some((item) => completionLabel(item) === 'FileOnlySymbol'));
+
+    const unknownDocument = await openFile('completion-unknown-source.sql', 'SELECT  FROM missing_source');
+    const unknownItems = await completionItemsAtOffset(unknownDocument, 'SELECT '.length);
+    assert.ok(unknownItems.some((item) => completionLabel(item) === 'CustomerName'));
+
+    const mixedDocument = await openFile(
+      'completion-mixed-sources.sql',
+      'SELECT  FROM sales.orders o JOIN missing_source m ON true',
+    );
+    const mixedItems = await completionItemsAtOffset(mixedDocument, 'SELECT '.length);
+    assert.ok(mixedItems.some((item) => completionLabel(item) === 'CustomerName'));
+
+    const ambiguousDocument = await openFile('completion-ambiguous-source.sql', 'SELECT  FROM orders');
+    const ambiguousItems = await completionItemsAtOffset(ambiguousDocument, 'SELECT '.length);
+    assert.ok(ambiguousItems.some((item) => completionLabel(item) === 'ArchiveCode'));
+    assert.ok(ambiguousItems.some((item) => completionLabel(item) === 'CustomerName'));
+
+    const resolvedDocument = await openFile('completion-resolved-source.sql', 'SELECT  FROM sales.orders o');
+    const resolvedItems = await completionItemsAtOffset(resolvedDocument, 'SELECT '.length);
+    assert.ok(resolvedItems.some((item) => completionLabel(item) === 'OrderId'));
+    assert.ok(!resolvedItems.some((item) => completionLabel(item) === 'CustomerName'));
+
+    const qualifierDocument = await openFile(
+      'completion-unknown-qualifier.sql',
+      'SELECT bad_alias. FROM missing_source',
+    );
+    const qualifierOffset = qualifierDocument.getText().indexOf('.') + 1;
+    const qualifierItems = await completionItemsAtOffset(qualifierDocument, qualifierOffset);
+    assert.ok(!qualifierItems.some((item) => item.kind === vscode.CompletionItemKind.Field));
+
+    const jsonDocument = await openFile(
+      'completion-schema-fallback.sql.json',
+      '{"firstSql":"SELECT JsonOnly FROM missing","secondSql":"SELECT "}',
+    );
+    const jsonOffset = jsonDocument.getText().lastIndexOf('SELECT ') + 'SELECT '.length;
+    const jsonItems = await completionItemsAtOffset(jsonDocument, jsonOffset);
+    assert.ok(jsonItems.some((item) => completionLabel(item) === 'JsonOnly'));
+    assert.ok(jsonItems.some((item) => completionLabel(item) === 'CustomerName'));
+
+    const localDocument = await openFile(
+      'completion-local-fallback.sql',
+      'CREATE TABLE local_active (LocalActive INTEGER); SELECT ',
+    );
+    const localItems = await completionItemsAtEnd(localDocument);
+    const localField = localItems.find((item) => completionLabel(item) === 'LocalActive');
+    assert.ok(localField);
+    assert.ok(String(localField.detail).includes('local_active.LocalActive'));
+
+    const droppedDocument = await openFile(
+      'completion-dropped-fallback.sql',
+      'CREATE TABLE local_dropped (DroppedOnly INTEGER); DROP TABLE local_dropped; SELECT ',
+    );
+    const droppedItems = await completionItemsAtEnd(droppedDocument);
+    assert.ok(!droppedItems.some((item) => (
+      completionLabel(item) === 'DroppedOnly' && String(item.detail).includes('local_dropped.DroppedOnly')
+    )));
+
+    const futureDocument = await openFile(
+      'completion-future-fallback.sql',
+      'SELECT ; CREATE TABLE future_table (FutureOnly INTEGER);',
+    );
+    const futureItems = await completionItemsAtOffset(futureDocument, 'SELECT '.length);
+    assert.ok(!futureItems.some((item) => (
+      completionLabel(item) === 'FutureOnly' && String(item.detail).includes('future_table.FutureOnly')
+    )));
+
+    const fromDocument = await openFile('completion-relation-from.sql', 'SELECT * FROM ');
+    const joinDocument = await openFile(
+      'completion-relation-join.sql',
+      'SELECT * FROM sales.orders o JOIN ',
+    );
+    const prefixDocument = await openFile('completion-relation-prefix.sql', 'SELECT * FROM sal');
+    for (const [contextName, document] of [
+      ['FROM', fromDocument],
+      ['JOIN', joinDocument],
+      ['prefix', prefixDocument],
+    ] as const) {
+      const items = await completionItemsAtEnd(document);
+      assert.ok(
+        items.some((item) => completionLabel(item) === 'sales.orders'),
+        `Expected a table in Spark ${contextName} completion.`,
+      );
+      assert.ok(!items.some((item) => item.kind === vscode.CompletionItemKind.Function));
+      assert.ok(!items.some((item) => item.kind === vscode.CompletionItemKind.Field));
+    }
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      false,
+      vscode.ConfigurationTarget.Global,
+    );
+    const dialects = ['spark', 'hive', 'flink', 'mysql', 'postgresql', 'trino', 'impala', 'generic'];
+    for (const dialect of dialects) {
+      await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+        'dialect',
+        dialect,
+        vscode.ConfigurationTarget.Global,
+      );
+      for (const [contextName, document] of [
+        ['FROM', fromDocument],
+        ['JOIN', joinDocument],
+        ['prefix', prefixDocument],
+      ] as const) {
+        const items = await completionItemsAtEnd(document);
+        assert.ok(
+          !items.some((item) => item.kind === vscode.CompletionItemKind.Function),
+          `Unexpected function in ${dialect} ${contextName} completion.`,
+        );
+        assert.ok(
+          !items.some((item) => item.kind === vscode.CompletionItemKind.Field),
+          `Unexpected field in ${dialect} ${contextName} completion.`,
+        );
+      }
+    }
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'dialect',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'udfs',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
   test('applies local DDL in order without requiring global schema files', async () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
       'schemaFiles',
@@ -719,6 +891,18 @@ SELECT id, amount FROM local_orders;`,
 
   async function completionItemsAtEnd(document: vscode.TextDocument): Promise<readonly vscode.CompletionItem[]> {
     return (await completionListAtEnd(document)).items;
+  }
+
+  async function completionItemsAtOffset(
+    document: vscode.TextDocument,
+    offset: number,
+  ): Promise<readonly vscode.CompletionItem[]> {
+    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      document.positionAt(offset),
+    );
+    return result.items;
   }
 
   async function completionListAtEnd(document: vscode.TextDocument): Promise<vscode.CompletionList> {
