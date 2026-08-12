@@ -2,9 +2,6 @@
 
 ## Unreleased
 
-- Added dynamic code-like pair editing and JSON-safe double-quote insertion inside SQL strings selected by `aiopsSqlJson.keyPatterns`.
-- Added theme-aware SQL bracket pair colorization, matching-bracket navigation, and safe block-comment shortcuts.
-
 ## 0.0.2
 
 - Made `*.sql.json` default to the `sql-json` language without workspace configuration.
@@ -12,6 +9,8 @@
 - Added same-length JSON placeholder projection with focused JSON Schema diagnostic suppression.
 - Added numeric masking for placeholders followed by decimal fractions.
 - Added high-confidence structural SQL diagnostics for missing relations, expressions, and boolean operands.
+- Added dynamic code-like pair editing and JSON-safe double-quote insertion inside SQL strings selected by `aiopsSqlJson.keyPatterns`.
+- Added theme-aware SQL bracket pair colorization, matching-bracket navigation, and safe block-comment shortcuts.
 
 ## 0.0.1
 
