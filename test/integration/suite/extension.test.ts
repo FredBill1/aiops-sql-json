@@ -22,6 +22,9 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('multilineStrings.allowAll', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('placeholders.allowEverywhere', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('keyPatterns', undefined, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaValidation.enabled', undefined, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaFiles', undefined, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update('udfs', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('autoClosingBrackets', undefined, vscode.ConfigurationTarget.Global);
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   });
@@ -43,8 +46,12 @@ suite('AIOps SQL JSON extension', () => {
   test('associates .sql.json and accepts an indented multiline SQL string', async () => {
     const languageContribution = extension.packageJSON.contributes.languages[0] as { filenamePatterns?: string[] };
     const configurationDefaults = extension.packageJSON.contributes.configurationDefaults as Record<string, unknown>;
+    const schemaFiles = extension.packageJSON.contributes.configuration.properties['aiopsSqlJson.schemaFiles'] as {
+      default?: string[];
+    };
     assert.ok(languageContribution.filenamePatterns?.includes('*.sql.json'));
     assert.deepEqual(configurationDefaults['files.associations'], { '*.sql.json': 'sql-json' });
+    assert.deepEqual(schemaFiles.default, ['${workspaceFolder}/schema/*.sql']);
 
     const document = await openFile('valid.sql.json', `{
   "trainSql": "SELECT
@@ -361,6 +368,345 @@ suite('AIOps SQL JSON extension', () => {
     );
     const disabledDiagnostics = await waitForDiagnostics(document.uri, (items) => items.length === 0);
     assert.equal(disabledDiagnostics.length, 0);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'plainSql.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('completes dialect keywords, functions, and fields seen in the current file', async () => {
+    const lowerDocument = await openFile(
+      'completion-lower.sql',
+      'SELECT customer_id FROM orders;\nse',
+    );
+    const lowerItems = await completionItemsAtEnd(lowerDocument);
+    assert.ok(
+      lowerItems.some((item) => completionLabel(item) === 'select'),
+      `Expected lowercase SELECT completion, got: ${lowerItems.map(completionLabel).slice(0, 40).join(', ')}`,
+    );
+
+    const fieldDocument = await openFile(
+      'completion-field.sql',
+      'SELECT customer_id FROM orders;\nSELECT cu',
+    );
+    const fieldItems = await completionItemsAtEnd(fieldDocument);
+    assert.ok(fieldItems.some((item) => completionLabel(item) === 'customer_id'));
+
+    const upperDocument = await openFile('completion-upper.sql', 'SE');
+    const upperItems = await completionItemsAtEnd(upperDocument);
+    assert.ok(upperItems.some((item) => completionLabel(item) === 'SELECT'));
+
+    const functionDocument = await openFile('completion-function.sql', 'SELECT su');
+    const functionItems = await completionItemsAtEnd(functionDocument);
+    const sum = functionItems.find((item) => completionLabel(item) === 'sum');
+    assert.ok(sum);
+    assert.equal(sum.kind, vscode.CompletionItemKind.Function);
+    assert.ok(sum.insertText instanceof vscode.SnippetString);
+
+    const emptyPrefixDocument = await openFile('completion-create-empty.sql', 'create ');
+    const emptyPrefixResult = await completionListAtEnd(emptyPrefixDocument);
+    assert.equal(emptyPrefixResult.isIncomplete, true);
+    assert.ok(emptyPrefixResult.items.some((item) => completionLabel(item) === 'table'));
+
+    const uppercaseSpaceDocument = await openFile('completion-create-space-upper.sql', 'CREATE ');
+    const uppercaseSpaceItems = await completionItemsAtEnd(uppercaseSpaceDocument);
+    assert.ok(uppercaseSpaceItems.some((item) => completionLabel(item) === 'TABLE'));
+
+    const lowercaseExpressionDocument = await openFile('completion-select-space-lower.sql', 'select ');
+    const lowercaseExpressionItems = await completionItemsAtEnd(lowercaseExpressionDocument);
+    assert.ok(lowercaseExpressionItems.some((item) => completionLabel(item) === 'sum'));
+
+    const resetDocument = await openFile('completion-case-reset.sql', 'select 1; ');
+    const resetItems = await completionItemsAtEnd(resetDocument);
+    assert.ok(resetItems.some((item) => completionLabel(item) === 'SELECT'));
+
+    const createLowerDocument = await openFile('completion-create-lower.sql', 'create t');
+    const createLowerItems = await completionItemsAtEnd(createLowerDocument);
+    assert.ok(createLowerItems.some((item) => completionLabel(item) === 'table'));
+
+    const createUpperDocument = await openFile('completion-create-upper.sql', 'create T');
+    const createUpperItems = await completionItemsAtEnd(createUpperDocument);
+    assert.ok(createUpperItems.some((item) => completionLabel(item) === 'TABLE'));
+  });
+
+  test('completes fields inside recognized SQL JSON strings', async () => {
+    const document = await openFile(
+      'completion.sql.json',
+      '{"trainSql":"SELECT customer_id FROM orders WHERE cu"}',
+    );
+    const offset = document.getText().indexOf('cu"') + 2;
+    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      document.positionAt(offset),
+    );
+    assert.ok(result.items.some((item) => completionLabel(item) === 'customer_id'));
+  });
+
+  test('indexes configured DDL for schema completion and strict diagnostics', async () => {
+    const schemaDirectory = path.join(temporaryDirectory, 'schemas');
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(
+      path.join(schemaDirectory, 'catalog.sql'),
+      'CREATE TABLE sales.orders (id BIGINT, amount DECIMAL(10,2), customer_id STRING);',
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(schemaDirectory, 'views.sql'),
+      'CREATE VIEW sales.order_ids AS SELECT id FROM sales.orders; DROP TABLE sales.orders;',
+      'utf8',
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      ['schemas/*.sql'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'udfs',
+      ['score_udf'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+
+    const validDocument = await openFile(
+      'schema-valid.sql',
+      'SELECT o.id, score_udf(o.amount) FROM sales.orders o WHERE o.customer_id > 0; SELECT id FROM sales.order_ids',
+    );
+    const validDiagnostics = await waitForDiagnostics(validDocument.uri);
+    assert.ok(!validDiagnostics.some((item) => item.source?.includes('SQL schema')));
+
+    const completionDocument = await openFile(
+      'schema-field-completion.sql',
+      'SELECT o.i FROM sales.orders o',
+    );
+    const completionOffset = completionDocument.getText().indexOf('o.i') + 3;
+    const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      completionDocument.uri,
+      completionDocument.positionAt(completionOffset),
+    );
+    assert.ok(completions.items.some((item) => completionLabel(item) === 'id'));
+
+    const invalidDocument = await openFile(
+      'schema-invalid.sql',
+      'SELECT o.missing, mystery(o.id) FROM sales.orders o',
+    );
+    const invalidDiagnostics = await waitForDiagnostics(
+      invalidDocument.uri,
+      (items) => items.some((item) => item.code === 'unknown-column')
+        && items.some((item) => item.code === 'unknown-function'),
+    );
+    assert.ok(
+      invalidDiagnostics.some((item) => item.code === 'unknown-column'),
+      `Expected unknown-column diagnostic, got: ${invalidDiagnostics.map((item) => `${String(item.code)}:${item.message}`).join(' | ')}`,
+    );
+    assert.ok(invalidDiagnostics.some((item) => item.code === 'unknown-function'));
+
+    await fs.writeFile(
+      path.join(schemaDirectory, 'catalog.sql'),
+      'CREATE TABLE sales.orders (id BIGINT, amount DECIMAL(10,2), customer_id STRING, missing STRING);',
+      'utf8',
+    );
+    const changedDdlDiagnostics = await waitForDiagnostics(
+      invalidDocument.uri,
+      (items) => !items.some((item) => item.code === 'unknown-column')
+        && items.some((item) => item.code === 'unknown-function'),
+    );
+    assert.ok(!changedDdlDiagnostics.some((item) => item.code === 'unknown-column'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'udfs',
+      ['score_udf', 'mystery'],
+      vscode.ConfigurationTarget.Global,
+    );
+    const changedConfigurationDiagnostics = await waitForDiagnostics(
+      invalidDocument.uri,
+      (items) => !items.some((item) => item.source?.includes('SQL schema')),
+    );
+    assert.ok(!changedConfigurationDiagnostics.some((item) => item.source?.includes('SQL schema')));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'udfs',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('applies local DDL in order without requiring global schema files', async () => {
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      [],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+
+    const validDocument = await openFile(
+      'local-ddl-valid.sql',
+      `set spark.sql.ansi.enabled = true;
+CREATE TEMPORARY TABLE local_orders (id BIGINT, amount STRING);
+SELECT id, amount FROM local_orders;`,
+    );
+    const validDiagnostics = await waitForDiagnostics(validDocument.uri);
+    assert.ok(!validDiagnostics.some((item) => item.source?.includes('SQL schema')));
+
+    const completionDocument = await openFile(
+      'local-ddl-completion.sql',
+      'CREATE TABLE local_orders (id BIGINT, amount STRING); SELECT o.i FROM local_orders o;',
+    );
+    const completionOffset = completionDocument.getText().indexOf('o.i') + 3;
+    const completion = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      completionDocument.uri,
+      completionDocument.positionAt(completionOffset),
+    );
+    assert.ok(completion.items.some((item) => completionLabel(item) === 'id'));
+
+    const droppedDocument = await openFile(
+      'local-ddl-dropped.sql',
+      'CREATE TABLE local_orders (id BIGINT); DROP TABLE local_orders; SELECT id FROM local_orders;',
+    );
+    const droppedDiagnostics = await waitForDiagnostics(
+      droppedDocument.uri,
+      (items) => items.some((item) => item.code === 'unknown-table'),
+    );
+    assert.equal(droppedDiagnostics.filter((item) => item.code === 'unknown-table').length, 1);
+
+    const isolatedDocument = await openFile(
+      'local-ddl-isolated.sql.json',
+      `{
+  "firstSql":"CREATE TABLE isolated_table (id BIGINT); SELECT id FROM isolated_table",
+  "secondSql":"SELECT id FROM isolated_table"
+}`,
+    );
+    const isolatedDiagnostics = await waitForDiagnostics(
+      isolatedDocument.uri,
+      (items) => items.some((item) => item.code === 'unknown-table'),
+    );
+    const unknownTable = isolatedDiagnostics.filter((item) => item.code === 'unknown-table');
+    assert.equal(unknownTable.length, 1);
+    assert.ok(unknownTable[0]!.range.start.line >= 2);
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('resolves the default schema variable and invalidates renamed or deleted schema directories', async () => {
+    const schemaDirectory = path.join(temporaryDirectory, 'schema');
+    const renamedDirectory = path.join(temporaryDirectory, 'schema1');
+    const catalogPath = path.join(schemaDirectory, 'catalog.sql');
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(catalogPath, 'CREATE TABLE variable_table (id BIGINT);', 'utf8');
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+
+    const document = await openFile('schema-variable-query.sql', 'SELECT id FROM variable_table;');
+    const initial = await waitForDiagnostics(
+      document.uri,
+      (items) => !items.some((item) => item.source?.includes('SQL schema')),
+    );
+    assert.ok(!initial.some((item) => item.source?.includes('SQL schema')));
+
+    await vscode.workspace.fs.rename(
+      vscode.Uri.file(schemaDirectory),
+      vscode.Uri.file(renamedDirectory),
+      { overwrite: false },
+    );
+    const renamed = await waitForDiagnostics(
+      document.uri,
+      (items) => items.some((item) => item.code === 'unknown-table'),
+    );
+    assert.ok(renamed.some((item) => item.code === 'unknown-table'));
+
+    await vscode.workspace.fs.rename(
+      vscode.Uri.file(renamedDirectory),
+      vscode.Uri.file(schemaDirectory),
+      { overwrite: false },
+    );
+    const restored = await waitForDiagnostics(
+      document.uri,
+      (items) => !items.some((item) => item.code === 'unknown-table'),
+    );
+    assert.ok(!restored.some((item) => item.code === 'unknown-table'));
+
+    await fs.rename(schemaDirectory, renamedDirectory);
+    const externallyRenamed = await waitForDiagnostics(
+      document.uri,
+      (items) => items.some((item) => item.code === 'unknown-table'),
+    );
+    assert.ok(externallyRenamed.some((item) => item.code === 'unknown-table'));
+    await fs.rename(renamedDirectory, schemaDirectory);
+    await waitForDiagnostics(document.uri, (items) => !items.some((item) => item.code === 'unknown-table'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      ['schema/*.sql'],
+      vscode.ConfigurationTarget.Global,
+    );
+    const relativePattern = await waitForDiagnostics(
+      document.uri,
+      (items) => !items.some((item) => item.code === 'unknown-table'),
+    );
+    assert.ok(!relativePattern.some((item) => item.code === 'unknown-table'));
+
+    await fs.rm(schemaDirectory, { recursive: true, force: true });
+    const deleted = await waitForDiagnostics(
+      document.uri,
+      (items) => items.some((item) => item.code === 'unknown-table'),
+    );
+    assert.ok(deleted.some((item) => item.code === 'unknown-table'));
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(catalogPath, 'CREATE TABLE variable_table (id BIGINT);', 'utf8');
+    const recreated = await waitForDiagnostics(
+      document.uri,
+      (items) => !items.some((item) => item.code === 'unknown-table'),
+    );
+    assert.ok(!recreated.some((item) => item.code === 'unknown-table'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
   });
 
   async function openFile(fileName: string, content: string): Promise<vscode.TextDocument> {
@@ -370,7 +716,24 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.window.showTextDocument(document);
     return document;
   }
+
+  async function completionItemsAtEnd(document: vscode.TextDocument): Promise<readonly vscode.CompletionItem[]> {
+    return (await completionListAtEnd(document)).items;
+  }
+
+  async function completionListAtEnd(document: vscode.TextDocument): Promise<vscode.CompletionList> {
+    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      document.positionAt(document.getText().length),
+    );
+    return result;
+  }
 });
+
+function completionLabel(item: vscode.CompletionItem): string {
+  return typeof item.label === 'string' ? item.label : item.label.label;
+}
 
 function activeEditorFor(document: vscode.TextDocument): vscode.TextEditor {
   const editor = vscode.window.activeTextEditor;

@@ -20,7 +20,8 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onLanguage:sql"
+    "onLanguage:sql",
+    "onLanguage:sql-json"
   ],
   "extensionKind": [
     "workspace"
@@ -154,7 +155,33 @@
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "markdownDescription": "Whether this extension provides syntax validation and semantic highlighting for regular `.sql` files."
+          "markdownDescription": "Whether this extension provides completion, syntax validation, and semantic highlighting for regular `.sql` files."
+        },
+        "aiopsSqlJson.schemaValidation.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "markdownDescription": "Whether to validate SQL table, column, and function references against the DDL files configured by `aiopsSqlJson.schemaFiles`. This is an offline static check and does not connect to a database."
+        },
+        "aiopsSqlJson.schemaFiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "${workspaceFolder}/schema/*.sql"
+          ],
+          "scope": "resource",
+          "markdownDescription": "Glob patterns for `.sql` files containing explicit `CREATE TABLE` and inferable `CREATE VIEW` DDL. Supports stable VS Code path variables such as `${workspaceFolder}`, `${fileDirname}`, `${userHome}`, and `${env:NAME}`."
+        },
+        "aiopsSqlJson.udfs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "markdownDescription": "User-defined SQL function names to include in completion and accept during schema validation. Signatures and argument types are not checked."
         },
         "aiopsSqlJson.placeholderPatterns": {
           "type": "array",

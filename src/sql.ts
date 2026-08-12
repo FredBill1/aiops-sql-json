@@ -8,7 +8,7 @@ import {
   SparkSQL,
   TrinoSQL,
 } from 'dt-sql-parser';
-import type { ParseError } from 'dt-sql-parser';
+import type { CaretPosition, EntityContext, ParseError, Suggestions } from 'dt-sql-parser';
 import type { Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
@@ -44,13 +44,26 @@ export interface SqlAnalysis {
   tokens: SqlToken[];
 }
 
-interface ParserLike {
+export interface ParserLike {
   validate(input: string): ParseError[];
   getAllTokens(input: string): Token[];
+  getSuggestionAtCaretPosition(input: string, caretPosition: CaretPosition): Suggestions | null;
+  getAllEntities(input: string, caretPosition?: CaretPosition): EntityContext[] | null;
+  createLexer(input: string): { vocabulary: VocabularyLike };
 }
 
-interface VocabularyLike {
+export interface VocabularyLike {
+  readonly maxTokenType: number;
+  getLiteralName(tokenType: number): string | null;
   getSymbolicName(tokenType: number): string | null;
+}
+
+export interface SqlLexToken {
+  start: number;
+  end: number;
+  text: string;
+  symbolicName: string;
+  channel: number;
 }
 
 const parserCache = new Map<SqlDialect, ParserLike>();
@@ -64,7 +77,7 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
     return { issues: [], tokens: [] };
   }
 
-  const parser = getParser(dialect);
+  const parser = getSqlParser(dialect);
   const masked = maskPlaceholders(text, placeholders).text;
   let errors: ParseError[] = [];
   let antlrTokens: Token[] = [];
@@ -94,6 +107,82 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
   });
 
   return { issues, tokens };
+}
+
+export function getSqlSuggestions(
+  text: string,
+  offset: number,
+  dialect: SqlDialect,
+  placeholders: readonly RegExp[],
+): Suggestions | null {
+  const masked = maskPlaceholders(text, placeholders).text;
+  try {
+    return getSqlParser(dialect).getSuggestionAtCaretPosition(masked, offsetToCaret(masked, offset));
+  } catch {
+    return null;
+  }
+}
+
+export function getSqlEntities(
+  text: string,
+  dialect: SqlDialect,
+  placeholders: readonly RegExp[] = [],
+  offset?: number,
+): EntityContext[] {
+  const masked = maskPlaceholders(text, placeholders).text;
+  try {
+    return getSqlParser(dialect).getAllEntities(
+      masked,
+      offset === undefined ? undefined : offsetToCaret(masked, offset),
+    ) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export function lexSql(
+  text: string,
+  dialect: SqlDialect,
+  placeholders: readonly RegExp[] = [],
+): SqlLexToken[] {
+  const masked = maskPlaceholders(text, placeholders).text;
+  try {
+    return getSqlParser(dialect).getAllTokens(masked).flatMap((token) => (
+      token.start >= 0 && token.stop >= token.start
+        ? [{
+            start: token.start,
+            end: token.stop + 1,
+            text: text.slice(token.start, token.stop + 1),
+            symbolicName: getSymbolicName(token),
+            channel: token.channel,
+          }]
+        : []
+    ));
+  } catch {
+    return [];
+  }
+}
+
+export function offsetToCaret(text: string, offset: number): CaretPosition {
+  const safeOffset = Math.min(Math.max(offset, 0), text.length);
+  let lineNumber = 1;
+  let column = 1;
+  for (let index = 0; index < safeOffset; index += 1) {
+    const character = text[index];
+    if (character === '\r') {
+      if (text[index + 1] === '\n' && index + 1 < safeOffset) {
+        index += 1;
+      }
+      lineNumber += 1;
+      column = 1;
+    } else if (character === '\n') {
+      lineNumber += 1;
+      column = 1;
+    } else {
+      column += 1;
+    }
+  }
+  return { lineNumber, column };
 }
 
 function findStructuralIssues(tokens: readonly Token[]): SqlIssue[] {
@@ -188,7 +277,7 @@ export function lineColumnToOffset(text: string, oneBasedLine: number, oneBasedC
   return Math.min(offset + Math.max(oneBasedColumn - 1, 0), text.length);
 }
 
-function getParser(dialect: SqlDialect): ParserLike {
+export function getSqlParser(dialect: SqlDialect): ParserLike {
   const existing = parserCache.get(dialect);
   if (existing) {
     return existing;

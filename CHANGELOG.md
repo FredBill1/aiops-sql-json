@@ -3,6 +3,12 @@
 ## Unreleased
 
 - Fixed regular `.sql` files not activating diagnostics when opened before any `sql-json` document.
+- Added context-aware keyword, built-in function, UDF, table, and field completion for all eight SQL dialects in `.sql` and recognized `.sql.json` strings.
+- Added optional, hot-reloaded offline Schema indexing from configurable DDL globs, with strict table, field, function, scope, projection-count, and inferable type diagnostics.
+- Added DDL diagnostics for invalid, implicit-CTAS, and duplicate table definitions without introducing database connectivity.
+- Added source-ordered local table/view CREATE and DROP lifecycles, including temporary-object shadowing and isolated embedded SQL strings.
+- Added declarative global view indexing and removed the warning for an empty Schema glob list.
+- Added stable VS Code path-variable expansion for Schema globs and changed the default to `${workspaceFolder}/schema/*.sql`.
 
 ## 0.0.2
 

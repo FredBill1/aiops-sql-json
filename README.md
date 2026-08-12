@@ -8,12 +8,14 @@ A VS Code extension for AIOps Spark job configurations. It lets strings in `*.sq
 - Allows every JSON string to span physical lines by default while using property-name patterns only to identify embedded SQL.
 - Accepts configurable placeholders in strings, bare values, unquoted property keys, and embedded bare tokens.
 - Validates and highlights SQL strings selected by configurable property-name patterns such as `*Sql`.
+- Completes dialect keywords, built-in functions, configured UDFs, and context-relevant fields in both regular SQL and embedded SQL strings.
 - Gives recognized SQL strings code-like pair editing for brackets and quotes, including overtyping, pair deletion, selection surrounding, and JSON-safe escaped double quotes.
 - Colorizes nested SQL bracket pairs using the active VS Code theme and supports jumping between matching SQL brackets.
 - Maps the standard comment shortcuts to safe `/* ... */` comments inside recognized SQL strings.
 - Supports Spark, Hive, Flink, MySQL, PostgreSQL, Trino, Impala, and Generic SQL. Spark SQL is the default.
 - Preserves strict JSON diagnostics, JSON Schema validation, completion, and hover information.
 - Enhances regular `.sql` files by default and can be disabled when not needed.
+- Optionally builds an offline Schema from workspace DDL and strictly checks table, column, function, projection-count, and safely inferable type references.
 - Warns when unindented continuation lines concatenate SQL words or when `--` comments cross physical lines.
 
 ## Installation
@@ -64,6 +66,9 @@ For the same reason, an SQL `--` comment does not end at the visible line bounda
 | `aiopsSqlJson.multilineStrings.allowAll` | `true` | Allows physical line breaks in every JSON string. Disable it to allow them only in SQL strings selected by `keyPatterns`. |
 | `aiopsSqlJson.dialect` | `"spark"` | SQL dialect used for embedded SQL and regular `.sql` files. |
 | `aiopsSqlJson.plainSql.enabled` | `true` | Enables this extension's diagnostics and semantic highlighting for regular `.sql` files. |
+| `aiopsSqlJson.schemaValidation.enabled` | `false` | Enables strict offline Schema completion and validation. No database connection or SQL execution is performed. |
+| `aiopsSqlJson.schemaFiles` | `["${workspaceFolder}/schema/*.sql"]` | Globs for `.sql` files containing explicit tables and inferable views. Relative globs are resolved from the resource's workspace folder. |
+| `aiopsSqlJson.udfs` | `[]` | Simple or qualified UDF names offered by completion and accepted by Schema validation. |
 | `aiopsSqlJson.placeholderPatterns` | `["\\$\\{[^}]+\\}", "\\$\\w+"]` | Regular expression sources for template placeholders that should be masked with equal-length text before parsing. |
 | `aiopsSqlJson.placeholders.allowEverywhere` | `true` | Accepts matching placeholders in strings, unquoted property keys, and bare JSON tokens throughout SQL JSON documents. |
 
@@ -75,6 +80,9 @@ Example workspace settings:
   "aiopsSqlJson.multilineStrings.allowAll": true,
   "aiopsSqlJson.dialect": "spark",
   "aiopsSqlJson.plainSql.enabled": true,
+  "aiopsSqlJson.schemaValidation.enabled": true,
+  "aiopsSqlJson.schemaFiles": ["${workspaceFolder}/schema/**/*.sql"],
+  "aiopsSqlJson.udfs": ["score_udf", "analytics.normalize_score"],
   "aiopsSqlJson.placeholders.allowEverywhere": true,
   "aiopsSqlJson.placeholderPatterns": [
     "\\$\\{[^}]+\\}",
@@ -99,6 +107,22 @@ Placeholders may also stand in for JSON tokens without quotes:
 The JSON projection uses same-length synthetic keys or values so syntax locations remain stable. Schema diagnostics that depend on a dynamic key or value are suppressed, while diagnostics for known surrounding properties remain active. A placeholder represents one lexical token; it is not interpreted as a comma, colon, or a fragment that expands to multiple JSON properties.
 
 In SQL, placeholders normally use an identifier-shaped mask. A placeholder immediately followed by a decimal fraction uses a numeric mask, so expressions such as `value > $limit.0` validate correctly.
+
+## SQL completion and offline Schema validation
+
+Completion is available for Spark, Hive, Flink, MySQL, PostgreSQL, Trino, Impala, and Generic SQL. Keyword and function catalogs are pinned with the extension; a lowercase first typed letter produces a lowercase candidate and an uppercase first letter produces uppercase. After whitespace, candidates follow the most recent word in the current statement; a new statement with no preceding word defaults to uppercase. Functions insert a snippet with the cursor inside `()`. Field names retain their original spelling.
+
+With Schema validation disabled (the default), field candidates are collected from all statements in the current `.sql` file, or from all recognized SQL strings in the current `.sql.json` file. Enabling `aiopsSqlJson.schemaValidation.enabled` replaces these lexical candidates with fields resolved from configured DDL, CTEs, subqueries, projections, aliases, and known wildcards. Configuration changes, matching DDL changes, and Schema directory creation, deletion, or rename are picked up without reloading the extension.
+
+Schema globs support `${workspaceFolder}`, `${workspaceFolder:Name}`, `${workspaceFolderBasename}`, `${userHome}`, `${file}`, `${fileWorkspaceFolder}`, `${relativeFile}`, `${relativeFileDirname}`, `${fileBasename}`, `${fileBasenameNoExtension}`, `${fileExtname}`, `${fileDirname}`, `${fileDirnameBasename}`, `${cwd}`, `${execPath}`, `${pathSeparator}`, `${/}`, and `${env:NAME}`. Relative globs remain relative to the current resource's workspace folder, or its directory outside a workspace. Variables that are unknown, empty, or refer to a missing named workspace cause that glob entry to be ignored with a warning. Interactive and task variables such as `command`, `input`, `config`, cursor, and selection variables are not evaluated.
+
+Schema files may contain multiple explicit `CREATE TABLE` and inferable `CREATE VIEW ... AS SELECT` statements. Their declarations are merged workspace-wide: tables are indexed first and view dependencies are then resolved without relying on file order. `DROP` statements in Schema files are ignored. Invalid DDL, CTAS without an explicit column list, unresolved views, cycles, and duplicate table/view names are reported on the source DDL and excluded from the index. Qualified names match exactly; an unqualified object name must uniquely identify one object. An empty `schemaFiles` list is valid and uses an empty global Schema.
+
+In other SQL files, DDL follows source order within that file. Explicit `CREATE [TEMPORARY] TABLE`, `DROP TABLE`, `CREATE [TEMPORARY] VIEW`, and `DROP VIEW` update the Schema seen by later statements. Temporary objects may shadow global objects and reveal them again when dropped. Each recognized SQL string in a `.sql.json` file has its own isolated DDL sequence. `IF EXISTS` and `IF NOT EXISTS` suppress the corresponding missing or duplicate-object error.
+
+The strict checker covers SELECT, INSERT, UPDATE, DELETE, and MERGE references, including joins, CTEs, nested and correlated subqueries, unknown or ambiguous fields, unknown functions, INSERT/UNION projection counts, and type compatibility where both sides are safely known. Configuration and administration statements such as Spark `SET` receive syntax validation but are not treated as table/field expressions. UDF return types and function arity remain unknown and do not cause cascading type errors. Statements with syntax errors skip semantic validation, and placeholder-dependent object references are treated as dynamic.
+
+This is a static, offline approximation of whether a statement can execute. It does not connect to a database and cannot verify permissions, live catalogs, data, engine configuration, execution plans, runtime temporary objects, `ALTER TABLE`, or UDF signatures.
 
 ## Editing embedded SQL
 
@@ -127,7 +151,7 @@ The extension supports `$schema` declarations in files and existing `json.schema
 
 Inline schemas, local and relative schemas, HTTP(S) schemas, and schemas contributed by other extensions through `jsonValidation` are supported. Remote downloads respect `json.schemaDownload.enable` and are disabled in untrusted workspaces.
 
-JSON Schema completion and hover information are suppressed inside recognized SQL strings. The current version does not provide database-aware table or column completion and does not format `.sql.json` files, preventing formatting from damaging the platform-specific multiline-string representation.
+JSON Schema completion and hover information are suppressed inside recognized SQL strings. The extension does not format `.sql.json` files, preventing formatting from damaging the platform-specific multiline-string representation.
 
 ## Development and verification
 
@@ -139,7 +163,7 @@ npm run package
 ```
 
 - `check`: runs TypeScript and ESLint checks.
-- `test:unit`: tests projection, position mapping, all eight dialects, placeholders, structural SQL checks, and JSON Schema behavior.
+- `test:unit`: tests projection, position mapping, all eight dialects, completion catalogs, placeholders, structural and Schema SQL checks, and JSON Schema behavior.
 - `test:integration`: runs tests in a real VS Code Extension Host.
 - `package`: runs the complete verification suite and generates a local VSIX.
 

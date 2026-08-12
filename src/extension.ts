@@ -7,7 +7,9 @@ import { SqlEditingCommands } from './editingCommands';
 import { SqlEditingContextService } from './editingContext';
 import { JsonServiceManager } from './jsonService';
 import { JsonCompletionProvider, JsonHoverProvider } from './providers';
+import { SqlSchemaService } from './schemaService';
 import { SEMANTIC_TOKEN_LEGEND, SqlSemanticTokensProvider } from './semanticTokens';
+import { SqlCompletionProvider } from './sqlCompletion';
 
 const SQL_JSON_SELECTOR: vscode.DocumentFilter[] = [
   { language: 'sql-json', scheme: 'file' },
@@ -25,13 +27,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const jsonServices = new JsonServiceManager();
   const editingContexts = new SqlEditingContextService(jsonServices);
   const semanticTokens = new SqlSemanticTokensProvider(jsonServices);
-  const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh());
+  const schemas = new SqlSchemaService();
+  const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh(), schemas);
   const editing = new SqlEditingController(editingContexts);
   const bracketDecorations = new SqlBracketDecorationController(editingContexts);
   const editingCommands = new SqlEditingCommands(editingContexts);
 
   context.subscriptions.push(
     semanticTokens,
+    schemas,
     diagnostics,
     editing,
     bracketDecorations,
@@ -46,6 +50,14 @@ export function activate(context: vscode.ExtensionContext): void {
       new JsonCompletionProvider(jsonServices),
       '"',
       ':',
+    ),
+    vscode.languages.registerCompletionItemProvider(
+      [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
+      new SqlCompletionProvider(jsonServices, schemas),
+      ' ',
+      '.',
+      '(',
+      ',',
     ),
     vscode.languages.registerHoverProvider(SQL_JSON_SELECTOR, new JsonHoverProvider(jsonServices)),
   );

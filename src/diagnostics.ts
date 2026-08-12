@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { analyzePlainSqlDocument, analyzeSqlJsonDocument } from './analysis';
 import { getExtensionConfiguration } from './config';
 import type { JsonServiceManager } from './jsonService';
+import type { SqlSchemaService } from './schemaService';
 
 export class DiagnosticController implements vscode.Disposable {
   private readonly collection = vscode.languages.createDiagnosticCollection('aiops-sql-json');
@@ -14,6 +15,7 @@ export class DiagnosticController implements vscode.Disposable {
   constructor(
     private readonly jsonServices: JsonServiceManager,
     private readonly refreshSemanticTokens: () => void,
+    private readonly schemas: SqlSchemaService,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.schedule(document, 0)),
@@ -23,6 +25,7 @@ export class DiagnosticController implements vscode.Disposable {
         if (event.affectsConfiguration('aiopsSqlJson') || event.affectsConfiguration('json.schemas')
           || event.affectsConfiguration('json.schemaDownload.enable')) {
           this.jsonServices.clear();
+          this.schemas.clear();
           this.refreshSemanticTokens();
           for (const document of vscode.workspace.textDocuments) {
             this.schedule(document, 0);
@@ -31,6 +34,11 @@ export class DiagnosticController implements vscode.Disposable {
       }),
       vscode.extensions.onDidChange(() => {
         this.jsonServices.clear();
+        for (const document of vscode.workspace.textDocuments) {
+          this.schedule(document, 0);
+        }
+      }),
+      this.schemas.onDidChangeSchema(() => {
         for (const document of vscode.workspace.textDocuments) {
           this.schedule(document, 0);
         }
@@ -74,13 +82,14 @@ export class DiagnosticController implements vscode.Disposable {
     const version = document.version;
     const configuration = getExtensionConfiguration(document.uri);
     this.warnAboutConfiguration(configuration.placeholderIssues);
+    const schema = await this.schemas.getSchema(document.uri, configuration);
 
     let diagnostics: vscode.Diagnostic[];
     if (document.languageId === 'sql-json') {
       const projected = this.jsonServices.createDocument(document, configuration);
-      diagnostics = (await analyzeSqlJsonDocument(document, projected, configuration)).diagnostics;
+      diagnostics = (await analyzeSqlJsonDocument(document, projected, configuration, schema)).diagnostics;
     } else if (document.languageId === 'sql' && configuration.plainSqlEnabled) {
-      diagnostics = analyzePlainSqlDocument(document, configuration).diagnostics;
+      diagnostics = analyzePlainSqlDocument(document, configuration, schema).diagnostics;
     } else {
       diagnostics = [];
     }

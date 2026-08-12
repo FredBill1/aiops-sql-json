@@ -12,6 +12,7 @@ import {
 } from './regions';
 import type { ProjectedJsonDocument } from './jsonService';
 import { analyzeSql, type SqlAnalysis } from './sql';
+import { analyzeSqlSemantics, type SchemaSnapshot } from './sqlSchemaCore';
 
 export interface RegionAnalysis {
   region: SqlJsonRegion;
@@ -27,6 +28,7 @@ export async function analyzeSqlJsonDocument(
   document: vscode.TextDocument,
   projected: ProjectedJsonDocument,
   configuration: ExtensionConfiguration,
+  schema?: SchemaSnapshot,
 ): Promise<SqlJsonAnalysis> {
   const regions = analyzeSqlJsonRegions(projected, configuration);
   const sqlRegions = regions.map((region) => region.region);
@@ -73,7 +75,7 @@ export async function analyzeSqlJsonDocument(
   }
 
   for (const regionAnalysis of regions) {
-    appendSqlDiagnostics(document, projected, configuration, regionAnalysis, diagnostics);
+    appendSqlDiagnostics(document, projected, configuration, regionAnalysis, diagnostics, schema);
   }
   return { diagnostics, regions };
 }
@@ -120,6 +122,7 @@ export function analyzeSqlJsonRegions(
 export function analyzePlainSqlDocument(
   document: vscode.TextDocument,
   configuration: ExtensionConfiguration,
+  schema?: SchemaSnapshot,
 ): { diagnostics: vscode.Diagnostic[]; sql: SqlAnalysis } {
   const sql = analyzeSql(document.getText(), configuration.dialect, configuration.placeholderPatterns);
   const diagnostics = sql.issues.map((issue) => createDiagnostic(
@@ -129,6 +132,22 @@ export function analyzePlainSqlDocument(
     vscode.DiagnosticSeverity.Error,
     `${configuration.dialect} SQL`,
   ));
+  if (configuration.schemaValidationEnabled && schema) {
+    diagnostics.push(...analyzeSqlSemantics(
+      document.getText(),
+      configuration.dialect,
+      configuration.placeholderPatterns,
+      schema,
+      configuration.udfs,
+    ).map((issue) => createDiagnostic(
+      document,
+      issue,
+      issue.message,
+      vscode.DiagnosticSeverity.Error,
+      `${configuration.dialect} SQL schema`,
+      issue.code,
+    )));
+  }
   return { diagnostics, sql };
 }
 
@@ -147,6 +166,7 @@ function appendSqlDiagnostics(
   configuration: ExtensionConfiguration,
   regionAnalysis: RegionAnalysis,
   diagnostics: vscode.Diagnostic[],
+  schema?: SchemaSnapshot,
 ): void {
   const { region, sql } = regionAnalysis;
   for (const issue of sql.issues) {
@@ -159,6 +179,30 @@ function appendSqlDiagnostics(
       vscode.DiagnosticSeverity.Error,
       `${configuration.dialect} SQL`,
     ));
+  }
+
+  if (configuration.schemaValidationEnabled && schema) {
+    for (const issue of analyzeSqlSemantics(
+      region.decoded.text,
+      configuration.dialect,
+      configuration.placeholderPatterns,
+      schema,
+      configuration.udfs,
+    )) {
+      const spans = mapDecodedRange(region.decoded, issue.start, issue.end);
+      const span = {
+        start: spans[0]?.start ?? region.originalRange.start,
+        end: spans.at(-1)?.end ?? region.originalRange.end,
+      };
+      diagnostics.push(createDiagnostic(
+        document,
+        span,
+        issue.message,
+        vscode.DiagnosticSeverity.Error,
+        `${configuration.dialect} SQL schema`,
+        issue.code,
+      ));
+    }
   }
 
   for (const token of sql.tokens) {
