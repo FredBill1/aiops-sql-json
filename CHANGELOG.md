@@ -4,9 +4,14 @@
 
 - Added a command to force rebuilding all cached offline Schema indexes.
 - Added an optional completion-only Schema mode that suppresses Schema query and DDL diagnostics.
-- Rebuilt offline SQL reference collection around per-dialect parse-tree adapters and a shared semantic model.
-- Added nested ARRAY, MAP, and STRUCT inference for Spark DDL, `from_json`, struct constructors, and generator functions.
-- Fixed quoted Spark identifier matching, partition-column extraction, LATERAL VIEW outputs, and nested function validation.
+- Rebuilt the offline Schema checker around a unified SQL AST frontend, recursive query scopes, and conservative type propagation for all eight SQL dialects.
+- Added semantic validation for ordered and correlated CTEs, derived tables, JOIN USING columns, qualified wildcards, set operations, INSERT targets, and UPDATE assignments.
+- Added typed relation support for EXPLODE and POSEXPLODE, UNNEST, JSON_TABLE, PostgreSQL set-returning functions, and Impala collection iteration.
+- Added nested ARRAY, MAP, and STRUCT inference for DDL, `from_json`, struct constructors, expressions, aggregates, and generator functions.
+- Added cross-file view dependency resolution, duplicate-column rejection, and reliable schema removal after duplicate DDL files are changed or deleted.
+- Made asynchronous Schema index rebuilds atomic so completion and diagnostics keep using the previous complete snapshot until the newest generation is ready.
+- Fixed valid dialect SQL being rejected because of gaps in the fallback grammar while retaining structural diagnostics for invalid SQL.
+- Fixed quoted identifier matching, partition-column extraction, LATERAL VIEW outputs, and nested function validation.
 - Suppressed table and dependent-column diagnostics for placeholder-based dynamic relations.
 - Changed unknown-function diagnostics from errors to warnings and expanded the Spark built-in function catalog.
 

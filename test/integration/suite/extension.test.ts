@@ -1155,6 +1155,117 @@ SELECT id, amount FROM local_orders;`,
     );
   });
 
+  for (const dialectCase of schemaIndexDialectCases()) {
+    test(`rebuilds the ${dialectCase.dialect} index after concurrent cross-file DDL changes and duplicate churn`, async () => {
+      const schemaDirectoryName = `schema-index-${dialectCase.dialect}`;
+      const schemaDirectory = path.join(temporaryDirectory, schemaDirectoryName);
+      const ordersPath = path.join(schemaDirectory, '10-orders.sql');
+      const customersPath = path.join(schemaDirectory, '20-customers.sql');
+      const duplicatePath = path.join(schemaDirectory, '30-duplicate-orders.sql');
+      const ordersUri = vscode.Uri.file(ordersPath);
+      const duplicateUri = vscode.Uri.file(duplicatePath);
+      await fs.mkdir(schemaDirectory, { recursive: true });
+      await fs.writeFile(ordersPath, dialectCase.oldOrdersDdl, 'utf8');
+      await fs.writeFile(customersPath, dialectCase.oldCustomersDdl, 'utf8');
+
+      try {
+        await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+          'dialect',
+          dialectCase.dialect,
+          vscode.ConfigurationTarget.Global,
+        );
+        await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+          'schemaFiles',
+          [`${schemaDirectoryName}/*.sql`],
+          vscode.ConfigurationTarget.Global,
+        );
+        await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+          'schemaValidation.enabled',
+          true,
+          vscode.ConfigurationTarget.Global,
+        );
+
+        const oldCompletionDocument = await openFile(
+          `schema-index-${dialectCase.dialect}-old-completion.sql`,
+          'SELECT o.o FROM rebuild_orders o',
+        );
+        const oldCompletionOffset = oldCompletionDocument.getText().indexOf('o.o') + 3;
+        const initiallyIndexed = await waitForCompletionItems(
+          oldCompletionDocument,
+          oldCompletionOffset,
+          (items) => items.some((item) => completionLabel(item) === 'old_amount'),
+        );
+        assert.ok(initiallyIndexed.some((item) => completionLabel(item) === 'old_amount'));
+        assert.ok(!initiallyIndexed.some((item) => completionLabel(item) === 'new_amount'));
+
+        await Promise.all([
+          fs.writeFile(ordersPath, dialectCase.newOrdersDdl, 'utf8'),
+          fs.writeFile(customersPath, dialectCase.newCustomersDdl, 'utf8'),
+        ]);
+        const completionDocument = await openFile(
+          `schema-index-${dialectCase.dialect}-completion.sql`,
+          'SELECT o.n FROM rebuild_orders o',
+        );
+        const completionOffset = completionDocument.getText().indexOf('o.n') + 3;
+        const completion = await waitForCompletionItems(
+          completionDocument,
+          completionOffset,
+          (items) => items.some((item) => completionLabel(item) === 'new_amount')
+            && !items.some((item) => completionLabel(item) === 'old_amount'),
+        );
+        assert.ok(completion.some((item) => completionLabel(item) === 'new_amount'));
+        assert.ok(!completion.some((item) => completionLabel(item) === 'old_amount'));
+
+        await fs.writeFile(duplicatePath, dialectCase.newOrdersDdl, 'utf8');
+        const duplicateDiagnostics = await waitForDiagnostics(
+          duplicateUri,
+          (items) => items.some((item) => item.code === 'duplicate-schema-table'),
+        );
+        assert.ok(duplicateDiagnostics.some((item) => item.code === 'duplicate-schema-table'));
+        const originalDiagnostics = await waitForDiagnostics(
+          ordersUri,
+          (items) => items.some((item) => item.code === 'duplicate-schema-table'),
+        );
+        assert.ok(originalDiagnostics.some((item) => item.code === 'duplicate-schema-table'));
+        const duplicateCompletion = await waitForCompletionItems(
+          completionDocument,
+          completionOffset,
+          (items) => !items.some((item) => completionLabel(item) === 'new_amount'),
+        );
+        assert.ok(!duplicateCompletion.some((item) => completionLabel(item) === 'new_amount'));
+
+        await fs.unlink(duplicatePath);
+        const clearedOriginal = await waitForDiagnostics(
+          ordersUri,
+          (items) => !items.some((item) => item.code === 'duplicate-schema-table'),
+        );
+        assert.ok(!clearedOriginal.some((item) => item.code === 'duplicate-schema-table'));
+        const recoveredCompletion = await waitForCompletionItems(
+          completionDocument,
+          completionOffset,
+          (items) => items.some((item) => completionLabel(item) === 'new_amount'),
+        );
+        assert.ok(recoveredCompletion.some((item) => completionLabel(item) === 'new_amount'));
+      } finally {
+        await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+          'schemaValidation.enabled',
+          undefined,
+          vscode.ConfigurationTarget.Global,
+        );
+        await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+          'schemaFiles',
+          undefined,
+          vscode.ConfigurationTarget.Global,
+        );
+        await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+          'dialect',
+          undefined,
+          vscode.ConfigurationTarget.Global,
+        );
+      }
+    });
+  }
+
   async function openFile(fileName: string, content: string): Promise<vscode.TextDocument> {
     const filePath = path.join(temporaryDirectory, fileName);
     await fs.writeFile(filePath, content, 'utf8');
@@ -1179,6 +1290,21 @@ SELECT id, amount FROM local_orders;`,
     return result.items;
   }
 
+  async function waitForCompletionItems(
+    document: vscode.TextDocument,
+    offset: number,
+    predicate: (items: readonly vscode.CompletionItem[]) => boolean,
+  ): Promise<readonly vscode.CompletionItem[]> {
+    const timeoutAt = Date.now() + 15_000;
+    let items: readonly vscode.CompletionItem[] = [];
+    while (Date.now() < timeoutAt) {
+      items = await completionItemsAtOffset(document, offset);
+      if (predicate(items)) return items;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return items;
+  }
+
   async function completionListAtEnd(document: vscode.TextDocument): Promise<vscode.CompletionList> {
     const result = await vscode.commands.executeCommand<vscode.CompletionList>(
       'vscode.executeCompletionItemProvider',
@@ -1191,6 +1317,67 @@ SELECT id, amount FROM local_orders;`,
 
 function completionLabel(item: vscode.CompletionItem): string {
   return typeof item.label === 'string' ? item.label : item.label.label;
+}
+
+function schemaIndexDialectCases() {
+  return [
+    {
+      dialect: 'spark',
+      oldOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount DECIMAL(18,2));',
+      newOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount DECIMAL(18,2));',
+      oldCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, old_name STRING);',
+      newCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, new_name STRING);',
+    },
+    {
+      dialect: 'hive',
+      oldOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount DECIMAL(18,2));',
+      newOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount DECIMAL(18,2));',
+      oldCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, old_name STRING);',
+      newCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, new_name STRING);',
+    },
+    {
+      dialect: 'flink',
+      oldOrdersDdl: "CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount DECIMAL(18,2)) WITH ('connector'='values');",
+      newOrdersDdl: "CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount DECIMAL(18,2)) WITH ('connector'='values');",
+      oldCustomersDdl: "CREATE TABLE rebuild_customers (customer_id BIGINT, old_name STRING) WITH ('connector'='values');",
+      newCustomersDdl: "CREATE TABLE rebuild_customers (customer_id BIGINT, new_name STRING) WITH ('connector'='values');",
+    },
+    {
+      dialect: 'mysql',
+      oldOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount DECIMAL(18,2));',
+      newOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount DECIMAL(18,2));',
+      oldCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, old_name VARCHAR(200));',
+      newCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, new_name VARCHAR(200));',
+    },
+    {
+      dialect: 'postgresql',
+      oldOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount NUMERIC(18,2));',
+      newOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount NUMERIC(18,2));',
+      oldCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, old_name TEXT);',
+      newCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, new_name TEXT);',
+    },
+    {
+      dialect: 'trino',
+      oldOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount DECIMAL(18,2));',
+      newOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount DECIMAL(18,2));',
+      oldCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, old_name VARCHAR);',
+      newCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, new_name VARCHAR);',
+    },
+    {
+      dialect: 'impala',
+      oldOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount DECIMAL(18,2));',
+      newOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount DECIMAL(18,2));',
+      oldCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, old_name STRING);',
+      newCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, new_name STRING);',
+    },
+    {
+      dialect: 'generic',
+      oldOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, old_amount DECIMAL(18,2));',
+      newOrdersDdl: 'CREATE TABLE rebuild_orders (order_id BIGINT, customer_id BIGINT, new_amount DECIMAL(18,2));',
+      oldCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, old_name VARCHAR(200));',
+      newCustomersDdl: 'CREATE TABLE rebuild_customers (customer_id BIGINT, new_name VARCHAR(200));',
+    },
+  ] as const;
 }
 
 function activeEditorFor(document: vscode.TextDocument): vscode.TextEditor {

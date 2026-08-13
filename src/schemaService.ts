@@ -65,6 +65,7 @@ export class SqlSchemaService implements vscode.Disposable {
   async getSchema(
     resource: vscode.Uri,
     configuration: ExtensionConfiguration,
+    waitForFresh = false,
   ): Promise<SchemaSnapshot> {
     if (!configuration.schemaValidationEnabled) {
       return EMPTY_SCHEMA;
@@ -89,6 +90,10 @@ export class SqlSchemaService implements vscode.Disposable {
     });
     const existing = this.cache.get(key);
     if (existing) {
+      if (!waitForFresh && !existing.committed && this.lastGood.has(key)) {
+        void this.resolveEntry(key, existing, configuration);
+        return this.lastGood.get(key)!;
+      }
       return this.resolveEntry(key, existing, configuration);
     }
     for (const pattern of resolved.patterns) {
@@ -101,17 +106,22 @@ export class SqlSchemaService implements vscode.Disposable {
       committed: false,
     };
     this.cache.set(key, entry);
+    if (!waitForFresh && this.lastGood.has(key)) {
+      void this.resolveEntry(key, entry, configuration);
+      return fallback;
+    }
     return this.resolveEntry(key, entry, configuration);
   }
 
   async rebuild(requests: readonly SchemaRebuildRequest[]): Promise<void> {
-    this.reset();
+    this.beginGeneration();
     const enabledRequests = requests.filter((request) => request.configuration.schemaValidationEnabled);
     while (true) {
       const rebuildGeneration = this.generation;
       await Promise.all(enabledRequests.map((request) => this.getSchema(
         request.resource,
         request.configuration,
+        true,
       )));
       if (this.generation === rebuildGeneration) {
         this.changedEmitter.fire();
@@ -176,7 +186,7 @@ export class SqlSchemaService implements vscode.Disposable {
   ): Promise<SchemaSnapshot> {
     const result = await entry.promise;
     if (entry.generation !== this.generation || this.cache.get(key) !== entry) {
-      return EMPTY_SCHEMA;
+      return this.lastGood.get(key) ?? EMPTY_SCHEMA;
     }
     if (!entry.committed) {
       entry.committed = true;
@@ -189,6 +199,7 @@ export class SqlSchemaService implements vscode.Disposable {
           this.updateDiagnosticContribution(key, result.sources, result.snapshot.issues);
         }
       }
+      this.changedEmitter.fire();
     }
     return result.snapshot;
   }
@@ -230,10 +241,7 @@ export class SqlSchemaService implements vscode.Disposable {
     }
     this.invalidationTimer = setTimeout(() => {
       this.invalidationTimer = undefined;
-      this.generation += 1;
-      this.cache.clear();
-      this.diagnosticContributions.clear();
-      this.diagnostics.clear();
+      this.beginGeneration();
       this.changedEmitter.fire();
     }, 150);
   }
@@ -312,6 +320,15 @@ export class SqlSchemaService implements vscode.Disposable {
       watcher.dispose();
     }
     this.watchers.clear();
+  }
+
+  private beginGeneration(): void {
+    if (this.invalidationTimer) {
+      clearTimeout(this.invalidationTimer);
+      this.invalidationTimer = undefined;
+    }
+    this.generation += 1;
+    this.cache.clear();
   }
 }
 

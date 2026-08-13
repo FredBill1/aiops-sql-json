@@ -12,6 +12,7 @@ import type { CaretPosition, EntityContext, ParseError, Suggestions } from 'dt-s
 import type { ParserRuleContext, Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
+import { sqlingoCanParse } from './sqlAst';
 
 export const SQL_DIALECTS = [
   'spark',
@@ -93,7 +94,10 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
     };
   }
 
-  const parserIssues = errors.map((error) => parseErrorToIssue(text, error));
+  const hasUnmaskedTemplate = /\$\{|\$[\p{L}_]/u.test(masked);
+  const parserIssues = errors.length > 0 && !hasUnmaskedTemplate && sqlingoCanParse(text, dialect, placeholders)
+    ? []
+    : errors.map((error) => parseErrorToIssue(text, error));
   const structuralIssues = findStructuralIssues(antlrTokens).filter((issue) => (
     !parserIssues.some((parserIssue) => rangesOverlap(issue, parserIssue))
   ));

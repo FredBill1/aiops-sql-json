@@ -230,7 +230,9 @@
     "package": "npm run test && vsce package --out aiops-sql-json.vsix"
   },
   "dependencies": {
+    "@hdnax/sqlingo.js": "0.4.2",
     "dt-sql-parser": "4.5.0",
+    "luxon": "3.7.2",
     "vscode-json-languageservice": "5.7.2",
     "vscode-languageserver-textdocument": "1.0.12"
   },
