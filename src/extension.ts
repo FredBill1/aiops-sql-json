@@ -11,6 +11,7 @@ import { JsonCompletionProvider, JsonHoverProvider } from './providers';
 import { SqlSchemaService, type SchemaRebuildRequest } from './schemaService';
 import { SEMANTIC_TOKEN_LEGEND, SqlSemanticTokensProvider } from './semanticTokens';
 import { SqlCompletionProvider } from './sqlCompletion';
+import { SqlDefinitionProvider, SqlHoverProvider } from './sqlNavigation';
 
 const SQL_JSON_SELECTOR: vscode.DocumentFilter[] = [
   { language: 'sql-json', scheme: 'file' },
@@ -87,6 +88,14 @@ export function activate(context: vscode.ExtensionContext): void {
       ',',
     ),
     vscode.languages.registerHoverProvider(SQL_JSON_SELECTOR, new JsonHoverProvider(jsonServices)),
+    vscode.languages.registerHoverProvider(
+      [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
+      new SqlHoverProvider(jsonServices, schemas),
+    ),
+    vscode.languages.registerDefinitionProvider(
+      [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
+      new SqlDefinitionProvider(jsonServices, schemas),
+    ),
   );
 }
 

@@ -69,6 +69,9 @@ export interface SqlAstNode {
   readonly outputName: string;
   readonly start: number;
   readonly end: number;
+  /** Exact source range of the node's own name (for example a function name). */
+  readonly nameStart: number;
+  readonly nameEnd: number;
   readonly args: Readonly<Record<string, SqlAstValue>>;
 }
 
@@ -101,7 +104,7 @@ export function parseSqlAst(
       if (statements.some((statement) => statement instanceof CommandExpr)) continue;
       return {
         statements: statements.flatMap((statement) => (
-          statement ? [normalizeExpression(statement)] : []
+          statement ? [decorateNameSpans(normalizeExpression(statement), masked)] : []
         )),
         parserDialect,
       };
@@ -179,8 +182,60 @@ function normalizeExpression(expression: Expression): SqlAstNode {
     outputName: expression.outputName,
     start,
     end,
+    nameStart: start,
+    nameEnd: end,
     args,
   };
+}
+
+function decorateNameSpans(node: SqlAstNode, text: string): SqlAstNode {
+  const args = Object.fromEntries(Object.entries(node.args).map(([key, value]) => [
+    key,
+    decorateValueNameSpans(value, text),
+  ]));
+  const own = exactNodeNameSpan(node, text);
+  return {
+    ...node,
+    args,
+    nameStart: own.start,
+    nameEnd: own.end,
+  };
+}
+
+function decorateValueNameSpans(value: SqlAstValue, text: string): SqlAstValue {
+  if (isSqlAstNode(value)) return decorateNameSpans(value, text);
+  if (Array.isArray(value)) return value.map((entry) => decorateValueNameSpans(entry, text));
+  return value;
+}
+
+function exactNodeNameSpan(node: SqlAstNode, text: string): { start: number; end: number } {
+  if (node.role === 'identifier' || node.role === 'literal') {
+    return { start: node.start, end: node.end };
+  }
+  if (node.role !== 'function' && node.role !== 'unnest') {
+    return { start: node.start, end: node.end };
+  }
+  const rawName = node.name || node.kind;
+  const name = rawName.replace(/^!/u, '');
+  if (!name || name === 'anonymous') return { start: node.start, end: node.end };
+  const childStarts = Object.values(node.args).flatMap(collectValueSpans).map((span) => span.start);
+  const before = childStarts.length > 0 ? Math.min(...childStarts) : node.end;
+  const searchStart = Math.max(0, Math.min(node.start, before) - name.length - 32);
+  const searchEnd = Math.min(text.length, Math.max(before, node.end) + 1);
+  const segment = text.slice(searchStart, searchEnd);
+  const matcher = new RegExp(`\\b${escapeRegExp(name)}\\b(?=\\s*\\()`, 'giu');
+  let best: RegExpExecArray | undefined;
+  for (const match of segment.matchAll(matcher)) {
+    const absolute = searchStart + match.index;
+    if (absolute <= before) best = match;
+  }
+  if (!best) return { start: node.start, end: Math.min(node.end, node.start + name.length) };
+  const start = searchStart + best.index;
+  return { start, end: start + best[0].length };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 function normalizeValue(value: unknown): SqlAstValue {

@@ -16,6 +16,7 @@ A VS Code extension for AIOps Spark job configurations. It lets strings in `*.sq
 - Preserves strict JSON diagnostics, JSON Schema validation, completion, and hover information.
 - Enhances regular `.sql` files by default and can be disabled when not needed.
 - Optionally builds an offline Schema from workspace DDL and strictly checks table, column, function, projection-count, and safely inferable type references.
+- Provides AST-based SQL Hover and Go to Definition for local query symbols, plus cross-file DDL navigation when the offline Schema is enabled.
 - Warns when unindented continuation lines concatenate SQL words or when `--` comments cross physical lines.
 
 ## Installation
@@ -65,7 +66,7 @@ For the same reason, an SQL `--` comment does not end at the visible line bounda
 | `aiopsSqlJson.keyPatterns` | `["*Sql"]` | Case-sensitive full-property-name globs. Supports `*` and `?`; multiple patterns use OR semantics. |
 | `aiopsSqlJson.multilineStrings.allowAll` | `true` | Allows physical line breaks in every JSON string. Disable it to allow them only in SQL strings selected by `keyPatterns`. |
 | `aiopsSqlJson.dialect` | `"spark"` | SQL dialect used for embedded SQL and regular `.sql` files. |
-| `aiopsSqlJson.plainSql.enabled` | `true` | Enables this extension's diagnostics and semantic highlighting for regular `.sql` files. |
+| `aiopsSqlJson.plainSql.enabled` | `true` | Enables this extension's diagnostics, semantic highlighting, completion, Hover, and definitions for regular `.sql` files. |
 | `aiopsSqlJson.schemaValidation.enabled` | `false` | Enables strict offline Schema completion and validation. No database connection or SQL execution is performed. |
 | `aiopsSqlJson.schemaValidation.completionOnly` | `false` | Keeps Schema-aware completion while suppressing all Schema-derived query and DDL diagnostics. Has no effect unless Schema validation is enabled. |
 | `aiopsSqlJson.schemaFiles` | `["${workspaceFolder}/schema/*.sql"]` | Globs for `.sql` files containing explicit tables and inferable views. Relative globs are resolved from the resource's workspace folder. |
@@ -129,6 +130,14 @@ The strict checker covers SELECT, INSERT, UPDATE, DELETE, and MERGE references, 
 Functions absent from the pinned built-in catalog and `aiopsSqlJson.udfs` produce a warning because an offline checker cannot distinguish every server-side UDF or engine-version addition. UDF return types and function arity remain unknown and do not cause cascading type errors. Statements with syntax errors skip semantic validation. A relation name containing a configured placeholder is treated as dynamic and produces no relation or dependent-field diagnostic. Dialect-native aliases remain valid; for example, Spark accepts both `expression alias` and `expression AS alias`.
 
 This is a static, offline approximation of whether a statement can execute. It does not connect to a database and cannot verify permissions, live catalogs, data, engine configuration, execution plans, runtime temporary objects, `ALTER TABLE`, or UDF signatures.
+
+## SQL Hover and Go to Definition
+
+Hover and Go to Definition use the same normalized AST, recursive scopes, and inferred types as the offline checker. They work in regular `.sql` documents and inside SQL JSON strings selected by `aiopsSqlJson.keyPatterns`; JSON escape sequences and physical multiline-string positions are mapped back to the original document. Hover shows the symbol kind, qualified name, inferred recursive type, and source. Relation summaries show at most 20 fields, nested types expand to at most four levels, and omitted fields are counted.
+
+Local symbols do not require `aiopsSqlJson.schemaValidation.enabled`. This includes CTEs, derived tables, projection aliases, Lambda parameters, local DDL, and generator outputs such as `POSEXPLODE`, `UNNEST`, `JSON_TABLE`, ordinality, typed PostgreSQL records, and Impala collection iteration. Cross-file table, view, column, and recursive field information comes from `aiopsSqlJson.schemaFiles`, so those targets are available only while Schema validation is enabled. `schemaValidation.completionOnly` suppresses diagnostics but does not disable Hover or definitions. Setting `plainSql.enabled` to `false` disables these providers in regular `.sql` files.
+
+Definitions are lexical-first. For example, a reference to `r.total` from a CTE jumps to that CTE's projection alias; invoking Go to Definition again on the alias follows the underlying expression or DDL column. Relation aliases and Lambda parameters behave the same way. `USING` columns, ambiguous unqualified columns, and UNION outputs may return multiple same-level targets. Built-in functions and name-only configured UDFs have Hover information but no source definition.
 
 ## Editing embedded SQL
 

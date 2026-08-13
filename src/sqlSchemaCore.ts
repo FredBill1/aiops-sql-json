@@ -19,6 +19,53 @@ export type SqlDataType =
   | { kind: 'map'; keyType: SqlDataType; valueType: SqlDataType }
   | { kind: 'struct'; fields: readonly SchemaColumn[] };
 
+export type SqlSymbolKind =
+  | 'table'
+  | 'view'
+  | 'cte'
+  | 'derived-table'
+  | 'relation-alias'
+  | 'column'
+  | 'field'
+  | 'projection'
+  | 'lambda-parameter'
+  | 'generator-column'
+  | 'function'
+  | 'udf';
+
+export interface SqlSymbolLocation {
+  /** Empty means the SQL text passed to getSqlSymbolAtOffset. */
+  source: string;
+  start: number;
+  end: number;
+  selectionStart: number;
+  selectionEnd: number;
+}
+
+export interface SqlSymbolDefinition {
+  kind: SqlSymbolKind;
+  name: string;
+  qualifiedName?: string;
+  location: SqlSymbolLocation;
+}
+
+export interface SqlSymbolResolution {
+  reference: { start: number; end: number };
+  kind: SqlSymbolKind;
+  name: string;
+  qualifiedName?: string;
+  dataType?: SqlDataType;
+  type?: string;
+  relation?: {
+    kind: 'table' | 'view' | 'cte' | 'derived-table' | 'generator';
+    name: string;
+    columns: readonly SchemaColumn[];
+  };
+  definitions: readonly SqlSymbolDefinition[];
+  functionCategory?: 'builtin' | 'udf';
+  dialect?: SqlDialect;
+}
+
 export interface SchemaColumn {
   name: string;
   normalizedName: string;
@@ -27,6 +74,7 @@ export interface SchemaColumn {
   dataType?: SqlDataType;
   start: number;
   end: number;
+  definitions?: readonly SqlSymbolDefinition[];
 }
 
 export interface SchemaTable {
@@ -39,6 +87,7 @@ export interface SchemaTable {
   source: string;
   start: number;
   end: number;
+  definitions?: readonly SqlSymbolDefinition[];
 }
 
 export interface SchemaIssue {
@@ -60,6 +109,7 @@ export interface SchemaViewDefinition {
   normalizedLeafName: string;
   query: string;
   explicitColumns: readonly string[];
+  explicitColumnDefinitions?: readonly SqlSymbolDefinition[];
   dialect: SqlDialect;
   source: string;
   start: number;
@@ -87,6 +137,9 @@ export interface RelationBinding {
   columns: readonly SchemaColumn[];
   unresolved: boolean;
   dynamic?: boolean;
+  kind?: 'table' | 'view' | 'cte' | 'derived-table' | 'generator';
+  definitions?: readonly SqlSymbolDefinition[];
+  targetDefinitions?: readonly SqlSymbolDefinition[];
 }
 
 export interface SqlScopeInfo {
@@ -100,6 +153,7 @@ interface MutableScope {
   depth: number;
   relations: RelationBinding[];
   projectionAliases: Set<string>;
+  projectionColumns: Map<string, SchemaColumn>;
 }
 
 interface AstScope extends MutableScope {
@@ -132,6 +186,7 @@ interface LocalSchemaState {
 
 const EMPTY_SCHEMA: SchemaSnapshot = { tables: [], issues: [] };
 const UNKNOWN_DATA_TYPE: SqlDataType = { kind: 'unknown' };
+export const CURRENT_SQL_DOCUMENT_SOURCE = 'aiops-sql-current:';
 
 export function parseDdlSchema(
   text: string,
@@ -198,7 +253,25 @@ function parseAstDdlSchema(
         if (!identifier?.name) return [];
         const typeNode = astChild(definition, 'kind');
         const type = typeNode ? astDataTypeText(typeNode) : '';
-        return [declaredColumn(identifier.name, type, identifier.start, identifier.end, dialect)];
+        const definitions = [symbolDefinition(
+          'column',
+          identifier.name,
+          source,
+          identifier.start,
+          identifier.end,
+        )];
+        const dataType = typeNode
+          ? dataTypeWithAstOrigins(parseSqlDataType(type, dialect), typeNode, dialect, source)
+          : UNKNOWN_DATA_TYPE;
+        return [declaredColumn(
+          identifier.name,
+          type,
+          identifier.start,
+          identifier.end,
+          dialect,
+          dataType,
+          definitions,
+        )];
       });
       const duplicate = firstDuplicateColumn(columns);
       if (duplicate) {
@@ -231,6 +304,15 @@ function parseAstDdlSchema(
         source,
         start: tableNode.start,
         end: tableNode.end,
+        definitions: [symbolDefinition(
+          'table',
+          name,
+          source,
+          tableNode.start,
+          tableNode.end,
+          astNameSpan(tableNode),
+          name,
+        )],
       });
       continue;
     }
@@ -264,15 +346,19 @@ function parseAstDdlSchema(
       });
       continue;
     }
-    const explicitColumns = schema
-      ? astChildren(schema, 'expressions').filter((node) => node.role === 'identifier').map((node) => node.name)
+    const explicitColumnNodes = schema
+      ? astChildren(schema, 'expressions').filter((node) => node.role === 'identifier')
       : [];
+    const explicitColumns = explicitColumnNodes.map((node) => node.name);
     views.push({
       name,
       normalizedName,
       normalizedLeafName,
       query: text.slice(queryStart, queryEnd),
       explicitColumns,
+      explicitColumnDefinitions: explicitColumnNodes.map((node) => symbolDefinition(
+        'column', node.name, source, node.start, node.end,
+      )),
       dialect,
       source,
       start: tableNode.start,
@@ -350,8 +436,17 @@ export function createSchemaSnapshot(
       if (view.explicitColumns.length > 0 && columns.length === view.explicitColumns.length) {
         columns = view.explicitColumns.map((name, index) => {
           const inferred = columns[index];
-          return virtualColumn(name, inferred?.typeFamily ?? 'unknown', inferred?.type ?? '');
+          return renameVirtualColumn(
+            name,
+            inferred,
+            view.dialect,
+            view.explicitColumnDefinitions?.[index]
+              ? [view.explicitColumnDefinitions[index]!]
+              : undefined,
+          );
         });
+      } else {
+        columns = columns.map((column) => rebaseColumnDefinitions(column, view.queryStart, view.source));
       }
       const validColumns = columns.length > 0 && columns.every((column) => isUsableOutputColumn(column.name));
       if (model.issues.length === 0 && validColumns
@@ -365,6 +460,10 @@ export function createSchemaSnapshot(
           source: view.source,
           start: view.start,
           end: view.end,
+          definitions: [symbolDefinition(
+            'view', view.name, view.source, view.start, view.end,
+            { start: view.start, end: view.end }, view.name,
+          )],
         });
         resolvedAny = true;
       } else {
@@ -529,6 +628,111 @@ export function getSqlScopeInfo(
   return { fields, relations: uniqueRelations };
 }
 
+export function getSqlSymbolAtOffset(
+  text: string,
+  offset: number,
+  dialect: SqlDialect,
+  placeholders: readonly RegExp[],
+  snapshot: SchemaSnapshot,
+  udfs: readonly string[] = [],
+): SqlSymbolResolution | undefined {
+  if (findPlaceholderRanges(text, placeholders).some((range) => offset >= range.start && offset <= range.end)) {
+    return undefined;
+  }
+  const statements = splitSqlStatements(text, dialect, placeholders);
+  const statement = statements.find((candidate) => candidate.start <= offset && candidate.end >= offset);
+  if (!statement) return undefined;
+  const effective = getSqlSchemaAtOffset(text, statement.start, dialect, placeholders, snapshot, udfs);
+  const localOffset = Math.max(0, Math.min(statement.text.length, offset - statement.start));
+  const kind = sqlStatementKind(statement.text);
+  if (kind === 'create' || kind === 'drop') {
+    const declaration = resolveDdlSymbolAtOffset(statement.text, localOffset, dialect, effective);
+    return declaration ? offsetSymbolResolution(declaration, statement.start) : undefined;
+  }
+  if (!isDataStatementKind(kind)) return undefined;
+  const model = buildSqlModel(statement.text, dialect, effective, placeholders, udfs, true);
+  const matches = model.symbols.filter((symbol) => (
+    localOffset >= symbol.reference.start && localOffset <= symbol.reference.end
+  )).sort((left, right) => {
+    const leftLength = left.reference.end - left.reference.start;
+    const rightLength = right.reference.end - right.reference.start;
+    return leftLength - rightLength || symbolPriority(left.kind) - symbolPriority(right.kind);
+  });
+  const symbol = matches[0];
+  return symbol ? offsetSymbolResolution(symbol, statement.start) : undefined;
+}
+
+function resolveDdlSymbolAtOffset(
+  text: string,
+  offset: number,
+  dialect: SqlDialect,
+  snapshot: SchemaSnapshot,
+): SqlSymbolResolution | undefined {
+  const statement = parseSqlAst(text, dialect)?.statements[0];
+  if (!statement) return undefined;
+  const target = astChild(statement, 'this');
+  const schema = target?.role === 'schema' ? target : undefined;
+  const tableNode = schema ? astChild(schema, 'this') : target;
+  if (tableNode) {
+    const tableSpan = astNameSpan(tableNode);
+    if (offset >= tableSpan.start && offset <= tableSpan.end) {
+      const name = astTableName(tableNode);
+      const table = resolveSchemaTable(snapshot, name, dialect).table;
+      return {
+        reference: tableSpan,
+        kind: table?.kind ?? (statement.role === 'create' && astPrimitiveString(statement.args.kind) === 'view' ? 'view' : 'table'),
+        name,
+        qualifiedName: table?.name ?? name,
+        relation: table ? { kind: table.kind, name: table.name, columns: table.columns } : undefined,
+        definitions: statement.role === 'drop' ? table?.definitions ?? [] : [],
+      };
+    }
+  }
+  for (const definition of schema ? collectAstNodes(schema, (node) => node.kind === 'columnDef') : []) {
+    const identifier = astChild(definition, 'this');
+    if (!identifier || offset < identifier.start || offset > identifier.end) continue;
+    const dataTypeNode = astChild(definition, 'kind');
+    const dataType = dataTypeNode ? parseSqlDataType(astDataTypeText(dataTypeNode), dialect) : UNKNOWN_DATA_TYPE;
+    return {
+      reference: { start: identifier.start, end: identifier.end },
+      kind: 'column',
+      name: identifier.name,
+      dataType,
+      type: displaySqlDataType(dataType),
+      definitions: [],
+    };
+  }
+  return undefined;
+}
+
+function offsetSymbolResolution(symbol: SqlSymbolResolution, offset: number): SqlSymbolResolution {
+  return {
+    ...symbol,
+    reference: { start: symbol.reference.start + offset, end: symbol.reference.end + offset },
+    definitions: symbol.definitions.map((definition) => {
+      if (definition.location.source) return definition;
+      const location = definition.location;
+      return {
+        ...definition,
+        location: {
+          ...location,
+          start: location.start + offset,
+          end: location.end + offset,
+          selectionStart: location.selectionStart + offset,
+          selectionEnd: location.selectionEnd + offset,
+        },
+      };
+    }),
+  };
+}
+
+function symbolPriority(kind: SqlSymbolKind): number {
+  if (kind === 'lambda-parameter') return 0;
+  if (kind === 'field' || kind === 'column' || kind === 'projection') return 1;
+  if (kind === 'relation-alias' || kind === 'cte' || kind === 'table' || kind === 'view') return 2;
+  return 3;
+}
+
 type SqlStatementKind = 'create' | 'drop' | 'select' | 'insert' | 'update' | 'delete' | 'merge' | 'other';
 
 function splitSqlStatements(
@@ -647,7 +851,7 @@ function applyLocalDdl(
         'duplicate-local-object',
       )] : [];
     }
-    const parsed = parseAstDdlSchema(text, dialect, 'local', [astStatement]);
+    const parsed = parseAstDdlSchema(text, dialect, '', [astStatement]);
     if (kind === 'table') {
       const parsedTable = parsed.tables[0];
       if (!parsedTable) {
@@ -667,6 +871,16 @@ function applyLocalDdl(
         source: 'local',
         start: statement.start + parsedTable.start,
         end: statement.start + parsedTable.end,
+        columns: parsedTable.columns.map((column) => rebaseColumnDefinitions(
+          column,
+          statement.start,
+          CURRENT_SQL_DOCUMENT_SOURCE,
+        )),
+        definitions: rebaseDefinitions(
+          parsedTable.definitions,
+          statement.start,
+          CURRENT_SQL_DOCUMENT_SOURCE,
+        ),
       });
       return [];
     }
@@ -699,8 +913,22 @@ function applyLocalDdl(
       }
       columns = view.explicitColumns.map((name, index) => {
         const inferred = columns[index];
-        return virtualColumn(name, inferred?.typeFamily ?? 'unknown', inferred?.type ?? '');
+        const explicitDefinition = view.explicitColumnDefinitions?.[index];
+        return renameVirtualColumn(
+          name,
+          inferred,
+          dialect,
+          explicitDefinition
+            ? rebaseDefinitions([explicitDefinition], statement.start, CURRENT_SQL_DOCUMENT_SOURCE)
+            : undefined,
+        );
       });
+    } else {
+      columns = columns.map((column) => rebaseColumnDefinitions(
+        column,
+        statement.start + view.queryStart,
+        CURRENT_SQL_DOCUMENT_SOURCE,
+      ));
     }
     if (queryIssues.length > 0 || columns.length === 0 || !columns.every((column) => isUsableOutputColumn(column.name))) {
       return reportIssues ? [
@@ -726,6 +954,18 @@ function applyLocalDdl(
       source: 'local',
       start: statement.start + objectNode.start,
       end: statement.start + objectNode.end,
+      definitions: [symbolDefinition(
+        'view',
+        name,
+        CURRENT_SQL_DOCUMENT_SOURCE,
+        statement.start + objectNode.start,
+        statement.start + objectNode.end,
+        {
+          start: statement.start + astNameSpan(objectNode).start,
+          end: statement.start + astNameSpan(objectNode).end,
+        },
+        name,
+      )],
     });
     return [];
   }
@@ -818,7 +1058,12 @@ function buildSqlModel(
   placeholders: readonly RegExp[],
   udfs: readonly string[],
   validate: boolean,
-): { scopes: MutableScope[]; references: IdentifierReference[]; issues: SqlSemanticIssue[] } {
+): {
+  scopes: MutableScope[];
+  references: IdentifierReference[];
+  issues: SqlSemanticIssue[];
+  symbols: SqlSymbolResolution[];
+} {
   const ast = parseSqlAst(text, dialect, placeholders);
   if (ast && ast.statements.length > 0) {
     return buildAstSqlModel(text, dialect, snapshot, placeholders, udfs, validate, ast.statements);
@@ -826,10 +1071,18 @@ function buildSqlModel(
   // Syntax has already been checked by the caller. If normalization is not
   // possible, skip claims that cannot be proven instead of guessing from DT
   // entity contexts or source-text fragments.
-  return {
-    scopes: [{ start: 0, end: text.length, depth: 0, relations: [], projectionAliases: new Set() }],
+    return {
+    scopes: [{
+      start: 0,
+      end: text.length,
+      depth: 0,
+      relations: [],
+      projectionAliases: new Set(),
+      projectionColumns: new Map(),
+    }],
     references: [],
     issues: [],
+    symbols: [],
   };
 }
 
@@ -839,20 +1092,33 @@ interface AstModelContext {
   readonly snapshot: SchemaSnapshot;
   readonly placeholderRanges: readonly { start: number; end: number }[];
   readonly functions: ReadonlySet<string>;
+  readonly builtinFunctions: ReadonlySet<string>;
+  readonly udfs: ReadonlySet<string>;
   readonly validate: boolean;
   readonly scopes: AstScope[];
   readonly references: IdentifierReference[];
   readonly issues: SqlSemanticIssue[];
+  readonly symbols: SqlSymbolResolution[];
 }
 
 interface AstColumnResolution {
   readonly status: 'ambiguous' | 'found' | 'missing-column' | 'missing-qualifier' | 'unresolved';
   readonly column?: SchemaColumn;
+  readonly rootColumn?: SchemaColumn;
+  readonly nestedColumns?: readonly SchemaColumn[];
+  readonly binding?: RelationBinding;
+  readonly candidates?: readonly { binding: RelationBinding; column: SchemaColumn }[];
+  readonly relationPrefixLength?: number;
   readonly qualifier?: string;
   readonly missingName?: string;
 }
 
-type AstTypeEnvironment = ReadonlyMap<string, SqlDataType>;
+interface AstTypeBinding {
+  readonly dataType: SqlDataType;
+  readonly definition?: SqlSymbolDefinition;
+}
+
+type AstTypeEnvironment = ReadonlyMap<string, AstTypeBinding>;
 const EMPTY_AST_TYPE_ENVIRONMENT: AstTypeEnvironment = new Map();
 
 function buildAstSqlModel(
@@ -863,27 +1129,36 @@ function buildAstSqlModel(
   udfs: readonly string[],
   validate: boolean,
   statements: readonly SqlAstNode[],
-): { scopes: MutableScope[]; references: IdentifierReference[]; issues: SqlSemanticIssue[] } {
+): {
+  scopes: MutableScope[];
+  references: IdentifierReference[];
+  issues: SqlSemanticIssue[];
+  symbols: SqlSymbolResolution[];
+} {
   const catalog = getSqlCatalog(dialect);
+  const builtinFunctions = new Set([
+    ...catalog.functions.map((name) => normalizeQualifiedName(name, dialect)),
+    'explode', 'explode_outer', 'posexplode', 'posexplode_outer', 'unnest', 'json_table',
+    'jsonb_array_elements', 'jsonb_array_elements_text',
+    'count', 'sum', 'avg', 'min', 'max', 'row_number', 'rank', 'dense_rank',
+    'transform', 'filter', 'exists', 'forall', 'aggregate', 'reduce', 'zip_with',
+    'map_filter', 'map_zip_with', 'transform_keys', 'transform_values', 'array_sort',
+    'named_struct', 'struct', 'array', 'map', 'element_at', 'try_element_at',
+  ]);
+  const configuredUdfs = new Set(udfs.map((name) => normalizeQualifiedName(name, dialect)));
   const context: AstModelContext = {
     text,
     dialect,
     snapshot,
     placeholderRanges: findPlaceholderRanges(text, placeholders),
-    functions: new Set([
-      ...catalog.functions.map((name) => normalizeQualifiedName(name, dialect)),
-      ...udfs.map((name) => normalizeQualifiedName(name, dialect)),
-      'explode', 'explode_outer', 'posexplode', 'posexplode_outer', 'unnest', 'json_table',
-      'jsonb_array_elements', 'jsonb_array_elements_text',
-      'count', 'sum', 'avg', 'min', 'max', 'row_number', 'rank', 'dense_rank',
-      'transform', 'filter', 'exists', 'forall', 'aggregate', 'reduce', 'zip_with',
-      'map_filter', 'map_zip_with', 'transform_keys', 'transform_values', 'array_sort',
-      'named_struct', 'struct', 'array', 'map', 'element_at', 'try_element_at',
-    ]),
+    functions: new Set([...builtinFunctions, ...configuredUdfs]),
+    builtinFunctions,
+    udfs: configuredUdfs,
     validate,
     scopes: [],
     references: [],
     issues: [],
+    symbols: [],
   };
   for (const statement of statements) {
     analyzeAstStatement(statement, context, new Map());
@@ -892,6 +1167,7 @@ function buildAstSqlModel(
     scopes: context.scopes,
     references: context.references,
     issues: deduplicateSemanticIssues(context.issues),
+    symbols: deduplicateSymbolResolutions(context.symbols),
   };
 }
 
@@ -938,7 +1214,14 @@ function analyzeAstQuery(
         }
       }
     }
-    return leftColumns;
+    return leftColumns.map((column, index) => {
+      const rightColumn = rightColumns[index];
+      const definitions = deduplicateDefinitions([
+        ...(column.definitions ?? []),
+        ...(rightColumn?.definitions ?? []),
+      ]);
+      return definitions.length > 0 ? { ...column, definitions } : column;
+    });
   }
   if (query.role !== 'select') return deriveAstValuesColumns(query, context, parent);
 
@@ -948,6 +1231,7 @@ function analyzeAstQuery(
     depth: parent ? parent.depth + 1 : 0,
     relations: [],
     projectionAliases: new Set(),
+    projectionColumns: new Map(),
     parent,
   };
   context.scopes.push(scope);
@@ -960,7 +1244,27 @@ function analyzeAstQuery(
     let columns = cteQuery ? analyzeAstQuery(cteQuery, context, undefined, ctes) : [];
     const explicitColumns = cte.aliasColumns;
     if (explicitColumns.length > 0) {
-      columns = explicitColumns.map((name, index) => renameVirtualColumn(name, columns[index], context.dialect));
+      const sourceColumns = columns;
+      const aliasNode = astChild(cte, 'alias');
+      const explicitNodes = aliasNode ? astChildren(aliasNode, 'columns') : [];
+      columns = explicitColumns.map((name, index) => {
+        const identifier = explicitNodes[index];
+        const definition = identifier
+          ? [symbolDefinition('projection', name, '', identifier.start, identifier.end)]
+          : undefined;
+        return renameVirtualColumn(name, columns[index], context.dialect, definition);
+      });
+      explicitNodes.forEach((identifier, index) => {
+        const sourceColumn = sourceColumns[index];
+        appendSymbol(context, {
+          reference: { start: identifier.start, end: identifier.end },
+          kind: 'projection',
+          name: identifier.name,
+          dataType: sourceColumn ? columnDataType(sourceColumn, context.dialect) : UNKNOWN_DATA_TYPE,
+          type: sourceColumn ? displaySqlDataType(columnDataType(sourceColumn, context.dialect)) : undefined,
+          definitions: sourceColumn?.definitions ?? [],
+        });
+      });
     }
     const name = cte.alias;
     if (name) {
@@ -970,12 +1274,27 @@ function analyzeAstQuery(
         continue;
       }
       localCteNames.add(normalizedName);
+      const aliasIdentifier = astAliasIdentifier(cte);
+      const definition = aliasIdentifier
+        ? symbolDefinition('cte', name, '', cte.start, cte.end, aliasIdentifier)
+        : symbolDefinition('cte', name, '', cte.start, cte.end);
       ctes.set(normalizedName, {
         name,
         aliases: [normalizeQualifiedName(name, context.dialect)],
         columns,
         unresolved: false,
+        kind: 'cte',
+        definitions: [definition],
       });
+      if (aliasIdentifier) {
+        appendSymbol(context, {
+          reference: aliasIdentifier,
+          kind: 'cte',
+          name,
+          relation: { kind: 'cte', name, columns },
+          definitions: [],
+        });
+      }
     }
   }
 
@@ -1002,6 +1321,12 @@ function analyzeAstQuery(
       scope.projectionAliases.add(normalizeBareIdentifier(projection.alias, context.dialect));
     }
   }
+  const outputColumns = deriveAstProjectionColumns(projections, scope, context);
+  for (const column of outputColumns) {
+    if (scope.projectionAliases.has(column.normalizedName)) {
+      scope.projectionColumns.set(column.normalizedName, column);
+    }
+  }
   if (context.validate) {
     for (const projection of projections) validateAstExpression(projection, scope, ctes, context);
     for (const join of astChildren(query, 'joins')) {
@@ -1019,7 +1344,7 @@ function analyzeAstQuery(
       if (clause) collectAstReferences(clause, context);
     }
   }
-  return deriveAstProjectionColumns(projections, scope, context);
+  return outputColumns;
 }
 
 function astQueryStart(text: string, firstNodeStart: number): number {
@@ -1040,14 +1365,14 @@ function bindAstRelation(
   if (relation.role === 'subquery') {
     const query = astChild(relation, 'this');
     const columns = query ? analyzeAstQuery(query, context, undefined, ctes) : [];
-    return astDerivedBinding(relation, columns, context.dialect);
+    return astDerivedBinding(relation, columns, context);
   }
   if (relation.role === 'lateral') {
     const source = astChild(relation, 'this');
     if (source?.role === 'subquery') {
       const query = astChild(source, 'this');
       const columns = query ? analyzeAstQuery(query, context, scope, ctes) : [];
-      return astDerivedBinding(relation.alias ? relation : source, columns, context.dialect);
+      return astDerivedBinding(relation.alias ? relation : source, columns, context);
     }
     return bindAstExpansion(source ?? relation, relation, scope, ctes, context);
   }
@@ -1055,7 +1380,7 @@ function bindAstRelation(
     return bindAstExpansion(relation, relation, scope, ctes, context);
   }
   if (relation.role !== 'table') {
-    return astDerivedBinding(relation, [], context.dialect, true);
+    return astDerivedBinding(relation, [], context, true);
   }
 
   const tableExpression = astChild(relation, 'this');
@@ -1073,7 +1398,16 @@ function bindAstRelation(
   if (collection) return collection;
   const cte = ctes.get(normalizeQualifiedName(name, context.dialect));
   if (cte) {
-    return { name: relation.alias || cte.name, aliases, columns: cte.columns, unresolved: false };
+    const binding = relationBindingWithDefinitions(relation, {
+      name: relation.alias || cte.name,
+      aliases,
+      columns: cte.columns,
+      unresolved: false,
+      kind: 'cte',
+      targetDefinitions: cte.definitions,
+    }, context);
+    appendRelationReference(relation, name, binding, cte.definitions ?? [], context);
+    return binding;
   }
   const resolution = resolveSchemaTable(context.snapshot, name, context.dialect);
   if (context.validate && resolution.status !== 'found') {
@@ -1083,12 +1417,17 @@ function bindAstRelation(
         ? `Table reference ${name} is ambiguous in the configured schema.`
         : `Unknown table ${name}.`);
   }
-  return {
+  const table = resolution.table;
+  const binding = relationBindingWithDefinitions(relation, {
     name: relation.alias || name,
     aliases,
-    columns: resolution.table?.columns ?? [],
+    columns: table?.columns ?? [],
     unresolved: resolution.status !== 'found',
-  };
+    kind: table?.kind,
+    targetDefinitions: table?.definitions,
+  }, context);
+  if (table) appendRelationReference(relation, name, binding, table.definitions ?? [], context, table.name);
+  return binding;
 }
 
 function bindImpalaCollectionRelation(
@@ -1104,22 +1443,32 @@ function bindImpalaCollectionRelation(
   const dataType = columnDataType(resolution.column, context.dialect);
   let columns: SchemaColumn[] = [];
   if (dataType.kind === 'array') {
-    columns = [virtualColumn('item', dataTypeFamily(dataType.elementType), '', dataType.elementType)];
+    columns = [virtualColumn(
+      'item',
+      dataTypeFamily(dataType.elementType),
+      '',
+      dataType.elementType,
+      resolution.column.definitions,
+    )];
   } else if (dataType.kind === 'map') {
     columns = [
-      virtualColumn('key', dataTypeFamily(dataType.keyType), '', dataType.keyType),
-      virtualColumn('value', dataTypeFamily(dataType.valueType), '', dataType.valueType),
+      virtualColumn('key', dataTypeFamily(dataType.keyType), '', dataType.keyType, resolution.column.definitions),
+      virtualColumn('value', dataTypeFamily(dataType.valueType), '', dataType.valueType, resolution.column.definitions),
     ];
   } else {
     return undefined;
   }
   const alias = relation.alias || path.at(-1) || relation.name;
-  return {
+  const binding = relationBindingWithDefinitions(relation, {
     name: alias,
     aliases: [normalizeQualifiedName(alias, context.dialect)],
     columns,
     unresolved: false,
-  };
+    kind: 'generator',
+    targetDefinitions: resolution.column?.definitions,
+  }, context);
+  recordAstPathSymbols(astTablePathNodes(relation), resolution, context);
+  return binding;
 }
 
 function bindAstExpansion(
@@ -1177,28 +1526,102 @@ function bindAstExpansion(
 
   const typedAliasColumns = astTypedAliasColumns(relation, source, context.dialect);
   if (typedAliasColumns.length > 0) columns = typedAliasColumns;
+  const implicitDefinition = symbolDefinition(
+    'generator-column',
+    source.name || source.kind,
+    '',
+    source.start,
+    source.end,
+    { start: source.nameStart, end: source.nameEnd },
+  );
+  columns = columns.map((column) => (
+    column.definitions?.length ? column : { ...column, definitions: [implicitDefinition] }
+  ));
   const explicit = relation.aliasColumns.length > 0 ? relation.aliasColumns : source.aliasColumns;
+  const aliasNode = astChild(relation, 'alias') ?? astChild(source, 'alias');
+  const explicitNodes = aliasNode ? astChildren(aliasNode, 'columns') : [];
   if (explicit.length > 0) {
     columns = columns.map((column, index) => (
-      explicit[index] ? renameVirtualColumn(explicit[index]!, column, context.dialect) : column
+      explicit[index] ? renameVirtualColumn(
+        explicit[index]!,
+        column,
+        context.dialect,
+        explicitNodes[index]
+          ? [symbolDefinition(
+              'generator-column',
+              explicit[index]!,
+              '',
+              explicitNodes[index]!.start,
+              explicitNodes[index]!.end,
+            )]
+          : column.definitions,
+      ) : column
     ));
     if (columns.length === 0) {
-      columns = explicit.map((name) => renameVirtualColumn(name, undefined, context.dialect));
+      columns = explicit.map((name, index) => renameVirtualColumn(
+        name,
+        undefined,
+        context.dialect,
+        explicitNodes[index]
+          ? [symbolDefinition('generator-column', name, '', explicitNodes[index]!.start, explicitNodes[index]!.end)]
+          : undefined,
+      ));
     }
   } else if (columns.length === 0) {
-    columns = [virtualColumn(source.outputName || source.name || 'col')];
+    columns = [virtualColumn(
+      source.outputName || source.name || 'col',
+      'unknown',
+      '',
+      UNKNOWN_DATA_TYPE,
+      [symbolDefinition(
+        'generator-column',
+        source.outputName || source.name || 'col',
+        '',
+        source.start,
+        source.end,
+        { start: source.nameStart, end: source.nameEnd },
+      )],
+    )];
   }
   const offset = astChild(source, 'offset') ?? astChild(relation, 'offset');
   if (offset && !findColumn(columns, offset.name || 'ordinality', context.dialect)) {
-    columns.push(virtualColumn(offset.name || 'ordinality', 'number'));
+    columns.push(virtualColumn(
+      offset.name || 'ordinality',
+      'number',
+      '',
+      dataTypeFromFamily('number'),
+      [symbolDefinition('generator-column', offset.name || 'ordinality', '', offset.start, offset.end)],
+    ));
   }
   const alias = relation.alias || source.alias || source.name || source.kind;
-  return {
+  const binding = relationBindingWithDefinitions(relation.alias ? relation : source, {
     name: alias,
     aliases: alias ? [normalizeQualifiedName(alias, context.dialect)] : [],
     columns,
     unresolved: false,
-  };
+    kind: 'generator',
+    targetDefinitions: [symbolDefinition(
+      'function',
+      source.name || source.kind,
+      '',
+      source.start,
+      source.end,
+      { start: source.nameStart, end: source.nameEnd },
+    )],
+  }, context);
+  for (let index = 0; index < explicitNodes.length; index += 1) {
+    const identifier = explicitNodes[index]!;
+    const column = columns[index];
+    appendSymbol(context, {
+      reference: { start: identifier.start, end: identifier.end },
+      kind: 'generator-column',
+      name: identifier.name,
+      dataType: column ? columnDataType(column, context.dialect) : UNKNOWN_DATA_TYPE,
+      type: column ? displaySqlDataType(columnDataType(column, context.dialect)) : undefined,
+      definitions: [],
+    });
+  }
+  return binding;
 }
 
 function astJsonTableColumns(schema: SqlAstNode, dialect: SqlDialect): SchemaColumn[] {
@@ -1206,11 +1629,17 @@ function astJsonTableColumns(schema: SqlAstNode, dialect: SqlDialect): SchemaCol
     const nested = astChild(definition, 'nestedSchema');
     if (nested) return astJsonTableColumns(nested, dialect);
     if (!definition.name) return [];
-    if (definition.args.ordinality === true) return [virtualColumn(definition.name, 'number')];
+    const identifier = astChild(definition, 'this') ?? definition;
+    const definitions = [symbolDefinition(
+      'generator-column', definition.name, '', identifier.start, identifier.end,
+    )];
+    if (definition.args.ordinality === true) {
+      return [virtualColumn(definition.name, 'number', '', dataTypeFromFamily('number'), definitions)];
+    }
     const dataTypeNode = astChild(definition, 'kind');
     const type = dataTypeNode ? astDataTypeText(dataTypeNode) : '';
     const dataType = parseSqlDataType(type, dialect);
-    return [virtualColumn(definition.name, dataTypeFamily(dataType), type, dataType)];
+    return [virtualColumn(definition.name, dataTypeFamily(dataType), type, dataType, definitions)];
   });
 }
 
@@ -1228,7 +1657,13 @@ function astTypedAliasColumns(
     if (!identifier?.name || !dataTypeNode) return [];
     const type = astDataTypeText(dataTypeNode);
     const dataType = parseSqlDataType(type, dialect);
-    return [virtualColumn(identifier.name, dataTypeFamily(dataType), type, dataType)];
+    return [virtualColumn(
+      identifier.name,
+      dataTypeFamily(dataType),
+      type,
+      dataType,
+      [symbolDefinition('generator-column', identifier.name, '', identifier.start, identifier.end)],
+    )];
   });
 }
 
@@ -1245,6 +1680,25 @@ function validateAstUsing(
     if (!leftHas || !rightHas) {
       appendAstIssue(context, identifier, 'unknown-column',
         `USING column ${identifier.name} must exist on both sides of the join.`);
+    } else {
+      const columns = [
+        ...leftRelations.flatMap((binding) => {
+          const column = findColumn(binding.columns, identifier.name, context.dialect);
+          return column ? [column] : [];
+        }),
+        ...(() => {
+          const column = findColumn(right.columns, identifier.name, context.dialect);
+          return column ? [column] : [];
+        })(),
+      ];
+      appendSymbol(context, {
+        reference: { start: identifier.start, end: identifier.end },
+        kind: 'column',
+        name: identifier.name,
+        dataType: columns[0] ? columnDataType(columns[0], context.dialect) : UNKNOWN_DATA_TYPE,
+        type: columns[0]?.type,
+        definitions: deduplicateDefinitions(columns.flatMap((column) => column.definitions ?? [])),
+      });
     }
   }
 }
@@ -1266,15 +1720,48 @@ function validateAstExpression(
     validateAstColumn(node, scope, context);
     return;
   }
-  if (node.role === 'identifier' && environment.has(normalizeBareIdentifier(node.name, context.dialect))) return;
-  if (node.role === 'function') {
-    const name = node.name;
-    if (node.kind === 'anonymous' && name) {
-      context.references.push({ text: name, parts: [name], start: node.start, end: node.end, isFunction: true });
-      if (!context.functions.has(normalizeQualifiedName(name, context.dialect))) {
-        appendAstIssue(context, node, 'unknown-function',
-          `Unknown function ${name}. Add it to aiopsSqlJson.udfs if it is user-defined.`, 'warning');
-      }
+  if (node.role === 'identifier') {
+    const binding = environment.get(normalizeBareIdentifier(node.name, context.dialect));
+    if (binding) {
+      appendSymbol(context, {
+        reference: { start: node.start, end: node.end },
+        kind: 'lambda-parameter',
+        name: node.name,
+        dataType: binding.dataType,
+        type: displaySqlDataType(binding.dataType),
+        definitions: binding.definition ? [binding.definition] : [],
+      });
+      return;
+    }
+  }
+  if (node.role === 'function' || node.role === 'unnest') {
+    const name = (node.name || node.kind).replace(/^!/u, '');
+    const normalized = normalizeQualifiedName(name, context.dialect);
+    const knownFunction = context.functions.has(normalized);
+    const category = context.udfs.has(normalized) ? 'udf' : 'builtin';
+    const dataType = inferAstExpressionType(node, scope, context, environment);
+    if (knownFunction) {
+      appendSymbol(context, {
+        reference: { start: node.nameStart, end: node.nameEnd },
+        kind: category === 'udf' ? 'udf' : 'function',
+        name,
+        dataType,
+        type: displaySqlDataType(dataType),
+        definitions: [],
+        functionCategory: category,
+        dialect: context.dialect,
+      });
+    }
+    context.references.push({
+      text: name,
+      parts: [name],
+      start: node.nameStart,
+      end: node.nameEnd,
+      isFunction: true,
+    });
+    if (node.kind === 'anonymous' && name && !context.functions.has(normalized)) {
+      appendAstIssue(context, node, 'unknown-function',
+        `Unknown function ${name}. Add it to aiopsSqlJson.udfs if it is user-defined.`, 'warning');
     }
   }
   if (validateAstHigherOrderExpression(node, scope, ctes, context, environment)) return;
@@ -1288,6 +1775,7 @@ function validateAstColumn(node: SqlAstNode, scope: AstScope, context: AstModelC
   const qualifier = parts.length > 1 ? parts.slice(0, -1).join('.') : '';
   if (name === '*' && !qualifier) return;
   const resolution = resolveAstColumnPath(scope, parts, context.dialect);
+  recordAstPathSymbols(astColumnPathNodes(node), resolution, context);
   if (resolution.status === 'found' || resolution.status === 'unresolved') return;
   if (resolution.status === 'ambiguous') {
     appendAstIssue(context, node, 'ambiguous-column',
@@ -1325,49 +1813,120 @@ function resolveAstColumnPath(
       if (binding) {
         if (binding.unresolved) return { status: 'unresolved' };
         const columnName = parts[prefixLength]!;
-        if (columnName === '*') return { status: 'found', qualifier };
+        if (columnName === '*') {
+          return { status: 'found', qualifier, binding, relationPrefixLength: prefixLength };
+        }
         const column = findColumn(binding.columns, columnName, dialect);
         if (!column) return { status: 'missing-column', qualifier, missingName: columnName };
-        let dataType = columnDataType(column, dialect);
-        for (const field of parts.slice(prefixLength + 1)) {
-          const nested = fieldDataType(dataType, field, dialect);
-          if (!nested) return { status: 'missing-column', qualifier, missingName: field };
-          dataType = nested;
+        const nested = resolveNestedColumnPath(column, parts.slice(prefixLength + 1), dialect);
+        if (!nested) {
+          return {
+            status: 'missing-column',
+            qualifier,
+            missingName: parts.at(-1),
+            binding,
+            rootColumn: column,
+            relationPrefixLength: prefixLength,
+          };
         }
         const outputName = parts.at(-1) ?? column.name;
         return parts.length === prefixLength + 1
-          ? { status: 'found', column, qualifier }
-          : { status: 'found', column: virtualColumn(outputName, dataTypeFamily(dataType), '', dataType), qualifier };
+          ? {
+              status: 'found', column, rootColumn: column, nestedColumns: [], qualifier, binding,
+              relationPrefixLength: prefixLength,
+            }
+          : {
+              status: 'found',
+              column: virtualColumn(
+                outputName,
+                dataTypeFamily(nested.dataType),
+                '',
+                nested.dataType,
+                nested.columns.at(-1)?.definitions,
+              ),
+              rootColumn: column,
+              nestedColumns: nested.columns,
+              qualifier,
+              binding,
+              relationPrefixLength: prefixLength,
+            };
       }
     }
 
     const name = parts[0]!;
     if (parts.length === 1 && current.projectionAliases.has(normalizeBareIdentifier(name, dialect))) {
-      return { status: 'found' };
+      const column = current.projectionColumns.get(normalizeBareIdentifier(name, dialect));
+      return column
+        ? { status: 'found', column, rootColumn: column, nestedColumns: [], relationPrefixLength: 0 }
+        : { status: 'found' };
     }
     const matches = current.relations.flatMap((binding) => {
       const column = binding.unresolved ? undefined : findColumn(binding.columns, name, dialect);
-      return column ? [column] : [];
+      return column ? [{ binding, column }] : [];
     });
     if (matches.length === 1) {
-      const column = matches[0]!;
-      let dataType = columnDataType(column, dialect);
-      for (const field of parts.slice(1)) {
-        const nested = fieldDataType(dataType, field, dialect);
-        if (!nested) return { status: 'missing-column', missingName: field };
-        dataType = nested;
-      }
+      const { binding, column } = matches[0]!;
+      const nested = resolveNestedColumnPath(column, parts.slice(1), dialect);
+      if (!nested) return { status: 'missing-column', missingName: parts.at(-1), binding, rootColumn: column };
       const outputName = parts.at(-1) ?? column.name;
       return parts.length === 1
-        ? { status: 'found', column }
-        : { status: 'found', column: virtualColumn(outputName, dataTypeFamily(dataType), '', dataType) };
+        ? { status: 'found', column, rootColumn: column, nestedColumns: [], binding, relationPrefixLength: 0 }
+        : {
+            status: 'found',
+            column: virtualColumn(
+              outputName,
+              dataTypeFamily(nested.dataType),
+              '',
+              nested.dataType,
+              nested.columns.at(-1)?.definitions,
+            ),
+            rootColumn: column,
+            nestedColumns: nested.columns,
+            binding,
+            relationPrefixLength: 0,
+          };
     }
-    if (matches.length > 1) return { status: 'ambiguous' };
+    if (matches.length > 1) return { status: 'ambiguous', candidates: matches, relationPrefixLength: 0 };
     if (current.relations.some((binding) => binding.unresolved)) return { status: 'unresolved' };
   }
   return parts.length > 1
     ? { status: 'missing-qualifier', qualifier: parts.slice(0, -1).join('.') }
     : { status: 'missing-column', missingName: parts[0] };
+}
+
+function resolveNestedColumnPath(
+  root: SchemaColumn,
+  fields: readonly string[],
+  dialect: SqlDialect,
+): { dataType: SqlDataType; columns: SchemaColumn[] } | undefined {
+  let dataType = columnDataType(root, dialect);
+  const columns: SchemaColumn[] = [];
+  for (const field of fields) {
+    const resolved = resolveDataTypeField(dataType, field, dialect);
+    if (!resolved) return undefined;
+    columns.push(resolved.column);
+    dataType = resolved.dataType;
+  }
+  return { dataType, columns };
+}
+
+function resolveDataTypeField(
+  dataType: SqlDataType,
+  field: string,
+  dialect: SqlDialect,
+): { dataType: SqlDataType; column: SchemaColumn } | undefined {
+  if (dataType.kind === 'unknown') {
+    return { dataType: UNKNOWN_DATA_TYPE, column: virtualColumn(field) };
+  }
+  if (dataType.kind === 'array') {
+    const nested = resolveDataTypeField(dataType.elementType, field, dialect);
+    return nested
+      ? { dataType: { kind: 'array', elementType: nested.dataType }, column: nested.column }
+      : undefined;
+  }
+  if (dataType.kind !== 'struct') return undefined;
+  const column = findColumn(dataType.fields, field, dialect);
+  return column ? { dataType: columnDataType(column, dialect), column } : undefined;
 }
 
 function validateAstNestedField(
@@ -1380,7 +1939,17 @@ function validateAstNestedField(
   const field = astChild(node, 'expression');
   if (!base || !field?.name) return;
   const dataType = inferAstExpressionType(base, scope, context, environment);
-  if (dataType.kind !== 'unknown' && !fieldDataType(dataType, field.name, context.dialect)) {
+  const resolved = resolveDataTypeField(dataType, field.name, context.dialect);
+  if (resolved) {
+    appendSymbol(context, {
+      reference: { start: field.start, end: field.end },
+      kind: 'field',
+      name: field.name,
+      dataType: resolved.dataType,
+      type: resolved.column.type || displaySqlDataType(resolved.dataType),
+      definitions: resolved.column.definitions ?? [],
+    });
+  } else if (dataType.kind !== 'unknown') {
     appendAstIssue(context, field, 'unknown-column', `Unknown column ${field.name}.`);
   }
 }
@@ -1404,7 +1973,33 @@ function deriveAstProjectionColumns(
     const name = projection.alias || projection.outputName || expression.outputName || expression.name
       || `_col${columns.length + 1}`;
     const dataType = inferAstExpressionType(expression, scope, context);
-    columns.push(renameVirtualColumn(name, virtualColumn(name, dataTypeFamily(dataType), '', dataType), context.dialect));
+    const aliasIdentifier = projection.role === 'alias' ? astAliasIdentifier(projection) : undefined;
+    const selection = aliasIdentifier ?? astProjectionSelection(expression);
+    const definition = symbolDefinition(
+      'projection',
+      name,
+      '',
+      projection.start,
+      projection.end,
+      selection ?? { start: projection.start, end: projection.end },
+    );
+    const output = renameVirtualColumn(
+      name,
+      virtualColumn(name, dataTypeFamily(dataType), '', dataType),
+      context.dialect,
+      [definition],
+    );
+    columns.push(output);
+    if (aliasIdentifier) {
+      appendSymbol(context, {
+        reference: { start: aliasIdentifier.start, end: aliasIdentifier.end },
+        kind: 'projection',
+        name,
+        dataType,
+        type: displaySqlDataType(dataType),
+        definitions: expressionDefinitions(expression, scope, context),
+      });
+    }
   }
   return columns;
 }
@@ -1420,7 +2015,7 @@ function inferAstExpressionType(
     return inner ? inferAstExpressionType(inner, scope, context, environment) : UNKNOWN_DATA_TYPE;
   }
   if (node.role === 'identifier') {
-    return environment.get(normalizeBareIdentifier(node.name, context.dialect)) ?? UNKNOWN_DATA_TYPE;
+    return environment.get(normalizeBareIdentifier(node.name, context.dialect))?.dataType ?? UNKNOWN_DATA_TYPE;
   }
   if (node.role === 'column') {
     const resolution = resolveAstColumnPath(scope, astColumnPath(node), context.dialect);
@@ -1459,7 +2054,11 @@ function inferAstExpressionType(
     return inferAstExpressionType(args[0], scope, context, environment);
   }
   if (normalizedFunction === 'from_json' && args[1]?.role === 'literal') {
-    return parseSqlDataType(args[1].name, context.dialect);
+    return dataTypeWithLiteralOrigins(
+      parseSqlDataType(args[1].name, context.dialect),
+      args[1],
+      context,
+    );
   }
   if (normalizedFunction === 'struct') {
     return {
@@ -1467,7 +2066,12 @@ function inferAstExpressionType(
       fields: args.map((argument, index) => {
         const dataType = inferAstExpressionType(argument, scope, context, environment);
         const name = argument.outputName || argument.name || `col${index + 1}`;
-        return virtualColumn(name, dataTypeFamily(dataType), '', dataType);
+        const alias = argument.role === 'alias' ? astAliasIdentifier(argument) : undefined;
+        const selection = alias ?? astProjectionSelection(argument);
+        const definitions = selection
+          ? [symbolDefinition('field', name, '', argument.start, argument.end, selection)]
+          : undefined;
+        return virtualColumn(name, dataTypeFamily(dataType), '', dataType, definitions);
       }),
     };
   }
@@ -1478,7 +2082,13 @@ function inferAstExpressionType(
       const value = args[index + 1];
       if (!name || !value) return UNKNOWN_DATA_TYPE;
       const dataType = inferAstExpressionType(value, scope, context, environment);
-      fields.push(virtualColumn(name, dataTypeFamily(dataType), '', dataType));
+      fields.push(virtualColumn(
+        name,
+        dataTypeFamily(dataType),
+        '',
+        dataType,
+        [symbolDefinition('field', name, '', args[index]!.start, args[index]!.end)],
+      ));
     }
     return { kind: 'struct', fields };
   }
@@ -1540,10 +2150,19 @@ function validateAstHigherOrderExpression(
     const lambdaEnvironment = new Map(environment);
     const parameters = astChildren(invocation.lambda, 'expressions');
     parameters.forEach((parameter, index) => {
-      lambdaEnvironment.set(
-        normalizeBareIdentifier(parameter.name, context.dialect),
-        invocation.parameterTypes[index] ?? UNKNOWN_DATA_TYPE,
+      const dataType = invocation.parameterTypes[index] ?? UNKNOWN_DATA_TYPE;
+      const definition = symbolDefinition(
+        'lambda-parameter', parameter.name, '', parameter.start, parameter.end,
       );
+      lambdaEnvironment.set(normalizeBareIdentifier(parameter.name, context.dialect), { dataType, definition });
+      appendSymbol(context, {
+        reference: { start: parameter.start, end: parameter.end },
+        kind: 'lambda-parameter',
+        name: parameter.name,
+        dataType,
+        type: displaySqlDataType(dataType),
+        definitions: [],
+      });
     });
     const body = astChild(invocation.lambda, 'this');
     if (body) validateAstExpression(body, scope, ctes, context, lambdaEnvironment);
@@ -1631,7 +2250,10 @@ function inferAstHigherOrderType(
   const inferLambda = (invocation: AstLambdaInvocation): SqlDataType => {
     const lambdaEnvironment = new Map(environment);
     astChildren(invocation.lambda, 'expressions').forEach((parameter, index) => {
-      lambdaEnvironment.set(normalizeBareIdentifier(parameter.name, context.dialect), invocation.parameterTypes[index] ?? UNKNOWN_DATA_TYPE);
+      lambdaEnvironment.set(normalizeBareIdentifier(parameter.name, context.dialect), {
+        dataType: invocation.parameterTypes[index] ?? UNKNOWN_DATA_TYPE,
+        definition: symbolDefinition('lambda-parameter', parameter.name, '', parameter.start, parameter.end),
+      });
     });
     const body = astChild(invocation.lambda, 'this');
     return body ? inferAstExpressionType(body, scope, context, lambdaEnvironment) : UNKNOWN_DATA_TYPE;
@@ -1682,6 +2304,25 @@ function analyzeAstInsert(
   const targetTable = targetNode?.role === 'schema' ? astChild(targetNode, 'this') : targetNode;
   const targetName = targetTable ? astTableName(targetTable) : '';
   const target = targetName ? resolveSchemaTable(context.snapshot, targetName, context.dialect) : { status: 'missing' as const };
+  if (targetTable && target.status === 'found' && target.table) {
+    const binding: RelationBinding = {
+      name: target.table.name,
+      aliases: astRelationAliases(targetTable, targetName, context.dialect, false),
+      columns: target.table.columns,
+      unresolved: false,
+      kind: target.table.kind,
+      definitions: target.table.definitions,
+      targetDefinitions: target.table.definitions,
+    };
+    appendRelationReference(
+      targetTable,
+      targetName,
+      binding,
+      target.table.definitions ?? [],
+      context,
+      target.table.name,
+    );
+  }
   if (context.validate && targetName && target.status !== 'found') {
     appendAstIssue(context, targetTable ?? insert,
       target.status === 'ambiguous' ? 'ambiguous-table' : 'unknown-table',
@@ -1700,6 +2341,15 @@ function analyzeAstInsert(
           appendAstIssue(context, identifier, 'unknown-column', `Unknown target column ${identifier.name}.`);
           return [];
         }
+        appendSymbol(context, {
+          reference: { start: identifier.start, end: identifier.end },
+          kind: 'column',
+          name: identifier.name,
+          qualifiedName: `${target.table!.name}.${column.name}`,
+          dataType: columnDataType(column, context.dialect),
+          type: column.type,
+          definitions: column.definitions ?? [],
+        });
         return [column];
       })
     : target.table.columns.filter((column) => !shape.staticPartitionColumns.includes(column.normalizedName));
@@ -1732,6 +2382,7 @@ function analyzeAstUpdate(
     depth: 0,
     relations: [],
     projectionAliases: new Set(),
+    projectionColumns: new Map(),
   };
   context.scopes.push(scope);
   scope.relations.push(bindAstRelation(table, scope, ctes, context));
@@ -1815,6 +2466,119 @@ function astColumnPath(node: SqlAstNode): string[] {
   return parts.length > 0 ? parts : (node.name ? [node.name] : []);
 }
 
+function astColumnPathNodes(node: SqlAstNode): SqlAstNode[] {
+  const parts = ['catalog', 'db', 'table', 'this'].flatMap((key) => {
+    const part = astChild(node, key);
+    return part?.name ? [part] : [];
+  });
+  return parts.length > 0 ? parts : (node.name ? [node] : []);
+}
+
+function astTablePathNodes(node: SqlAstNode): SqlAstNode[] {
+  return ['catalog', 'db', 'this'].flatMap((key) => {
+    const part = astChild(node, key);
+    return part?.name ? [part] : [];
+  });
+}
+
+function recordAstPathSymbols(
+  nodes: readonly SqlAstNode[],
+  resolution: AstColumnResolution,
+  context: AstModelContext,
+): void {
+  if (nodes.length === 0 || resolution.status === 'unresolved') return;
+  if (resolution.status === 'ambiguous') {
+    const node = nodes[0]!;
+    const definitions = deduplicateDefinitions(resolution.candidates?.flatMap((candidate) => (
+      candidate.column.definitions ?? []
+    )) ?? []);
+    if (definitions.length > 0) {
+      appendSymbol(context, {
+        reference: { start: node.start, end: node.end },
+        kind: 'column',
+        name: node.name,
+        definitions,
+      });
+    }
+    return;
+  }
+  if (resolution.status !== 'found') return;
+  const prefixLength = resolution.relationPrefixLength ?? 0;
+  const binding = resolution.binding;
+  if (binding && prefixLength > 0) {
+    for (const node of nodes.slice(0, prefixLength)) {
+      appendSymbol(context, {
+        reference: { start: node.start, end: node.end },
+        kind: binding.definitions?.[0]?.kind === 'relation-alias' ? 'relation-alias' : binding.kind === 'cte' ? 'cte' : binding.kind === 'view' ? 'view' : 'table',
+        name: node.name,
+        qualifiedName: binding.name,
+        relation: {
+          kind: binding.kind ?? 'table',
+          name: binding.name,
+          columns: binding.columns,
+        },
+        definitions: binding.definitions ?? binding.targetDefinitions ?? [],
+      });
+    }
+  }
+  const rootIndex = prefixLength;
+  const rootNode = nodes[rootIndex];
+  const rootColumn = resolution.rootColumn ?? resolution.column;
+  if (rootNode && rootColumn && rootNode.name !== '*') {
+    appendSymbol(context, {
+      reference: { start: rootNode.start, end: rootNode.end },
+      kind: 'column',
+      name: rootNode.name,
+      qualifiedName: binding ? `${binding.name}.${rootColumn.name}` : rootColumn.name,
+      dataType: columnDataType(rootColumn, context.dialect),
+      type: rootColumn.type || displaySqlDataType(columnDataType(rootColumn, context.dialect)),
+      definitions: rootColumn.definitions ?? [],
+    });
+  }
+  const nested = resolution.nestedColumns ?? [];
+  for (let index = 0; index < nested.length; index += 1) {
+    const node = nodes[rootIndex + index + 1];
+    const column = nested[index];
+    if (!node || !column) continue;
+    appendSymbol(context, {
+      reference: { start: node.start, end: node.end },
+      kind: 'field',
+      name: node.name,
+      qualifiedName: nodes.slice(0, rootIndex + index + 2).map((part) => part.name).join('.'),
+      dataType: columnDataType(column, context.dialect),
+      type: column.type || displaySqlDataType(columnDataType(column, context.dialect)),
+      definitions: column.definitions ?? [],
+    });
+  }
+}
+
+function astProjectionSelection(node: SqlAstNode): { start: number; end: number } | undefined {
+  if (node.role === 'column') {
+    const last = astColumnPathNodes(node).at(-1);
+    if (last) return { start: last.start, end: last.end };
+  }
+  return node.end > node.start ? { start: node.start, end: node.end } : undefined;
+}
+
+function expressionDefinitions(
+  node: SqlAstNode,
+  scope: AstScope,
+  context: AstModelContext,
+): SqlSymbolDefinition[] {
+  if (node.role === 'column') {
+    const resolution = resolveAstColumnPath(scope, astColumnPath(node), context.dialect);
+    if (resolution.status === 'found') return [...(resolution.column?.definitions ?? [])];
+    if (resolution.status === 'ambiguous') {
+      return deduplicateDefinitions(resolution.candidates?.flatMap((candidate) => candidate.column.definitions ?? []) ?? []);
+    }
+  }
+  if (node.role === 'alias') {
+    const inner = astChild(node, 'this');
+    return inner ? expressionDefinitions(inner, scope, context) : [];
+  }
+  return [];
+}
+
 function astTableName(node: SqlAstNode): string {
   return ['catalog', 'db', 'this'].flatMap((key) => {
     const part = astChild(node, key);
@@ -1837,16 +2601,99 @@ function astRelationAliases(
 function astDerivedBinding(
   relation: SqlAstNode,
   columns: readonly SchemaColumn[],
-  dialect: SqlDialect,
+  context: AstModelContext,
   unresolved = false,
 ): RelationBinding {
   const name = relation.alias || relation.outputName || relation.name;
-  return {
+  const query = relation.role === 'subquery'
+    ? astChild(relation, 'this')
+    : astChild(astChild(relation, 'this') ?? relation, 'this');
+  const target = query ?? relation;
+  return relationBindingWithDefinitions(relation, {
     name,
-    aliases: name ? [normalizeQualifiedName(name, dialect)] : [],
+    aliases: name ? [normalizeQualifiedName(name, context.dialect)] : [],
     columns,
     unresolved,
-  };
+    kind: 'derived-table',
+    targetDefinitions: [symbolDefinition(
+      'derived-table',
+      name || 'subquery',
+      '',
+      target.start,
+      target.end,
+      { start: target.start, end: Math.min(target.end, target.start + 1) },
+    )],
+  }, context);
+}
+
+function relationBindingWithDefinitions(
+  relation: SqlAstNode,
+  binding: RelationBinding,
+  context: AstModelContext,
+): RelationBinding {
+  const aliasIdentifier = astAliasIdentifier(relation);
+  if (!aliasIdentifier) {
+    return {
+      ...binding,
+      definitions: binding.definitions ?? binding.targetDefinitions,
+    };
+  }
+  const definition = symbolDefinition(
+    'relation-alias',
+    aliasIdentifier.name,
+    '',
+    relation.start,
+    relation.end,
+    aliasIdentifier,
+  );
+  appendSymbol(context, {
+    reference: { start: aliasIdentifier.start, end: aliasIdentifier.end },
+    kind: 'relation-alias',
+    name: aliasIdentifier.name,
+    relation: {
+      kind: binding.kind ?? 'derived-table',
+      name: binding.name,
+      columns: binding.columns,
+    },
+    definitions: binding.targetDefinitions ?? [],
+  });
+  return { ...binding, definitions: [definition] };
+}
+
+function appendRelationReference(
+  relation: SqlAstNode,
+  name: string,
+  binding: RelationBinding,
+  definitions: readonly SqlSymbolDefinition[],
+  context: AstModelContext,
+  qualifiedName = name,
+): void {
+  const parts = astTablePathNodes(relation);
+  const spans = parts.length > 0
+    ? parts.map((part) => ({ start: part.start, end: part.end }))
+    : [astNameSpan(relation)];
+  for (const span of spans) {
+    if (span.end <= span.start) continue;
+    appendSymbol(context, {
+      reference: span,
+      kind: binding.kind === 'view' ? 'view' : binding.kind === 'cte' ? 'cte' : 'table',
+      name,
+      qualifiedName,
+      relation: {
+        kind: binding.kind ?? 'table',
+        name: qualifiedName,
+        columns: binding.columns,
+      },
+      definitions,
+    });
+  }
+}
+
+function astAliasIdentifier(node: SqlAstNode): SqlAstNode | undefined {
+  const alias = astChild(node, 'alias');
+  if (!alias) return undefined;
+  if (alias.role === 'identifier') return alias;
+  return astChild(alias, 'this');
 }
 
 function astNameSpan(node: SqlAstNode): { start: number; end: number } {
@@ -1876,7 +2723,12 @@ function astPrimitiveString(value: SqlAstValue): string {
   return typeof value === 'string' ? value : '';
 }
 
-function renameVirtualColumn(name: string, source: SchemaColumn | undefined, dialect: SqlDialect): SchemaColumn {
+function renameVirtualColumn(
+  name: string,
+  source: SchemaColumn | undefined,
+  dialect: SqlDialect,
+  definitions: readonly SqlSymbolDefinition[] | undefined = source?.definitions,
+): SchemaColumn {
   const quoted = isQuotedIdentifier(name);
   const visible = unquoteIdentifier(name);
   const dataType = source?.dataType ?? UNKNOWN_DATA_TYPE;
@@ -1888,6 +2740,7 @@ function renameVirtualColumn(name: string, source: SchemaColumn | undefined, dia
     dataType,
     start: source?.start ?? 0,
     end: source?.end ?? 0,
+    ...(definitions ? { definitions } : {}),
   };
 }
 
@@ -1906,6 +2759,118 @@ function appendAstIssue(
     code,
     ...(severity ? { severity } : {}),
   });
+}
+
+function appendSymbol(context: AstModelContext, symbol: SqlSymbolResolution): void {
+  if (symbol.reference.end <= symbol.reference.start) return;
+  if (overlapsAny(symbol.reference, context.placeholderRanges)) return;
+  context.symbols.push(symbol);
+}
+
+function deduplicateDefinitions(
+  definitions: readonly SqlSymbolDefinition[],
+): SqlSymbolDefinition[] {
+  const seen = new Set<string>();
+  return definitions.filter((definition) => {
+    const location = definition.location;
+    const key = `${definition.kind}:${location.source}:${location.start}:${location.end}:${location.selectionStart}:${location.selectionEnd}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function rebaseDefinitions(
+  definitions: readonly SqlSymbolDefinition[] | undefined,
+  offset: number,
+  source: string,
+): SqlSymbolDefinition[] | undefined {
+  if (!definitions) return undefined;
+  return definitions.map((definition) => {
+    if (definition.location.source) return definition;
+    const location = definition.location;
+    return {
+      ...definition,
+      location: {
+        source,
+        start: location.start + offset,
+        end: location.end + offset,
+        selectionStart: location.selectionStart + offset,
+        selectionEnd: location.selectionEnd + offset,
+      },
+    };
+  });
+}
+
+function rebaseColumnDefinitions(column: SchemaColumn, offset: number, source: string): SchemaColumn {
+  const dataType = rebaseDataTypeDefinitions(columnDataType(column, 'generic'), offset, source);
+  return {
+    ...column,
+    dataType,
+    definitions: rebaseDefinitions(column.definitions, offset, source),
+    start: column.start ? column.start + offset : column.start,
+    end: column.end ? column.end + offset : column.end,
+  };
+}
+
+function rebaseDataTypeDefinitions(dataType: SqlDataType, offset: number, source: string): SqlDataType {
+  if (dataType.kind === 'array') {
+    return { kind: 'array', elementType: rebaseDataTypeDefinitions(dataType.elementType, offset, source) };
+  }
+  if (dataType.kind === 'map') {
+    return {
+      kind: 'map',
+      keyType: rebaseDataTypeDefinitions(dataType.keyType, offset, source),
+      valueType: rebaseDataTypeDefinitions(dataType.valueType, offset, source),
+    };
+  }
+  if (dataType.kind === 'struct') {
+    return {
+      kind: 'struct',
+      fields: dataType.fields.map((field) => rebaseColumnDefinitions(field, offset, source)),
+    };
+  }
+  return dataType;
+}
+
+function deduplicateSymbolResolutions(
+  symbols: readonly SqlSymbolResolution[],
+): SqlSymbolResolution[] {
+  const seen = new Set<string>();
+  return symbols.filter((symbol) => {
+    const key = `${symbol.reference.start}:${symbol.reference.end}:${symbol.kind}:${symbol.name}:${symbol.definitions.map((definition) => (
+      `${definition.location.source}:${definition.location.selectionStart}:${definition.location.selectionEnd}`
+    )).join('|')}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export function formatSqlDataType(
+  dataType: SqlDataType,
+  maxDepth = 4,
+  maxFields = 20,
+): string {
+  const render = (value: SqlDataType, depth: number): string => {
+    if (value.kind === 'unknown') return 'UNKNOWN';
+    if (value.kind === 'scalar') return value.name || value.family.toUpperCase();
+    if (depth >= maxDepth) return value.kind.toUpperCase();
+    if (value.kind === 'array') return `ARRAY<${render(value.elementType, depth + 1)}>`;
+    if (value.kind === 'map') {
+      return `MAP<${render(value.keyType, depth + 1)}, ${render(value.valueType, depth + 1)}>`;
+    }
+    const visible = value.fields.slice(0, maxFields);
+    const fields = visible.map((field) => `${field.name}: ${render(columnDataType(field, 'generic'), depth + 1)}`);
+    const omitted = value.fields.length - visible.length;
+    if (omitted > 0) fields.push(`… ${omitted} more`);
+    return `STRUCT<${fields.join(', ')}>`;
+  };
+  return render(dataType, 0);
+}
+
+function displaySqlDataType(dataType: SqlDataType): string {
+  return formatSqlDataType(dataType);
 }
 
 function deriveQueryColumns(
@@ -1931,10 +2896,13 @@ function deriveAstStatementColumns(
     snapshot,
     placeholderRanges: findPlaceholderRanges(text, placeholders),
     functions: new Set(),
+    builtinFunctions: new Set(),
+    udfs: new Set(),
     validate: false,
     scopes: [],
     references: [],
     issues: [],
+    symbols: [],
   };
   return analyzeAstStatement(statement, context, new Map());
 }
@@ -1985,10 +2953,11 @@ function declaredColumn(
   start: number,
   end: number,
   dialect: SqlDialect,
+  dataType: SqlDataType = parseSqlDataType(type, dialect),
+  definitions?: readonly SqlSymbolDefinition[],
 ): SchemaColumn {
   const quoted = isQuotedIdentifier(rawName);
   const name = unquoteIdentifier(rawName);
-  const dataType = parseSqlDataType(type, dialect);
   return {
     name,
     normalizedName: normalizeIdentifier(name, quoted, dialect),
@@ -1997,7 +2966,156 @@ function declaredColumn(
     dataType,
     start,
     end,
+    ...(definitions ? { definitions } : {}),
   };
+}
+
+function symbolDefinition(
+  kind: SqlSymbolKind,
+  name: string,
+  source: string,
+  start: number,
+  end: number,
+  selection: { start: number; end: number } = { start, end },
+  qualifiedName?: string,
+): SqlSymbolDefinition {
+  return {
+    kind,
+    name,
+    ...(qualifiedName ? { qualifiedName } : {}),
+    location: {
+      source,
+      start,
+      end: Math.max(end, start + 1),
+      selectionStart: selection.start,
+      selectionEnd: Math.max(selection.end, selection.start + 1),
+    },
+  };
+}
+
+function dataTypeWithAstOrigins(
+  dataType: SqlDataType,
+  node: SqlAstNode,
+  dialect: SqlDialect,
+  source: string,
+): SqlDataType {
+  if (dataType.kind === 'struct') {
+    const definitions = astChildren(node, 'expressions').filter((child) => child.kind === 'columnDef');
+    return {
+      kind: 'struct',
+      fields: dataType.fields.map((field, index) => {
+        const definition = definitions[index];
+        const identifier = definition ? astChild(definition, 'this') : undefined;
+        const nestedTypeNode = definition ? astChild(definition, 'kind') : undefined;
+        const nestedType = nestedTypeNode
+          ? dataTypeWithAstOrigins(columnDataType(field, dialect), nestedTypeNode, dialect, source)
+          : columnDataType(field, dialect);
+        if (!identifier) return { ...field, dataType: nestedType };
+        return {
+          ...field,
+          start: identifier.start,
+          end: identifier.end,
+          dataType: nestedType,
+          definitions: [symbolDefinition('field', identifier.name, source, identifier.start, identifier.end)],
+        };
+      }),
+    };
+  }
+  if (dataType.kind === 'array') {
+    const nested = firstAstDataTypeChild(node);
+    return {
+      kind: 'array',
+      elementType: nested
+        ? dataTypeWithAstOrigins(dataType.elementType, nested, dialect, source)
+        : dataType.elementType,
+    };
+  }
+  if (dataType.kind === 'map') {
+    const nested = astDataTypeChildren(node);
+    return {
+      kind: 'map',
+      keyType: nested[0]
+        ? dataTypeWithAstOrigins(dataType.keyType, nested[0], dialect, source)
+        : dataType.keyType,
+      valueType: nested[1]
+        ? dataTypeWithAstOrigins(dataType.valueType, nested[1], dialect, source)
+        : dataType.valueType,
+    };
+  }
+  return dataType;
+}
+
+function dataTypeWithLiteralOrigins(
+  dataType: SqlDataType,
+  literal: SqlAstNode,
+  context: AstModelContext,
+): SqlDataType {
+  const raw = context.text.slice(literal.start, literal.end);
+  let cursor = 0;
+  const visit = (value: SqlDataType): SqlDataType => {
+    if (value.kind === 'array') return { kind: 'array', elementType: visit(value.elementType) };
+    if (value.kind === 'map') {
+      return { kind: 'map', keyType: visit(value.keyType), valueType: visit(value.valueType) };
+    }
+    if (value.kind !== 'struct') return value;
+    return {
+      kind: 'struct',
+      fields: value.fields.map((field) => {
+        const match = findIdentifierInTypeLiteral(raw, field.name, cursor);
+        if (match) cursor = match.end;
+        const nested = visit(columnDataType(field, context.dialect));
+        if (!match) return { ...field, dataType: nested };
+        const start = literal.start + match.start;
+        const end = literal.start + match.end;
+        return {
+          ...field,
+          start,
+          end,
+          dataType: nested,
+          definitions: [symbolDefinition('field', field.name, '', start, end)],
+        };
+      }),
+    };
+  };
+  return visit(dataType);
+}
+
+function findIdentifierInTypeLiteral(
+  text: string,
+  name: string,
+  from: number,
+): { start: number; end: number } | undefined {
+  const visible = unquoteIdentifier(name);
+  const matcher = new RegExp(`(?:^|[^\\p{L}\\p{N}_$])(${escapeRegularExpression(visible)})(?=[\`"\\]]?\\s*(?::|\\s))`, 'giu');
+  const segment = text.slice(from);
+  const match = matcher.exec(segment);
+  if (!match || match.index === undefined) return undefined;
+  const token = match[1];
+  if (!token) return undefined;
+  const tokenIndex = match[0].lastIndexOf(token);
+  const start = from + match.index + tokenIndex;
+  return { start, end: start + token.length };
+}
+
+function escapeRegularExpression(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function astDataTypeChildren(node: SqlAstNode): SqlAstNode[] {
+  const result: SqlAstNode[] = [];
+  for (const value of Object.values(node.args)) {
+    if (isSqlAstNode(value) && value.role === 'data-type') result.push(value);
+    else if (Array.isArray(value)) {
+      for (const child of value) {
+        if (isSqlAstNode(child) && child.role === 'data-type') result.push(child);
+      }
+    }
+  }
+  return result;
+}
+
+function firstAstDataTypeChild(node: SqlAstNode): SqlAstNode | undefined {
+  return astDataTypeChildren(node)[0];
 }
 
 function extractInsertShape(
@@ -2192,6 +3310,7 @@ function virtualColumn(
   family: SqlTypeFamily = 'unknown',
   type = '',
   dataType: SqlDataType = type ? parseSqlDataType(type, 'generic') : dataTypeFromFamily(family),
+  definitions?: readonly SqlSymbolDefinition[],
 ): SchemaColumn {
   return {
     name,
@@ -2201,6 +3320,7 @@ function virtualColumn(
     dataType,
     start: 0,
     end: 0,
+    ...(definitions ? { definitions } : {}),
   };
 }
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added AST-based SQL Hover and Go to Definition for regular `.sql` files and recognized SQL regions in `.sql.json` files.
+- Added lexical-first navigation for relation aliases, CTE and derived-table projections, nested fields, generator outputs, Lambda parameters, and local DDL, with cross-file links to indexed table, view, and column declarations.
+- Added recursive type signatures and source summaries to SQL Hover, including built-in/UDF classification and bounded table/STRUCT expansion.
+- Kept local AST navigation available when offline Schema validation is disabled; external DDL navigation continues to require Schema indexing, while completion-only mode retains both features.
 - Added a command to force rebuilding all cached offline Schema indexes.
 - Added an optional completion-only Schema mode that suppresses Schema query and DDL diagnostics.
 - Rebuilt the offline Schema checker around a unified SQL AST frontend, recursive query scopes, and conservative type propagation for all eight SQL dialects.

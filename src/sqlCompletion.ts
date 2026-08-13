@@ -2,16 +2,10 @@ import * as vscode from 'vscode';
 
 import { getExtensionConfiguration } from './config';
 import type { JsonServiceManager } from './jsonService';
-import {
-  decodedOffsetAtOriginalOffset,
-  extractSqlRegions,
-  findSqlRegionAtProjectedOffset,
-  mapDecodedRange,
-  type DecodedSqlText,
-} from './regions';
 import type { SqlSchemaService } from './schemaService';
 import { getSqlSuggestions } from './sql';
 import { getSqlCatalog } from './sqlCatalog';
+import { getSqlDocumentContext } from './sqlDocumentContext';
 import {
   collectSqlFieldNames,
   getSqlSchemaAtOffset,
@@ -42,10 +36,16 @@ export class SqlCompletionProvider implements vscode.CompletionItemProvider {
     if (document.languageId === 'sql' && !configuration.plainSqlEnabled) {
       return undefined;
     }
-    const context = this.getContext(document, position);
-    if (!context) {
-      return undefined;
-    }
+    const documentContext = getSqlDocumentContext(document, position, this.jsonServices, configuration);
+    if (!documentContext) return undefined;
+    const context: CompletionContext = {
+      sqlText: documentContext.sqlText,
+      sqlOffset: documentContext.sqlOffset,
+      allFieldNames: deduplicateFields(documentContext.allSqlTexts.flatMap((text) => (
+        collectSqlFieldNames(text, configuration.dialect, configuration.placeholderPatterns)
+      ))),
+      toDocumentRange: documentContext.toDocumentRange,
+    };
     const snapshot = await this.schemas.getSchema(document.uri, configuration);
     if (token.isCancellationRequested) {
       return undefined;
@@ -54,41 +54,6 @@ export class SqlCompletionProvider implements vscode.CompletionItemProvider {
     return new vscode.CompletionList(completion.items, completion.prefix.length === 0);
   }
 
-  private getContext(
-    document: vscode.TextDocument,
-    position: vscode.Position,
-  ): CompletionContext | undefined {
-    const configuration = getExtensionConfiguration(document.uri);
-    if (document.languageId === 'sql') {
-      const text = document.getText();
-      return {
-        sqlText: text,
-        sqlOffset: document.offsetAt(position),
-        allFieldNames: collectSqlFieldNames(text, configuration.dialect, configuration.placeholderPatterns),
-        toDocumentRange: (start, end) => new vscode.Range(document.positionAt(start), document.positionAt(end)),
-      };
-    }
-    if (document.languageId !== 'sql-json') {
-      return undefined;
-    }
-    const projected = this.jsonServices.createDocument(document, configuration);
-    const regions = extractSqlRegions(projected.projection, projected.jsonDocument, configuration.keyPatterns);
-    const originalOffset = document.offsetAt(position);
-    const projectedOffset = projected.projection.toProjectedOffset(originalOffset);
-    const region = findSqlRegionAtProjectedOffset(regions, projectedOffset);
-    if (!region) {
-      return undefined;
-    }
-    const allFieldNames = deduplicateFields(regions.flatMap((candidate) => (
-      collectSqlFieldNames(candidate.decoded.text, configuration.dialect, configuration.placeholderPatterns)
-    )));
-    return {
-      sqlText: region.decoded.text,
-      sqlOffset: decodedOffsetAtOriginalOffset(region.decoded, originalOffset),
-      allFieldNames,
-      toDocumentRange: (start, end) => decodedRangeToDocumentRange(document, region.decoded, start, end),
-    };
-  }
 }
 
 function buildCompletionItems(
@@ -264,18 +229,6 @@ function appendSchemaItems(
     item.sortText = `0-2-${field}`;
     items.push(item);
   }
-}
-
-function decodedRangeToDocumentRange(
-  document: vscode.TextDocument,
-  decoded: DecodedSqlText,
-  start: number,
-  end: number,
-): vscode.Range {
-  const spans = mapDecodedRange(decoded, start, end);
-  const mappedStart = spans[0]?.start ?? decoded.fallbackOffset;
-  const mappedEnd = spans.at(-1)?.end ?? mappedStart;
-  return new vscode.Range(document.positionAt(mappedStart), document.positionAt(mappedEnd));
 }
 
 function wordAt(text: string, offset: number): { start: number; end: number } {

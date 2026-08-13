@@ -1155,6 +1155,194 @@ SELECT id, amount FROM local_orders;`,
     );
   });
 
+  test('provides local AST hover and lexical definitions when Schema validation is disabled', async () => {
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      false,
+      vscode.ConfigurationTarget.Global,
+    );
+    const document = await openFile(
+      'local-navigation.sql',
+      'WITH c AS (SELECT 1 AS local_id) SELECT c.local_id FROM c',
+    );
+    const usageOffset = document.getText().lastIndexOf('local_id');
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      document.positionAt(usageOffset),
+    );
+    assert.ok(hovers.some((hover) => hoverText(hover).includes('local_id')));
+    assert.ok(hovers.some((hover) => hoverText(hover).includes('number')));
+
+    const definitions = await executeDefinitions(document, usageOffset);
+    assert.equal(definitions.length, 1);
+    const target = definitionSelection(definitions[0]!);
+    assert.equal(definitionUri(definitions[0]!).toString(), document.uri.toString());
+    assert.equal(document.getText(target), 'local_id');
+    assert.equal(document.offsetAt(target.start), document.getText().indexOf('local_id'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'plainSql.enabled',
+      false,
+      vscode.ConfigurationTarget.Global,
+    );
+    const disabledHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      document.positionAt(usageOffset),
+    );
+    const disabledDefinitions = await executeDefinitions(document, usageOffset);
+    assert.equal(disabledHovers.length, 0);
+    assert.equal(disabledDefinitions.length, 0);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'plainSql.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('maps SQL JSON hover and definitions through escaped multiline strings', async () => {
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      false,
+      vscode.ConfigurationTarget.Global,
+    );
+    const document = await openFile(
+      'navigation-offsets.sql.json',
+      '{"trainSql":"WITH c AS (SELECT 1 AS local_id)\\nSELECT c.local_id FROM c","jobName":"daily"}',
+    );
+    const usageOffset = document.getText().lastIndexOf('local_id');
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      document.positionAt(usageOffset),
+    );
+    assert.ok(hovers.some((hover) => hoverText(hover).includes('local_id')));
+    const definitions = await executeDefinitions(document, usageOffset);
+    assert.equal(definitions.length, 1);
+    const selection = definitionSelection(definitions[0]!);
+    assert.equal(document.getText(selection), 'local_id');
+    assert.equal(document.offsetAt(selection.start), document.getText().indexOf('local_id'));
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('hovers and navigates to external DDL in completion-only mode', async () => {
+    const schemaDirectory = path.join(temporaryDirectory, 'navigation-schemas');
+    const schemaPath = path.join(schemaDirectory, 'catalog.sql');
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(
+      schemaPath,
+      'CREATE TABLE sales.orders (id BIGINT, payload STRUCT<name: STRING>);',
+      'utf8',
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      ['navigation-schemas/*.sql'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.completionOnly',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+    const document = await openFile(
+      'external-navigation.sql',
+      'SELECT o.id, o.payload.name FROM sales.orders o',
+    );
+    const fieldOffset = document.getText().indexOf('name');
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      document.positionAt(fieldOffset),
+    );
+    assert.ok(hovers.some((hover) => hoverText(hover).includes('name')));
+    assert.ok(hovers.some((hover) => /(STRING|TEXT)/u.test(hoverText(hover).toUpperCase())));
+    const definitions = await executeDefinitions(document, fieldOffset);
+    assert.equal(definitions.length, 1);
+    assert.equal(definitionUri(definitions[0]!).fsPath.toLocaleLowerCase(), schemaPath.toLocaleLowerCase());
+    const schemaDocument = await vscode.workspace.openTextDocument(vscode.Uri.file(schemaPath));
+    assert.equal(schemaDocument.getText(definitionSelection(definitions[0]!)), 'name');
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.completionOnly',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('definition waits for the rebuilt generation and uses the new DDL offset', async () => {
+    const schemaDirectory = path.join(temporaryDirectory, 'navigation-rebuild-schemas');
+    const schemaPath = path.join(schemaDirectory, 'catalog.sql');
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(schemaPath, 'CREATE TABLE moving_table (moving_id BIGINT);', 'utf8');
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      ['navigation-rebuild-schemas/*.sql'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+    const document = await openFile('navigation-rebuild.sql', 'SELECT moving_id FROM moving_table');
+    const offset = document.getText().indexOf('moving_id');
+    const before = await executeDefinitions(document, offset);
+    assert.equal(before.length, 1);
+    const beforeStart = definitionSelection(before[0]!).start;
+
+    const prefix = '-- DDL moved after rebuild\n\n';
+    const schemaDocument = vscode.workspace.textDocuments.find((candidate) => candidate.uri.fsPath === schemaPath)
+      ?? await vscode.workspace.openTextDocument(vscode.Uri.file(schemaPath));
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(
+      schemaDocument.uri,
+      new vscode.Range(schemaDocument.positionAt(0), schemaDocument.positionAt(schemaDocument.getText().length)),
+      `${prefix}CREATE TABLE moving_table (moving_id BIGINT);`,
+    );
+    assert.equal(await vscode.workspace.applyEdit(edit), true);
+    assert.equal(await schemaDocument.save(), true);
+    await vscode.commands.executeCommand('aiopsSqlJson.rebuildSchemaIndex');
+    const after = await executeDefinitions(document, offset);
+    assert.equal(after.length, 1);
+    const afterStart = definitionSelection(after[0]!).start;
+    assert.equal(afterStart.line, beforeStart.line + 2);
+    assert.equal(afterStart.character, beforeStart.character);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
   for (const dialectCase of schemaIndexDialectCases()) {
     test(`rebuilds the ${dialectCase.dialect} index after concurrent cross-file DDL changes and duplicate churn`, async () => {
       const schemaDirectoryName = `schema-index-${dialectCase.dialect}`;
@@ -1272,6 +1460,31 @@ SELECT id, amount FROM local_orders;`,
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
     await vscode.window.showTextDocument(document);
     return document;
+  }
+
+  async function executeDefinitions(
+    document: vscode.TextDocument,
+    offset: number,
+  ): Promise<Array<vscode.Location | vscode.LocationLink>> {
+    return vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      document.positionAt(offset),
+    );
+  }
+
+  function definitionUri(definition: vscode.Location | vscode.LocationLink): vscode.Uri {
+    return 'targetUri' in definition ? definition.targetUri : definition.uri;
+  }
+
+  function definitionSelection(definition: vscode.Location | vscode.LocationLink): vscode.Range {
+    return 'targetUri' in definition
+      ? definition.targetSelectionRange ?? definition.targetRange
+      : definition.range;
+  }
+
+  function hoverText(hover: vscode.Hover): string {
+    return hover.contents.map((content) => typeof content === 'string' ? content : content.value).join('\n');
   }
 
   async function completionItemsAtEnd(document: vscode.TextDocument): Promise<readonly vscode.CompletionItem[]> {

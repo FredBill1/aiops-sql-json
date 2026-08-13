@@ -73,6 +73,12 @@ export class SqlSchemaService implements vscode.Disposable {
     if (configuration.schemaFileGlobs.length === 0) {
       return EMPTY_SCHEMA;
     }
+    // Definition requests opt into the newest known generation. If a watched
+    // DDL change is still inside the debounce window, promote it immediately
+    // instead of returning a snapshot whose offsets are already known stale.
+    if (waitForFresh && this.invalidationTimer) {
+      this.beginGeneration();
+    }
     const resolved = resolveSchemaPatterns(configuration.schemaFileGlobs, createPatternContext(resource));
     this.reportPatternIssues(
       resolved.issues,
