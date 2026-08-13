@@ -9,6 +9,7 @@ export class DiagnosticController implements vscode.Disposable {
   private readonly collection = vscode.languages.createDiagnosticCollection('aiops-sql-json');
   private readonly disposables: vscode.Disposable[] = [];
   private readonly timers = new Map<string, NodeJS.Timeout>();
+  private readonly validationRequests = new Map<string, number>();
   private readonly warnedConfigurationIssues = new Set<string>();
   private disposed = false;
 
@@ -55,13 +56,15 @@ export class DiagnosticController implements vscode.Disposable {
       return;
     }
     const key = document.uri.toString();
+    const request = (this.validationRequests.get(key) ?? 0) + 1;
+    this.validationRequests.set(key, request);
     const existing = this.timers.get(key);
     if (existing) {
       clearTimeout(existing);
     }
     this.timers.set(key, setTimeout(() => {
       this.timers.delete(key);
-      void this.validate(document);
+      void this.validate(document, request);
     }, delay));
   }
 
@@ -71,11 +74,12 @@ export class DiagnosticController implements vscode.Disposable {
       clearTimeout(timer);
     }
     this.timers.clear();
+    this.validationRequests.clear();
     this.collection.dispose();
     this.disposables.forEach((disposable) => disposable.dispose());
   }
 
-  private async validate(document: vscode.TextDocument): Promise<void> {
+  private async validate(document: vscode.TextDocument, request: number): Promise<void> {
     if (this.disposed || document.isClosed) {
       return;
     }
@@ -94,7 +98,8 @@ export class DiagnosticController implements vscode.Disposable {
       diagnostics = [];
     }
 
-    if (!this.disposed && !document.isClosed && document.version === version) {
+    if (!this.disposed && !document.isClosed && document.version === version
+      && this.validationRequests.get(document.uri.toString()) === request) {
       this.collection.set(document.uri, diagnostics);
     }
   }
@@ -106,6 +111,7 @@ export class DiagnosticController implements vscode.Disposable {
       clearTimeout(timer);
       this.timers.delete(key);
     }
+    this.validationRequests.delete(key);
     this.collection.delete(document.uri);
   }
 

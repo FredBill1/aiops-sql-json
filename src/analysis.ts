@@ -132,7 +132,7 @@ export function analyzePlainSqlDocument(
     vscode.DiagnosticSeverity.Error,
     `${configuration.dialect} SQL`,
   ));
-  if (configuration.schemaValidationEnabled && schema) {
+  if (shouldReportSchemaDiagnostics(configuration) && schema) {
     diagnostics.push(...analyzeSqlSemantics(
       document.getText(),
       configuration.dialect,
@@ -181,7 +181,7 @@ function appendSqlDiagnostics(
     ));
   }
 
-  if (configuration.schemaValidationEnabled && schema) {
+  if (shouldReportSchemaDiagnostics(configuration) && schema) {
     for (const issue of analyzeSqlSemantics(
       region.decoded.text,
       configuration.dialect,
@@ -232,6 +232,10 @@ function appendSqlDiagnostics(
 
 function semanticIssueSeverity(severity: 'error' | 'warning' | undefined): vscode.DiagnosticSeverity {
   return severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
+}
+
+function shouldReportSchemaDiagnostics(configuration: ExtensionConfiguration): boolean {
+  return configuration.schemaValidationEnabled && !configuration.schemaValidationCompletionOnly;
 }
 
 function createDiagnostic(

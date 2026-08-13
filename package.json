@@ -79,6 +79,11 @@
       {
         "command": "aiopsSqlJson.toggleSqlBlockComment",
         "title": "AIOps SQL JSON: Toggle Safe SQL Block Comment"
+      },
+      {
+        "command": "aiopsSqlJson.rebuildSchemaIndex",
+        "title": "AIOps SQL JSON: Force Rebuild Schema Index",
+        "enablement": "config.aiopsSqlJson.schemaValidation.enabled"
       }
     ],
     "keybindings": [
@@ -162,6 +167,12 @@
           "default": false,
           "scope": "resource",
           "markdownDescription": "Whether to validate SQL table, column, and function references against the DDL files configured by `aiopsSqlJson.schemaFiles`. This is an offline static check and does not connect to a database."
+        },
+        "aiopsSqlJson.schemaValidation.completionOnly": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "markdownDescription": "When Schema validation is enabled, use the indexed DDL for Schema-aware completion but suppress all Schema-derived query and DDL diagnostics. Regular SQL, JSON, and platform diagnostics remain enabled."
         },
         "aiopsSqlJson.schemaFiles": {
           "type": "array",

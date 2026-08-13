@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added a command to force rebuilding all cached offline Schema indexes.
+- Added an optional completion-only Schema mode that suppresses Schema query and DDL diagnostics.
 - Rebuilt offline SQL reference collection around per-dialect parse-tree adapters and a shared semantic model.
 - Added nested ARRAY, MAP, and STRUCT inference for Spark DDL, `from_json`, struct constructors, and generator functions.
 - Fixed quoted Spark identifier matching, partition-column extraction, LATERAL VIEW outputs, and nested function validation.

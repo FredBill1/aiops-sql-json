@@ -67,6 +67,7 @@ For the same reason, an SQL `--` comment does not end at the visible line bounda
 | `aiopsSqlJson.dialect` | `"spark"` | SQL dialect used for embedded SQL and regular `.sql` files. |
 | `aiopsSqlJson.plainSql.enabled` | `true` | Enables this extension's diagnostics and semantic highlighting for regular `.sql` files. |
 | `aiopsSqlJson.schemaValidation.enabled` | `false` | Enables strict offline Schema completion and validation. No database connection or SQL execution is performed. |
+| `aiopsSqlJson.schemaValidation.completionOnly` | `false` | Keeps Schema-aware completion while suppressing all Schema-derived query and DDL diagnostics. Has no effect unless Schema validation is enabled. |
 | `aiopsSqlJson.schemaFiles` | `["${workspaceFolder}/schema/*.sql"]` | Globs for `.sql` files containing explicit tables and inferable views. Relative globs are resolved from the resource's workspace folder. |
 | `aiopsSqlJson.udfs` | `[]` | Simple or qualified UDF names offered by completion and accepted by Schema validation. |
 | `aiopsSqlJson.placeholderPatterns` | `["\\$\\{[^}]+\\}", "\\$\\w+"]` | Regular expression sources for template placeholders that should be masked with equal-length text before parsing. |
@@ -81,6 +82,7 @@ Example workspace settings:
   "aiopsSqlJson.dialect": "spark",
   "aiopsSqlJson.plainSql.enabled": true,
   "aiopsSqlJson.schemaValidation.enabled": true,
+  "aiopsSqlJson.schemaValidation.completionOnly": false,
   "aiopsSqlJson.schemaFiles": ["${workspaceFolder}/schema/**/*.sql"],
   "aiopsSqlJson.udfs": ["score_udf", "analytics.normalize_score"],
   "aiopsSqlJson.placeholders.allowEverywhere": true,
@@ -113,6 +115,8 @@ In SQL, placeholders normally use an identifier-shaped mask. A placeholder immed
 Completion is available for Spark, Hive, Flink, MySQL, PostgreSQL, Trino, Impala, and Generic SQL. Keyword and function catalogs are pinned with the extension; a lowercase first typed letter produces a lowercase candidate and an uppercase first letter produces uppercase. After whitespace, candidates follow the most recent word in the current statement; a new statement with no preceding word defaults to uppercase. Functions insert a snippet with the cursor inside `()`. Field names retain their original spelling.
 
 With Schema validation disabled (the default), field candidates are collected from all statements in the current `.sql` file, or from all recognized SQL strings in the current `.sql.json` file. Enabling `aiopsSqlJson.schemaValidation.enabled` prioritizes fields resolved from configured DDL, CTEs, subqueries, projections, aliases, and known wildcards. Before a relation is written, or while any relation is unresolved, an unqualified expression also offers every field in the currently effective DDL Schema plus current-file field symbols. Qualified expressions never guess fields for an unknown qualifier. In `FROM`, `JOIN`, and other relation-name positions, completion offers tables, views, and valid keywords without scalar functions, UDFs, or fields. Configuration changes, matching DDL changes, and Schema directory creation, deletion, or rename are picked up without reloading the extension.
+
+Set `aiopsSqlJson.schemaValidation.completionOnly` to `true` to retain all of that Schema-aware completion while suppressing every Schema-derived query and DDL diagnostic. Regular SQL syntax, JSON, multiline-string, placeholder, and platform diagnostics remain unchanged. Use **AIOps SQL JSON: Force Rebuild Schema Index** from the Command Palette to discard and rebuild every cached Schema index when automatic file watching misses an external or unusual filesystem change; the command is available only while Schema validation is enabled.
 
 Schema globs support `${workspaceFolder}`, `${workspaceFolder:Name}`, `${workspaceFolderBasename}`, `${userHome}`, `${file}`, `${fileWorkspaceFolder}`, `${relativeFile}`, `${relativeFileDirname}`, `${fileBasename}`, `${fileBasenameNoExtension}`, `${fileExtname}`, `${fileDirname}`, `${fileDirnameBasename}`, `${cwd}`, `${execPath}`, `${pathSeparator}`, `${/}`, and `${env:NAME}`. Relative globs remain relative to the current resource's workspace folder, or its directory outside a workspace. Variables that are unknown, empty, or refer to a missing named workspace cause that glob entry to be ignored with a warning. Interactive and task variables such as `command`, `input`, `config`, cursor, and selection variables are not evaluated.
 

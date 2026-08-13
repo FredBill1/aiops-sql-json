@@ -12,6 +12,7 @@ export interface ExtensionConfiguration {
   dialect: SqlDialect;
   plainSqlEnabled: boolean;
   schemaValidationEnabled: boolean;
+  schemaValidationCompletionOnly: boolean;
   schemaFileGlobs: string[];
   udfs: string[];
   placeholderSources: string[];
@@ -35,6 +36,7 @@ export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfig
     dialect: isSqlDialect(configuredDialect) ? configuredDialect : 'spark',
     plainSqlEnabled: configuration.get<boolean>('plainSql.enabled', true),
     schemaValidationEnabled: configuration.get<boolean>('schemaValidation.enabled', false),
+    schemaValidationCompletionOnly: configuration.get<boolean>('schemaValidation.completionOnly', false),
     schemaFileGlobs,
     udfs,
     placeholderSources,
@@ -51,6 +53,7 @@ export function configurationSignature(configuration: ExtensionConfiguration): s
     dialect: configuration.dialect,
     plainSql: configuration.plainSqlEnabled,
     schemaValidation: configuration.schemaValidationEnabled,
+    schemaValidationCompletionOnly: configuration.schemaValidationCompletionOnly,
     schemaFiles: configuration.schemaFileGlobs,
     udfs: configuration.udfs,
     placeholders: configuration.placeholderSources,

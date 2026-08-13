@@ -23,6 +23,7 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('placeholders.allowEverywhere', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('keyPatterns', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaValidation.enabled', undefined, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaValidation.completionOnly', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaFiles', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('udfs', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('dialect', undefined, vscode.ConfigurationTarget.Global);
@@ -50,9 +51,19 @@ suite('AIOps SQL JSON extension', () => {
     const schemaFiles = extension.packageJSON.contributes.configuration.properties['aiopsSqlJson.schemaFiles'] as {
       default?: string[];
     };
+    const completionOnly = extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.schemaValidation.completionOnly'
+    ] as { default?: boolean; scope?: string };
+    const rebuildCommand = (extension.packageJSON.contributes.commands as Array<{
+      command: string;
+      enablement?: string;
+    }>).find((command) => command.command === 'aiopsSqlJson.rebuildSchemaIndex');
     assert.ok(languageContribution.filenamePatterns?.includes('*.sql.json'));
     assert.deepEqual(configurationDefaults['files.associations'], { '*.sql.json': 'sql-json' });
     assert.deepEqual(schemaFiles.default, ['${workspaceFolder}/schema/*.sql']);
+    assert.equal(completionOnly.default, false);
+    assert.equal(completionOnly.scope, 'resource');
+    assert.equal(rebuildCommand?.enablement, 'config.aiopsSqlJson.schemaValidation.enabled');
 
     const document = await openFile('valid.sql.json', `{
   "trainSql": "SELECT
@@ -543,6 +554,191 @@ suite('AIOps SQL JSON extension', () => {
     );
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
       'udfs',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('keeps Schema completion while completion-only mode suppresses every Schema diagnostic', async () => {
+    const schemaDirectory = path.join(temporaryDirectory, 'completion-only-schemas');
+    const invalidSchemaPath = path.join(schemaDirectory, 'invalid.sql');
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(
+      path.join(schemaDirectory, 'catalog.sql'),
+      'CREATE TABLE demo.orders (id BIGINT, amount DECIMAL(10,2));',
+      'utf8',
+    );
+    await fs.writeFile(invalidSchemaPath, 'CREATE TABLE broken_table AS SELECT 1;', 'utf8');
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      ['completion-only-schemas/*.sql'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+
+    const queryDocument = await openFile(
+      'completion-only-query.sql',
+      'SELECT o.missing, mystery(o.id) FROM demo.orders o;',
+    );
+    const strictDiagnostics = await waitForDiagnostics(
+      queryDocument.uri,
+      (items) => items.some((item) => item.code === 'unknown-column')
+        && items.some((item) => item.code === 'unknown-function'),
+    );
+    assert.ok(strictDiagnostics.some((item) => item.code === 'unknown-column'));
+    assert.ok(strictDiagnostics.some((item) => item.code === 'unknown-function'));
+    const syntaxDocument = await openFile('completion-only-syntax.sql', 'SELEC 1;');
+    const syntaxDiagnostics = await waitForDiagnostics(
+      syntaxDocument.uri,
+      (items) => items.some((item) => item.source === 'spark SQL'),
+    );
+    assert.ok(syntaxDiagnostics.some((item) => item.source === 'spark SQL'));
+
+    const invalidSchemaDocument = await vscode.workspace.openTextDocument(vscode.Uri.file(invalidSchemaPath));
+    const strictDdlDiagnostics = await waitForDiagnostics(
+      invalidSchemaDocument.uri,
+      (items) => items.some((item) => item.source === 'SQL schema DDL'),
+    );
+    assert.ok(strictDdlDiagnostics.some((item) => item.source === 'SQL schema DDL'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.completionOnly',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+    const completionOnlyDiagnostics = await waitForDiagnostics(
+      queryDocument.uri,
+      (items) => !items.some((item) => item.source?.includes('SQL schema')),
+    );
+    assert.ok(!completionOnlyDiagnostics.some((item) => item.source?.includes('SQL schema')));
+    const retainedSyntaxDiagnostics = await waitForDiagnostics(
+      syntaxDocument.uri,
+      (items) => items.some((item) => item.source === 'spark SQL')
+        && !items.some((item) => item.source?.includes('SQL schema')),
+    );
+    assert.ok(retainedSyntaxDiagnostics.some((item) => item.source === 'spark SQL'));
+    const completionOnlyDdlDiagnostics = await waitForDiagnostics(
+      invalidSchemaDocument.uri,
+      (items) => !items.some((item) => item.source?.includes('SQL schema')),
+    );
+    assert.ok(!completionOnlyDdlDiagnostics.some((item) => item.source?.includes('SQL schema')));
+
+    const globalCompletionDocument = await openFile(
+      'completion-only-global.sql',
+      'SELECT o.i FROM demo.orders o',
+    );
+    const globalItems = await completionItemsAtOffset(
+      globalCompletionDocument,
+      globalCompletionDocument.getText().indexOf('o.i') + 3,
+    );
+    assert.ok(globalItems.some((item) => completionLabel(item) === 'id'));
+
+    const derivedCompletionDocument = await openFile(
+      'completion-only-derived.sql',
+      'WITH order_ids AS (SELECT id AS derived_id FROM demo.orders) SELECT o.d FROM order_ids o',
+    );
+    const derivedItems = await completionItemsAtOffset(
+      derivedCompletionDocument,
+      derivedCompletionDocument.getText().indexOf('o.d') + 3,
+    );
+    assert.ok(derivedItems.some((item) => completionLabel(item) === 'derived_id'));
+
+    const localCompletionDocument = await openFile(
+      'completion-only-local.sql',
+      'CREATE TABLE local_orders (local_id BIGINT); SELECT l.l FROM local_orders l;',
+    );
+    const localItems = await completionItemsAtOffset(
+      localCompletionDocument,
+      localCompletionDocument.getText().indexOf('l.l') + 3,
+    );
+    assert.ok(localItems.some((item) => completionLabel(item) === 'local_id'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.completionOnly',
+      false,
+      vscode.ConfigurationTarget.Global,
+    );
+    const restoredDiagnostics = await waitForDiagnostics(
+      queryDocument.uri,
+      (items) => items.some((item) => item.code === 'unknown-column')
+        && items.some((item) => item.code === 'unknown-function'),
+    );
+    assert.ok(restoredDiagnostics.some((item) => item.code === 'unknown-column'));
+    assert.ok(restoredDiagnostics.some((item) => item.code === 'unknown-function'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.completionOnly',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
+  test('force rebuilds every cached Schema index', async () => {
+    const schemaDirectory = path.join(temporaryDirectory, 'force-rebuild-schemas');
+    const catalogPath = path.join(schemaDirectory, 'catalog.sql');
+    await fs.mkdir(schemaDirectory, { recursive: true });
+    await fs.writeFile(catalogPath, 'CREATE TABLE rebuild_table (old_column BIGINT);', 'utf8');
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      ['force-rebuild-schemas/*.sql'],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+
+    const document = await openFile(
+      'force-rebuild-query.sql',
+      'SELECT r.new_column FROM rebuild_table r;',
+    );
+    const staleDiagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) => items.some((item) => item.code === 'unknown-column'),
+    );
+    assert.ok(staleDiagnostics.some((item) => item.code === 'unknown-column'));
+
+    await fs.writeFile(catalogPath, 'CREATE TABLE rebuild_table (new_column BIGINT);', 'utf8');
+    await vscode.commands.executeCommand('aiopsSqlJson.rebuildSchemaIndex');
+
+    const rebuiltDiagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) => !items.some((item) => item.code === 'unknown-column'),
+    );
+    assert.ok(!rebuiltDiagnostics.some((item) => item.code === 'unknown-column'));
+    const completionDocument = await openFile(
+      'force-rebuild-completion.sql',
+      'SELECT r.n FROM rebuild_table r;',
+    );
+    const completionItems = await completionItemsAtOffset(
+      completionDocument,
+      completionDocument.getText().indexOf('r.n') + 3,
+    );
+    assert.ok(completionItems.some((item) => completionLabel(item) === 'new_column'));
+    assert.ok(!completionItems.some((item) => completionLabel(item) === 'old_column'));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
       undefined,
       vscode.ConfigurationTarget.Global,
     );

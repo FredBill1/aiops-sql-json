@@ -12,18 +12,36 @@ import { createSchemaSnapshot, parseDdlSchema, type SchemaIssue, type SchemaSnap
 
 const EMPTY_SCHEMA: SchemaSnapshot = { tables: [], issues: [] };
 
+interface SchemaBuildResult {
+  snapshot: SchemaSnapshot;
+  sources?: readonly { uri: vscode.Uri; text: string }[];
+}
+
+interface SchemaCacheEntry {
+  generation: number;
+  promise: Promise<SchemaBuildResult>;
+  committed: boolean;
+}
+
+export interface SchemaRebuildRequest {
+  resource: vscode.Uri;
+  configuration: ExtensionConfiguration;
+}
+
 export class SqlSchemaService implements vscode.Disposable {
   private readonly changedEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeSchema = this.changedEmitter.event;
 
   private readonly diagnostics = vscode.languages.createDiagnosticCollection('aiops-sql-schema');
-  private readonly cache = new Map<string, Promise<SchemaSnapshot>>();
+  private readonly cache = new Map<string, SchemaCacheEntry>();
   private readonly lastGood = new Map<string, SchemaSnapshot>();
   private readonly watchers = new Map<string, vscode.FileSystemWatcher>();
   private readonly schemaUris = new Set<string>();
+  private readonly diagnosticContributions = new Map<string, Map<string, vscode.Diagnostic[]>>();
   private readonly reportedPatternIssues = new Set<string>();
   private readonly disposables: vscode.Disposable[] = [];
   private invalidationTimer: NodeJS.Timeout | undefined;
+  private generation = 0;
 
   constructor() {
     this.disposables.push(
@@ -67,32 +85,43 @@ export class SqlSchemaService implements vscode.Disposable {
         glob: pattern.glob,
       })),
       udfs: configuration.udfs,
+      schemaDiagnostics: !configuration.schemaValidationCompletionOnly,
     });
     const existing = this.cache.get(key);
     if (existing) {
-      return existing;
+      return this.resolveEntry(key, existing, configuration);
     }
     for (const pattern of resolved.patterns) {
       this.ensureWatchers(pattern);
     }
-    const pending = this.buildSchema(resolved.patterns, configuration).catch(() => (
-      this.lastGood.get(key) ?? EMPTY_SCHEMA
-    ));
-    this.cache.set(key, pending);
-    const snapshot = await pending;
-    this.lastGood.set(key, snapshot);
-    return snapshot;
+    const fallback = this.lastGood.get(key) ?? EMPTY_SCHEMA;
+    const entry: SchemaCacheEntry = {
+      generation: this.generation,
+      promise: this.buildSchema(resolved.patterns, configuration, this.generation).catch(() => ({ snapshot: fallback })),
+      committed: false,
+    };
+    this.cache.set(key, entry);
+    return this.resolveEntry(key, entry, configuration);
+  }
+
+  async rebuild(requests: readonly SchemaRebuildRequest[]): Promise<void> {
+    this.reset();
+    const enabledRequests = requests.filter((request) => request.configuration.schemaValidationEnabled);
+    while (true) {
+      const rebuildGeneration = this.generation;
+      await Promise.all(enabledRequests.map((request) => this.getSchema(
+        request.resource,
+        request.configuration,
+      )));
+      if (this.generation === rebuildGeneration) {
+        this.changedEmitter.fire();
+        return;
+      }
+    }
   }
 
   clear(): void {
-    this.cache.clear();
-    this.lastGood.clear();
-    this.schemaUris.clear();
-    this.diagnostics.clear();
-    for (const watcher of this.watchers.values()) {
-      watcher.dispose();
-    }
-    this.watchers.clear();
+    this.reset();
     this.changedEmitter.fire();
   }
 
@@ -109,7 +138,8 @@ export class SqlSchemaService implements vscode.Disposable {
   private async buildSchema(
     patterns: readonly ResolvedSchemaPattern[],
     configuration: ExtensionConfiguration,
-  ): Promise<SchemaSnapshot> {
+    generation: number,
+  ): Promise<SchemaBuildResult> {
     const uris = new Map<string, vscode.Uri>();
     for (const pattern of patterns) {
       const matches = await vscode.workspace.findFiles(new vscode.RelativePattern(
@@ -125,14 +155,42 @@ export class SqlSchemaService implements vscode.Disposable {
     const parsed = await Promise.all([...uris.values()].sort((left, right) => (
       left.toString().localeCompare(right.toString())
     )).map(async (uri) => {
-      this.schemaUris.add(uri.toString());
+      if (generation === this.generation) {
+        this.schemaUris.add(uri.toString());
+      }
       const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
       const text = openDocument?.getText() ?? new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
       return { uri, text, parsed: parseDdlSchema(text, configuration.dialect, uri.toString()) };
     }));
     const snapshot = createSchemaSnapshot(parsed.map((item) => item.parsed), configuration.udfs);
-    this.publishDiagnostics(parsed.map((item) => ({ uri: item.uri, text: item.text })), snapshot.issues);
-    return snapshot;
+    return {
+      snapshot,
+      sources: parsed.map((item) => ({ uri: item.uri, text: item.text })),
+    };
+  }
+
+  private async resolveEntry(
+    key: string,
+    entry: SchemaCacheEntry,
+    configuration: ExtensionConfiguration,
+  ): Promise<SchemaSnapshot> {
+    const result = await entry.promise;
+    if (entry.generation !== this.generation || this.cache.get(key) !== entry) {
+      return EMPTY_SCHEMA;
+    }
+    if (!entry.committed) {
+      entry.committed = true;
+      this.lastGood.set(key, result.snapshot);
+      if (result.sources) {
+        for (const source of result.sources) {
+          this.schemaUris.add(source.uri.toString());
+        }
+        if (!configuration.schemaValidationCompletionOnly) {
+          this.updateDiagnosticContribution(key, result.sources, result.snapshot.issues);
+        }
+      }
+    }
+    return result.snapshot;
   }
 
   private ensureWatchers(pattern: ResolvedSchemaPattern): void {
@@ -172,16 +230,19 @@ export class SqlSchemaService implements vscode.Disposable {
     }
     this.invalidationTimer = setTimeout(() => {
       this.invalidationTimer = undefined;
+      this.generation += 1;
       this.cache.clear();
+      this.diagnosticContributions.clear();
+      this.diagnostics.clear();
       this.changedEmitter.fire();
     }, 150);
   }
 
-  private publishDiagnostics(
+  private updateDiagnosticContribution(
+    key: string,
     sources: readonly { uri: vscode.Uri; text: string }[],
     issues: readonly SchemaIssue[],
   ): void {
-    this.diagnostics.clear();
     const sourceByUri = new Map(sources.map((source) => [source.uri.toString(), source]));
     const grouped = new Map<string, vscode.Diagnostic[]>();
     for (const issue of issues) {
@@ -200,9 +261,57 @@ export class SqlSchemaService implements vscode.Disposable {
       list.push(diagnostic);
       grouped.set(issue.source, list);
     }
-    for (const [source, diagnostics] of grouped) {
+    this.diagnosticContributions.set(key, grouped);
+    this.publishDiagnosticContributions();
+  }
+
+  private publishDiagnosticContributions(): void {
+    const combined = new Map<string, vscode.Diagnostic[]>();
+    const seen = new Map<string, Set<string>>();
+    for (const contribution of this.diagnosticContributions.values()) {
+      for (const [source, diagnostics] of contribution) {
+        const target = combined.get(source) ?? [];
+        const sourceSeen = seen.get(source) ?? new Set<string>();
+        for (const diagnostic of diagnostics) {
+          const signature = [
+            diagnostic.range.start.line,
+            diagnostic.range.start.character,
+            diagnostic.range.end.line,
+            diagnostic.range.end.character,
+            diagnostic.severity,
+            String(diagnostic.code),
+            diagnostic.message,
+          ].join(':');
+          if (!sourceSeen.has(signature)) {
+            sourceSeen.add(signature);
+            target.push(diagnostic);
+          }
+        }
+        combined.set(source, target);
+        seen.set(source, sourceSeen);
+      }
+    }
+    this.diagnostics.clear();
+    for (const [source, diagnostics] of combined) {
       this.diagnostics.set(vscode.Uri.parse(source), diagnostics);
     }
+  }
+
+  private reset(): void {
+    if (this.invalidationTimer) {
+      clearTimeout(this.invalidationTimer);
+      this.invalidationTimer = undefined;
+    }
+    this.generation += 1;
+    this.cache.clear();
+    this.lastGood.clear();
+    this.schemaUris.clear();
+    this.diagnosticContributions.clear();
+    this.diagnostics.clear();
+    for (const watcher of this.watchers.values()) {
+      watcher.dispose();
+    }
+    this.watchers.clear();
   }
 }
 
