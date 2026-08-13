@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.5
+
 - Added AST-based SQL Hover and Go to Definition for regular `.sql` files and recognized SQL regions in `.sql.json` files.
 - Added lexical-first navigation for relation aliases, CTE and derived-table projections, nested fields, generator outputs, Lambda parameters, and local DDL, with cross-file links to indexed table, view, and column declarations.
 - Added recursive type signatures and source summaries to SQL Hover, including built-in/UDF classification and bounded table/STRUCT expansion.
