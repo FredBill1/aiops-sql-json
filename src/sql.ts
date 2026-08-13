@@ -9,7 +9,7 @@ import {
   TrinoSQL,
 } from 'dt-sql-parser';
 import type { CaretPosition, EntityContext, ParseError, Suggestions } from 'dt-sql-parser';
-import type { Token } from 'antlr4ng';
+import type { ParserRuleContext, Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
 
@@ -45,6 +45,7 @@ export interface SqlAnalysis {
 }
 
 export interface ParserLike {
+  parse(input: string): ParserRuleContext;
   validate(input: string): ParseError[];
   getAllTokens(input: string): Token[];
   getSuggestionAtCaretPosition(input: string, caretPosition: CaretPosition): Suggestions | null;

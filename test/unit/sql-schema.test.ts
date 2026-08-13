@@ -118,7 +118,7 @@ WHERE o.amount > 0`;
       issue.code === 'unknown-qualifier'
     ))).toBe(true);
     expect(analyzeSqlSemantics('SELECT mystery(id) FROM sales.orders', 'spark', [], schema, []).some((issue) => (
-      issue.code === 'unknown-function'
+      issue.code === 'unknown-function' && issue.severity === 'warning'
     ))).toBe(true);
     expect(analyzeSqlSemantics(
       'SELECT id FROM sales.orders o JOIN sales.customers c ON o.customer_id = c.id',
@@ -127,6 +127,29 @@ WHERE o.amount > 0`;
       schema,
       [],
     ).some((issue) => issue.code === 'ambiguous-column')).toBe(true);
+  });
+
+  it('uses the parse-tree adapters consistently for every dialect', () => {
+    for (const dialect of SQL_DIALECTS) {
+      const dialectSchema = createSchemaSnapshot([
+        parseDdlSchema(ddlByDialect[dialect], dialect, `${dialect}.sql`),
+      ]);
+      expect(analyzeSqlSemantics('SELECT id FROM sales.orders', dialect, [], dialectSchema, [])).toEqual([]);
+      expect(analyzeSqlSemantics(
+        'SELECT missing FROM sales.orders',
+        dialect,
+        [],
+        dialectSchema,
+        [],
+      ).some((issue) => issue.code === 'unknown-column')).toBe(true);
+      expect(analyzeSqlSemantics(
+        'SELECT mystery(id) FROM sales.orders',
+        dialect,
+        [],
+        dialectSchema,
+        [],
+      ).some((issue) => issue.code === 'unknown-function' && issue.severity === 'warning')).toBe(true);
+    }
   });
 
   it('resolves CTE and subquery projection fields', () => {
@@ -257,5 +280,54 @@ SELECT id FROM local_orders;`;
       schema,
       [],
     ).some((issue) => issue.code === 'unknown-column')).toBe(true);
+  });
+
+  it('accepts Spark quoted identifiers, complex expressions, generators, partitions, and implicit aliases', () => {
+    const cases = [
+      'create table test_table (`a` string); select a from test_table;',
+      'create table test_table (a string); select `a` from test_table;',
+      "create table test_table (a string); select from_json(a, 'struct<x:int,y:int>').x from test_table;",
+      "create table test_table (a string); select pos, exp_obj.x, exp_obj.y from test_table lateral view outer posexplode (from_json(test_table.a, 'array<struct<x:string,y:string>>')) test_table_exp as pos, exp_obj;",
+      "create table test_table (a string) partitioned by (`pt_h` string); insert into test_table partition (pt_h = '$date$hour') values ('x');",
+      "create table test_table (a string); select struct(a).a, named_struct('x', a).x from test_table;",
+      "create table test_table (a string); select size(split(a, ',')) from test_table;",
+      'create table test_table (a string); select a b from test_table;',
+      "create table test_table (a string); select pos, key, value from test_table lateral view posexplode(from_json(a, 'map<string,int>')) expanded as pos, key, value;",
+    ];
+    for (const sql of cases) {
+      expect(analyzeSqlSemantics(sql, 'spark', [], { tables: [], issues: [] }, [])).toEqual([]);
+    }
+  });
+
+  it('retains nested-field errors when a complex type is known', () => {
+    const cases = [
+      "create table test_table (a string); select from_json(a, 'struct<x:int>').missing from test_table;",
+      "create table test_table (a string); select named_struct('x', a).missing from test_table;",
+      "create table test_table (a string); select exp_obj.missing from test_table lateral view posexplode(from_json(a, 'array<struct<x:string>>')) expanded as pos, exp_obj;",
+    ];
+    for (const sql of cases) {
+      expect(analyzeSqlSemantics(sql, 'spark', [], { tables: [], issues: [] }, []).some((issue) => (
+        issue.code === 'unknown-column'
+      ))).toBe(true);
+    }
+  });
+
+  it('adds partition columns to local schemas and excludes static partitions from INSERT payloads', () => {
+    const sql = "CREATE TABLE partitioned_table (a STRING) PARTITIONED BY (`pt_h` STRING); INSERT INTO partitioned_table PARTITION (pt_h = '$date$hour') VALUES ('x');";
+    const snapshot = getSqlSchemaAtOffset(sql, sql.length, 'spark', [], { tables: [], issues: [] });
+    expect(snapshot.tables[0]?.columns.map((column) => column.name)).toEqual(['a', 'pt_h']);
+    expect(analyzeSqlSemantics(sql, 'spark', [], { tables: [], issues: [] }, [])).toEqual([]);
+  });
+
+  it('suppresses relation and dependent column diagnostics for dynamic relation names', () => {
+    const placeholders = [/\$\{[^}]+\}/gu];
+    const cases = [
+      'SELECT a FROM ${param:db}.${param:table}',
+      'SELECT a FROM analytics.${param:table}',
+      'SELECT d.a FROM static_${param:db}.${param:table} d',
+    ];
+    for (const sql of cases) {
+      expect(analyzeSqlSemantics(sql, 'spark', placeholders, schema, [])).toEqual([]);
+    }
   });
 });

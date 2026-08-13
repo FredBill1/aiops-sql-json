@@ -789,6 +789,84 @@ SELECT id, amount FROM local_orders;`,
     );
   });
 
+  test('validates Spark complex schema expressions without false errors and maps warning severity', async () => {
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'dialect',
+      'spark',
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      [],
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+
+    const validStatements = [
+      'create table test_table (`a` string); select a from test_table;',
+      'create table test_table (a string); select `a` from test_table;',
+      "create table test_table (a string); select from_json(a, 'struct<x:int,y:int>').x from test_table;",
+      "create table test_table (a string); select pos, exp_obj.x, exp_obj.y from test_table lateral view outer posexplode (from_json(test_table.a, 'array<struct<x:string,y:string>>')) test_table_exp as pos, exp_obj;",
+      "create table test_table (a string) partitioned by (`pt_h` string); insert into test_table partition (pt_h = '$date$hour') values ('x');",
+      "create table test_table (a string); select struct(a).a, named_struct('x', a).x from test_table;",
+      "create table test_table (a string); select size(split(a, ',')) from test_table;",
+      'create table test_table (a string); select a b from test_table;',
+      'select a from ${param:db}.${param:table};',
+    ];
+    const jsonDocument = await openFile(
+      'spark-semantic-regressions.sql.json',
+      JSON.stringify(Object.fromEntries(validStatements.map((sql, index) => [`case${index}Sql`, sql])), null, 2),
+    );
+    const validDiagnostics = await waitForDiagnostics(jsonDocument.uri);
+    assert.ok(
+      !validDiagnostics.some((diagnostic) => diagnostic.source?.includes('SQL')),
+      `Unexpected SQL diagnostic: ${validDiagnostics.map((diagnostic) => diagnostic.message).join(' | ')}`,
+    );
+
+    const warningDocument = await openFile(
+      'schema-function-warning.sql',
+      'CREATE TABLE local_table (id BIGINT); SELECT mystery(id) FROM local_table;',
+    );
+    const warningDiagnostics = await waitForDiagnostics(
+      warningDocument.uri,
+      (items) => items.some((item) => item.code === 'unknown-function'),
+    );
+    const unknownFunction = warningDiagnostics.find((item) => item.code === 'unknown-function');
+    assert.ok(unknownFunction);
+    assert.equal(unknownFunction.severity, vscode.DiagnosticSeverity.Warning);
+
+    const invalidNestedDocument = await openFile(
+      'schema-nested-invalid.sql',
+      "CREATE TABLE local_table (payload STRING); SELECT from_json(payload, 'struct<x:int>').missing FROM local_table;",
+    );
+    const invalidNestedDiagnostics = await waitForDiagnostics(
+      invalidNestedDocument.uri,
+      (items) => items.some((item) => item.code === 'unknown-column'),
+    );
+    assert.ok(invalidNestedDiagnostics.some((item) => item.code === 'unknown-column'
+      && item.severity === vscode.DiagnosticSeverity.Error));
+
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'dialect',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaValidation.enabled',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'schemaFiles',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
+  });
+
   test('resolves the default schema variable and invalidates renamed or deleted schema directories', async () => {
     const schemaDirectory = path.join(temporaryDirectory, 'schema');
     const renamedDirectory = path.join(temporaryDirectory, 'schema1');

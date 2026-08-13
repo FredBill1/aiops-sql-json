@@ -143,7 +143,7 @@ export function analyzePlainSqlDocument(
       document,
       issue,
       issue.message,
-      vscode.DiagnosticSeverity.Error,
+      semanticIssueSeverity(issue.severity),
       `${configuration.dialect} SQL schema`,
       issue.code,
     )));
@@ -198,7 +198,7 @@ function appendSqlDiagnostics(
         document,
         span,
         issue.message,
-        vscode.DiagnosticSeverity.Error,
+        semanticIssueSeverity(issue.severity),
         `${configuration.dialect} SQL schema`,
         issue.code,
       ));
@@ -228,6 +228,10 @@ function appendSqlDiagnostics(
       }
     }
   }
+}
+
+function semanticIssueSeverity(severity: 'error' | 'warning' | undefined): vscode.DiagnosticSeverity {
+  return severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
 }
 
 function createDiagnostic(

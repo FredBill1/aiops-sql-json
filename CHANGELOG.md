@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Rebuilt offline SQL reference collection around per-dialect parse-tree adapters and a shared semantic model.
+- Added nested ARRAY, MAP, and STRUCT inference for Spark DDL, `from_json`, struct constructors, and generator functions.
+- Fixed quoted Spark identifier matching, partition-column extraction, LATERAL VIEW outputs, and nested function validation.
+- Suppressed table and dependent-column diagnostics for placeholder-based dynamic relations.
+- Changed unknown-function diagnostics from errors to warnings and expanded the Spark built-in function catalog.
+
 ## 0.0.4
 
 - Added DDL and current-file field fallback while a SELECT source is absent or unresolved.
