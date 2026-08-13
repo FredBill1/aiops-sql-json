@@ -97,7 +97,7 @@ export function parseSqlAst(
   if (/\bCREATE\s+[\p{L}_$]*\s*$/iu.test(masked)) return undefined;
   for (const parserDialect of DIALECT_CANDIDATES[dialect]) {
     try {
-      const statements = parse(masked, { dialect: parserDialect });
+      const statements = parse(maskSqlingoParserGaps(masked, parserDialect), { dialect: parserDialect });
       if (statements.some((statement) => statement instanceof CommandExpr)) continue;
       return {
         statements: statements.flatMap((statement) => (
@@ -117,8 +117,12 @@ export function sqlingoCanParse(
   dialect: SqlDialect,
   placeholders: readonly RegExp[] = [],
 ): boolean {
-  if (dialect === 'flink' || dialect === 'impala') return false;
   return parseSqlAst(text, dialect, placeholders) !== undefined;
+}
+
+function maskSqlingoParserGaps(text: string, dialect: ParsedSqlAst['parserDialect']): string {
+  if (dialect !== 'mysql' || !/\bJSON_TABLE\b/iu.test(text)) return text;
+  return text.replace(/\bEXISTS(?=\s+PATH\b)/giu, (value) => ' '.repeat(value.length));
 }
 
 export function astChild(node: SqlAstNode, key: string): SqlAstNode | undefined {

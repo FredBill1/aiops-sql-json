@@ -17,6 +17,11 @@ const FUNCTION_SOURCES: Record<SqlDialect, string> = {
   generic: "AVG COUNT FIRST_VALUE LAG LAST_VALUE LEAD MAX MIN NTH_VALUE NTILE PERCENT_RANK RANK ROW_NUMBER SUM STDDEV STDDEV_POP STDDEV_SAMP VAR_POP VAR_SAMP VARIANCE",
 };
 
+const FUNCTION_SUPPLEMENTS: Partial<Record<SqlDialect, string>> = {
+  spark: 'TRANSFORM FILTER EXISTS FORALL AGGREGATE REDUCE ZIP_WITH MAP_FILTER MAP_ZIP_WITH TRANSFORM_KEYS TRANSFORM_VALUES ARRAY_SORT',
+  hive: 'ARRAY NAMED_STRUCT STRUCT TRANSFORM FILTER EXISTS FORALL AGGREGATE REDUCE ZIP_WITH MAP_FILTER MAP_ZIP_WITH TRANSFORM_KEYS TRANSFORM_VALUES ARRAY_SORT',
+};
+
 const cache = new Map<SqlDialect, SqlCatalog>();
 
 export function getSqlCatalog(dialect: SqlDialect): SqlCatalog {
@@ -38,7 +43,7 @@ export function getSqlCatalog(dialect: SqlDialect): SqlCatalog {
       keywords.push(value);
     }
   }
-  const functions = splitAndDeduplicate(FUNCTION_SOURCES[dialect]);
+  const functions = splitAndDeduplicate(`${FUNCTION_SOURCES[dialect]} ${FUNCTION_SUPPLEMENTS[dialect] ?? ''}`);
   const catalog = {
     keywords: deduplicate(keywords),
     functions,

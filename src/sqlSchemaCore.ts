@@ -1,7 +1,5 @@
-import type { CommonEntityContext, EntityContext } from 'dt-sql-parser';
-
 import { findPlaceholderRanges } from './patterns';
-import { analyzeSql, getSqlEntities, lexSql, type SqlDialect, type SqlLexToken } from './sql';
+import { analyzeSql, lexSql, type SqlDialect, type SqlLexToken } from './sql';
 import {
   astChild,
   astChildren,
@@ -11,12 +9,6 @@ import {
   type SqlAstValue,
 } from './sqlAst';
 import { getSqlCatalog } from './sqlCatalog';
-import {
-  buildSqlSemanticIr,
-  type SemanticFieldAccess,
-  type SemanticLateralView,
-  type SemanticReference,
-} from './sqlSemanticIr';
 
 export type SqlTypeFamily = 'number' | 'string' | 'boolean' | 'date' | 'time' | 'binary' | 'complex' | 'unknown';
 
@@ -114,14 +106,6 @@ interface AstScope extends MutableScope {
   parent?: AstScope;
 }
 
-interface CteDefinition {
-  name: string;
-  normalizedName: string;
-  columns: SchemaColumn[];
-  declarationStart: number;
-  declarationEnd: number;
-}
-
 interface IdentifierReference {
   text: string;
   parts: string[];
@@ -154,6 +138,12 @@ export function parseDdlSchema(
   dialect: SqlDialect,
   source: string,
 ): ParsedDdlSchema {
+  const ast = parseSqlAst(text, dialect);
+  if (ast) {
+    const creates = ast.statements.filter((statement) => statement.role === 'create');
+    if (creates.length > 0) return parseAstDdlSchema(text, dialect, source, creates);
+  }
+
   const syntax = analyzeSql(text, dialect, []);
   if (syntax.issues.length > 0) {
     return {
@@ -169,65 +159,9 @@ export function parseDdlSchema(
     };
   }
 
-  const ast = parseSqlAst(text, dialect);
-  if (ast) {
-    const creates = ast.statements.filter((statement) => statement.role === 'create');
-    if (creates.length > 0) return parseAstDdlSchema(text, dialect, source, creates);
-  }
-
-  const entities = getSqlEntities(text, dialect);
-  const semanticIr = buildSqlSemanticIr(text, dialect, [], entities);
-  const createTables = entities.filter((entity) => entity.entityContextType === 'tableCreate');
-  const createViews = entities.filter((entity) => entity.entityContextType === 'viewCreate');
-  const tables: SchemaTable[] = [];
-  const views: SchemaViewDefinition[] = [];
-  const issues: SchemaIssue[] = [];
-  for (const entity of createTables) {
-    const columns = deduplicateColumns([
-      ...extractDeclaredColumns(entity, dialect),
-      ...semanticIr.partitionColumns
-        .filter((column) => column.start >= entity.belongStmt.position.startIndex
-          && column.end <= entity.belongStmt.position.endIndex + 1)
-        .map((column) => declaredColumn(column.name, column.type, column.start, column.end, dialect)),
-    ]);
-    if (columns.length === 0) {
-      issues.push({
-        source,
-        start: entity.position.startIndex,
-        end: entity.position.endIndex + 1,
-        message: `Table ${entity.text} has no explicit column definitions and cannot be used as an offline schema.`,
-        code: 'schema-table-without-columns',
-      });
-      continue;
-    }
-    const name = entity.text.trim();
-    const normalizedParts = splitQualifiedName(name).map((part) => normalizeIdentifier(part.text, part.quoted, dialect));
-    tables.push({
-      name,
-      normalizedName: normalizedParts.join('.'),
-      normalizedLeafName: normalizedParts.at(-1) ?? '',
-      kind: 'table',
-      columns,
-      source,
-      start: entity.position.startIndex,
-      end: entity.position.endIndex + 1,
-    });
-  }
-  for (const entity of createViews) {
-    const view = extractViewDefinition(text, entity, dialect, source);
-    if (view) {
-      views.push(view);
-    } else {
-      issues.push({
-        source,
-        start: entity.position.startIndex,
-        end: entity.position.endIndex + 1,
-        message: `View ${entity.text} has no query whose output columns can be inferred.`,
-        code: 'schema-view-without-query',
-      });
-    }
-  }
-  return { tables, views, issues };
+  // DT is the final syntax gate only. A syntactically valid statement that the
+  // normalized AST cannot represent is intentionally skipped conservatively.
+  return { tables: [], views: [], issues: [] };
 }
 
 function parseAstDdlSchema(
@@ -412,7 +346,7 @@ export function createSchemaSnapshot(
     for (const view of pending) {
       const snapshot: SchemaSnapshot = { tables, issues: [] };
       const model = buildSqlModel(view.query, view.dialect, snapshot, [], udfs, true);
-      let columns = deriveQueryColumns(view.query, view.dialect, snapshot, new Map(), []);
+      let columns = deriveQueryColumns(view.query, view.dialect, snapshot, []);
       if (view.explicitColumns.length > 0 && columns.length === view.explicitColumns.length) {
         columns = view.explicitColumns.map((name, index) => {
           const inferred = columns[index];
@@ -676,26 +610,30 @@ function applyLocalDdl(
 ): SqlSemanticIssue[] {
   const text = statement.text;
   const body = withoutLeadingSqlComments(text);
+  const astStatement = parseSqlAst(text, dialect, placeholders)?.statements[0];
   const createMatch = /^CREATE\s+(?<replace>OR\s+REPLACE\s+)?(?:(?:GLOBAL|LOCAL)\s+)?(?<temporary>TEMP(?:ORARY)?\s+)?(?<kind>TABLE|VIEW)\b/iu.exec(body);
-  if (createMatch?.groups) {
-    const kind = createMatch.groups.kind?.toLocaleLowerCase() as 'table' | 'view';
-    const entities = getSqlEntities(text, dialect, placeholders);
-    const entity = entities.find((candidate) => candidate.entityContextType === `${kind}Create`);
-    if (!entity) return [];
+  if (createMatch?.groups && astStatement?.role === 'create') {
+    const kind = astPrimitiveString(astStatement.args.kind).toLocaleLowerCase() as 'table' | 'view';
+    if (kind !== 'table' && kind !== 'view') return [];
+    const target = astChild(astStatement, 'this');
+    const schema = target?.role === 'schema' ? target : undefined;
+    const objectNode = schema ? astChild(schema, 'this') : target;
+    if (!objectNode) return [];
+    const name = astTableName(objectNode);
     const temporary = Boolean(createMatch.groups.temporary);
-    const ifNotExists = /\bIF\s+NOT\s+EXISTS\b/iu.test(text.slice(0, entity.position.startIndex));
+    const ifNotExists = /\bIF\s+NOT\s+EXISTS\b/iu.test(text.slice(0, objectNode.start));
     const orReplace = Boolean(createMatch.groups.replace);
     const effective = effectiveSchemaSnapshot(base, state);
-    const existing = resolveSchemaTable(effective, entity.text, dialect);
-    const normalizedName = normalizeQualifiedName(entity.text, dialect);
-    const localMatch = findLocalObject(state, entity.text, dialect);
+    const existing = resolveSchemaTable(effective, name, dialect);
+    const normalizedName = normalizeQualifiedName(name, dialect);
+    const localMatch = findLocalObject(state, name, dialect);
     if (existing.status !== 'missing' && !temporary && !orReplace) {
       if (ifNotExists) return [];
       return reportIssues ? [ddlIssue(
         statement,
-        entity.position.startIndex,
-        entity.position.endIndex + 1,
-        `Cannot create ${kind} ${entity.text}; an object with that name already exists.`,
+        objectNode.start,
+        objectNode.end,
+        `Cannot create ${kind} ${name}; an object with that name already exists.`,
         'duplicate-local-object',
       )] : [];
     }
@@ -703,62 +641,43 @@ function applyLocalDdl(
       if (ifNotExists) return [];
       return reportIssues ? [ddlIssue(
         statement,
-        entity.position.startIndex,
-        entity.position.endIndex + 1,
-        `Cannot create ${kind} ${entity.text}; a local object with that name already exists.`,
+        objectNode.start,
+        objectNode.end,
+        `Cannot create ${kind} ${name}; a local object with that name already exists.`,
         'duplicate-local-object',
       )] : [];
     }
+    const parsed = parseAstDdlSchema(text, dialect, 'local', [astStatement]);
     if (kind === 'table') {
-      const semanticIr = buildSqlSemanticIr(text, dialect, placeholders, entities);
-      const columns = [
-        ...extractDeclaredColumns(entity, dialect),
-        ...semanticIr.partitionColumns.map((column) => (
-          declaredColumn(column.name, column.type, column.start, column.end, dialect)
-        )),
-      ];
-      const duplicate = firstDuplicateColumn(columns);
-      if (duplicate) {
+      const parsedTable = parsed.tables[0];
+      if (!parsedTable) {
+        const issue = parsed.issues[0];
         return reportIssues ? [ddlIssue(
           statement,
-          duplicate.start,
-          duplicate.end,
-          `Duplicate column ${duplicate.name} in table ${entity.text}.`,
-          'duplicate-schema-column',
+          issue?.start ?? objectNode.start,
+          issue?.end ?? objectNode.end,
+          issue?.message ?? `Table ${name} has no explicit column definitions; CTAS does not create a local schema object.`,
+          issue?.code === 'duplicate-schema-column' ? issue.code : 'local-table-without-columns',
         )] : [];
       }
-      if (columns.length === 0) {
-        return reportIssues ? [ddlIssue(
-          statement,
-          entity.position.startIndex,
-          entity.position.endIndex + 1,
-          `Table ${entity.text} has no explicit column definitions; CTAS does not create a local schema object.`,
-          'local-table-without-columns',
-        )] : [];
-      }
-      const parts = splitQualifiedName(entity.text);
       prepareReplacement(state, existing.table, localMatch, orReplace, temporary);
       state.local.set(normalizedName, {
-        name: entity.text,
-        normalizedName,
-        normalizedLeafName: parts.at(-1) ? normalizeIdentifier(parts.at(-1)!.text, parts.at(-1)!.quoted, dialect) : '',
-        kind: 'table',
+        ...parsedTable,
         temporary,
-        columns,
         source: 'local',
-        start: statement.start + entity.position.startIndex,
-        end: statement.start + entity.position.endIndex + 1,
+        start: statement.start + parsedTable.start,
+        end: statement.start + parsedTable.end,
       });
       return [];
     }
 
-    const view = extractViewDefinition(text, entity, dialect, 'local');
+    const view = parsed.views[0];
     if (!view) {
       return reportIssues ? [ddlIssue(
         statement,
-        entity.position.startIndex,
-        entity.position.endIndex + 1,
-        `View ${entity.text} has no query whose output columns can be inferred.`,
+        objectNode.start,
+        objectNode.end,
+        `View ${name} has no query whose output columns can be inferred.`,
         'local-view-without-query',
       )] : [];
     }
@@ -767,14 +686,14 @@ function applyLocalDdl(
       issue,
       statement.start + view.queryStart,
     ));
-    let columns = deriveQueryColumns(view.query, dialect, effective, new Map(), placeholders);
+    let columns = deriveQueryColumns(view.query, dialect, effective, placeholders);
     if (view.explicitColumns.length > 0) {
       if (view.explicitColumns.length !== columns.length) {
         return reportIssues ? [...queryIssues, ddlIssue(
           statement,
-          entity.position.startIndex,
-          entity.position.endIndex + 1,
-          `View ${entity.text} declares ${view.explicitColumns.length} column(s), but its query returns ${columns.length}.`,
+          objectNode.start,
+          objectNode.end,
+          `View ${name} declares ${view.explicitColumns.length} column(s), but its query returns ${columns.length}.`,
           'local-view-column-count',
         )] : [];
       }
@@ -788,47 +707,47 @@ function applyLocalDdl(
         ...queryIssues,
         ...(queryIssues.length === 0 ? [ddlIssue(
           statement,
-          entity.position.startIndex,
-          entity.position.endIndex + 1,
-          `View ${entity.text} has output columns that cannot be inferred.`,
+          objectNode.start,
+          objectNode.end,
+          `View ${name} has output columns that cannot be inferred.`,
           'local-view-unresolved',
         )] : []),
       ] : [];
     }
-    const parts = splitQualifiedName(entity.text);
+    const parts = splitQualifiedName(name);
     prepareReplacement(state, existing.table, localMatch, orReplace, temporary);
     state.local.set(normalizedName, {
-      name: entity.text,
+      name,
       normalizedName,
       normalizedLeafName: parts.at(-1) ? normalizeIdentifier(parts.at(-1)!.text, parts.at(-1)!.quoted, dialect) : '',
       kind: 'view',
       temporary,
       columns,
       source: 'local',
-      start: statement.start + entity.position.startIndex,
-      end: statement.start + entity.position.endIndex + 1,
+      start: statement.start + objectNode.start,
+      end: statement.start + objectNode.end,
     });
     return [];
   }
 
   const dropMatch = /^DROP\s+(?<kind>TABLE|VIEW)\s+(?<ifExists>IF\s+EXISTS\s+)?/iu.exec(body);
-  if (!dropMatch?.groups) return [];
+  if (!dropMatch?.groups || astStatement?.role !== 'drop') return [];
   const kind = dropMatch.groups.kind?.toLocaleLowerCase() as 'table' | 'view';
-  const entities = getSqlEntities(text, dialect, placeholders);
-  const entity = entities.find((candidate) => candidate.entityContextType === kind);
-  if (!entity) return [];
+  const objectNode = astChild(astStatement, 'this');
+  if (!objectNode) return [];
+  const name = astTableName(objectNode);
   const effective = effectiveSchemaSnapshot(base, state);
-  const resolution = resolveSchemaTable(effective, entity.text, dialect);
+  const resolution = resolveSchemaTable(effective, name, dialect);
   const object = resolution.table;
   if (resolution.status !== 'found' || !object || object.kind !== kind) {
     if (dropMatch.groups.ifExists && resolution.status !== 'ambiguous') return [];
     return reportIssues ? [ddlIssue(
       statement,
-      entity.position.startIndex,
-      entity.position.endIndex + 1,
+      objectNode.start,
+      objectNode.end,
       resolution.status === 'ambiguous'
-        ? `Cannot drop ${entity.text}; the object reference is ambiguous.`
-        : `Cannot drop ${kind} ${entity.text}; no matching object exists.`,
+        ? `Cannot drop ${name}; the object reference is ambiguous.`
+        : `Cannot drop ${kind} ${name}; no matching object exists.`,
       resolution.status === 'ambiguous' ? 'ambiguous-drop-object' : 'unknown-drop-object',
     )] : [];
   }
@@ -904,73 +823,14 @@ function buildSqlModel(
   if (ast && ast.statements.length > 0) {
     return buildAstSqlModel(text, dialect, snapshot, placeholders, udfs, validate, ast.statements);
   }
-  const entities = getSqlEntities(text, dialect, placeholders);
-  const tokens = lexSql(text, dialect, placeholders).filter((token) => token.channel === 0);
-  const semanticIr = buildSqlSemanticIr(text, dialect, placeholders, entities);
-  const placeholderRanges = findPlaceholderRanges(text, placeholders);
-  const ctes = extractCtes(text, tokens, dialect, snapshot, placeholders);
-  const scopes = createScopes(entities, text.length);
-  const issues: SqlSemanticIssue[] = [];
-
-  const tableEntities = flattenEntities(entities).filter((entity) => (
-    (entity.entityContextType === 'table' || entity.entityContextType === 'view')
-      && !semanticIr.lateralViews.some((view) => overlapsAny(entityRange(entity), [{
-        start: view.functionStart,
-        end: view.functionEnd,
-      }]))
-  ));
-  for (const entity of tableEntities) {
-    const scope = scopeForStatement(scopes, entity.belongStmt.position.startIndex, entity.belongStmt.position.endIndex + 1, entity.belongStmt.scopeDepth);
-    if (!scope) {
-      continue;
-    }
-    const binding = bindingForEntity(entity, text, dialect, snapshot, ctes, placeholders, placeholderRanges);
-    scope.relations.push(binding);
-    if (validate && binding.unresolved && !binding.dynamic && !isExpressionTable(entity)) {
-      const resolution = resolveSchemaTable(snapshot, entity.text, dialect);
-      issues.push({
-        start: entity.position.startIndex,
-        end: entity.position.endIndex + 1,
-        message: resolution.status === 'ambiguous'
-          ? `Table reference ${entity.text} is ambiguous in the configured schema.`
-          : `Unknown table ${entity.text}.`,
-        code: resolution.status === 'ambiguous' ? 'ambiguous-table' : 'unknown-table',
-      });
-    }
-  }
-
-  for (const entity of flattenEntities(entities)) {
-    if (entity._alias && entity.entityContextType === 'column'
-      && entity.position.endIndex >= entity.position.startIndex) {
-      const scope = smallestContainingScope(scopes, entity.position.startIndex);
-      scope?.projectionAliases.add(normalizeBareIdentifier(entity._alias.text, dialect));
-    }
-  }
-
-  for (const lateralView of semanticIr.lateralViews) {
-    const scope = smallestContainingScope(scopes, lateralView.start);
-    if (scope) {
-      scope.relations.push(bindingForLateralView(lateralView, text, scope.relations, dialect));
-    }
-  }
-
-  const references = [
-    ...semanticIr.references,
-    ...semanticIr.lateralViews.map((view): SemanticReference => ({
-      kind: 'function',
-      text: view.functionName,
-      start: view.functionStart,
-      end: view.functionEnd,
-    })),
-  ].filter((reference) => !overlapsAny(reference, placeholderRanges)).map(referenceFromSemantic);
-  if (validate) {
-    validateReferences(references, scopes, dialect, snapshot, udfs, issues);
-    validateFieldAccesses(semanticIr.fieldAccesses, text, scopes, dialect, issues);
-    validateInsertShapes(text, entities, scopes, dialect, issues);
-    validateUnionShapes(text, dialect, snapshot, placeholders, issues);
-    validateUpdateAssignments(text, entities, scopes, dialect, issues);
-  }
-  return { scopes, references, issues: deduplicateSemanticIssues(issues) };
+  // Syntax has already been checked by the caller. If normalization is not
+  // possible, skip claims that cannot be proven instead of guessing from DT
+  // entity contexts or source-text fragments.
+  return {
+    scopes: [{ start: 0, end: text.length, depth: 0, relations: [], projectionAliases: new Set() }],
+    references: [],
+    issues: [],
+  };
 }
 
 interface AstModelContext {
@@ -988,7 +848,12 @@ interface AstModelContext {
 interface AstColumnResolution {
   readonly status: 'ambiguous' | 'found' | 'missing-column' | 'missing-qualifier' | 'unresolved';
   readonly column?: SchemaColumn;
+  readonly qualifier?: string;
+  readonly missingName?: string;
 }
+
+type AstTypeEnvironment = ReadonlyMap<string, SqlDataType>;
+const EMPTY_AST_TYPE_ENVIRONMENT: AstTypeEnvironment = new Map();
 
 function buildAstSqlModel(
   text: string,
@@ -1011,6 +876,9 @@ function buildAstSqlModel(
       'explode', 'explode_outer', 'posexplode', 'posexplode_outer', 'unnest', 'json_table',
       'jsonb_array_elements', 'jsonb_array_elements_text',
       'count', 'sum', 'avg', 'min', 'max', 'row_number', 'rank', 'dense_rank',
+      'transform', 'filter', 'exists', 'forall', 'aggregate', 'reduce', 'zip_with',
+      'map_filter', 'map_zip_with', 'transform_keys', 'transform_values', 'array_sort',
+      'named_struct', 'struct', 'array', 'map', 'element_at', 'try_element_at',
     ]),
     validate,
     scopes: [],
@@ -1063,7 +931,7 @@ function analyzeAstQuery(
         for (let index = 0; index < leftColumns.length; index += 1) {
           const expected = leftColumns[index]!;
           const actual = rightColumns[index]!;
-          if (!areTypesCompatible(expected.typeFamily, actual.typeFamily)) {
+          if (!areDataTypesCompatible(columnDataType(expected, context.dialect), columnDataType(actual, context.dialect))) {
             appendAstIssue(context, right, 'incompatible-type',
               `UNION column ${index + 1} has incompatible ${actual.typeFamily} and ${expected.typeFamily} types.`);
           }
@@ -1084,6 +952,7 @@ function analyzeAstQuery(
   };
   context.scopes.push(scope);
   const ctes = new Map(inheritedCtes);
+  const localCteNames = new Set<string>();
   const withNode = astChild(query, 'with');
   for (const cte of withNode ? astChildren(withNode, 'expressions') : []) {
     if (cte.role !== 'cte') continue;
@@ -1095,7 +964,13 @@ function analyzeAstQuery(
     }
     const name = cte.alias;
     if (name) {
-      ctes.set(normalizeQualifiedName(name, context.dialect), {
+      const normalizedName = normalizeQualifiedName(name, context.dialect);
+      if (localCteNames.has(normalizedName)) {
+        if (context.validate) appendAstIssue(context, cte, 'duplicate-cte', `Duplicate CTE name ${name}.`);
+        continue;
+      }
+      localCteNames.add(normalizedName);
+      ctes.set(normalizedName, {
         name,
         aliases: [normalizeQualifiedName(name, context.dialect)],
         columns,
@@ -1164,11 +1039,16 @@ function bindAstRelation(
 ): RelationBinding {
   if (relation.role === 'subquery') {
     const query = astChild(relation, 'this');
-    const columns = query ? analyzeAstQuery(query, context, scope, ctes) : [];
+    const columns = query ? analyzeAstQuery(query, context, undefined, ctes) : [];
     return astDerivedBinding(relation, columns, context.dialect);
   }
   if (relation.role === 'lateral') {
     const source = astChild(relation, 'this');
+    if (source?.role === 'subquery') {
+      const query = astChild(source, 'this');
+      const columns = query ? analyzeAstQuery(query, context, scope, ctes) : [];
+      return astDerivedBinding(relation.alias ? relation : source, columns, context.dialect);
+    }
     return bindAstExpansion(source ?? relation, relation, scope, ctes, context);
   }
   if (relation.role === 'unnest' || relation.role === 'function') {
@@ -1217,13 +1097,11 @@ function bindImpalaCollectionRelation(
   context: AstModelContext,
 ): RelationBinding | undefined {
   if (context.dialect !== 'impala') return undefined;
-  const db = astChild(relation, 'db')?.name;
-  const name = astChild(relation, 'this')?.name ?? relation.name;
-  if (!db || !name) return undefined;
-  const source = scope.relations.find((binding) => bindingMatchesQualifier(binding, db, context.dialect));
-  const sourceColumn = source && findColumn(source.columns, name, context.dialect);
-  if (!sourceColumn) return undefined;
-  const dataType = columnDataType(sourceColumn, context.dialect);
+  const path = splitQualifiedName(astTableName(relation)).map((part) => part.text);
+  if (path.length < 2) return undefined;
+  const resolution = resolveAstColumnPath(scope, path, context.dialect);
+  if (resolution.status !== 'found' || !resolution.column) return undefined;
+  const dataType = columnDataType(resolution.column, context.dialect);
   let columns: SchemaColumn[] = [];
   if (dataType.kind === 'array') {
     columns = [virtualColumn('item', dataTypeFamily(dataType.elementType), '', dataType.elementType)];
@@ -1235,7 +1113,7 @@ function bindImpalaCollectionRelation(
   } else {
     return undefined;
   }
-  const alias = relation.alias || name;
+  const alias = relation.alias || path.at(-1) || relation.name;
   return {
     name: alias,
     aliases: [normalizeQualifiedName(alias, context.dialect)],
@@ -1255,7 +1133,8 @@ function bindAstExpansion(
   else collectAstReferences(source, context);
   const functionName = normalizeBareIdentifier(source.name || source.kind, context.dialect).replace(/^!/u, '');
   const inputs = astExpressionArguments(source);
-  const inputType = inputs[0] ? inferAstExpressionType(inputs[0], scope, context) : UNKNOWN_DATA_TYPE;
+  const inputTypes = inputs.map((input) => inferAstExpressionType(input, scope, context));
+  const inputType = inputTypes[0] ?? UNKNOWN_DATA_TYPE;
   let columns: SchemaColumn[] = [];
   if (functionName === 'posexplode' || functionName === 'posexplode_outer') {
     columns.push(virtualColumn('pos', 'number'));
@@ -1267,7 +1146,7 @@ function bindAstExpansion(
         virtualColumn('value', dataTypeFamily(inputType.valueType), '', inputType.valueType),
       );
     }
-  } else if (functionName === 'explode' || functionName === 'explode_outer' || functionName === 'unnest') {
+  } else if (functionName === 'explode' || functionName === 'explode_outer') {
     if (inputType.kind === 'array') {
       columns.push(virtualColumn('col', dataTypeFamily(inputType.elementType), '', inputType.elementType));
     } else if (inputType.kind === 'map') {
@@ -1278,20 +1157,40 @@ function bindAstExpansion(
     } else {
       columns.push(virtualColumn('col'));
     }
+  } else if (functionName === 'unnest') {
+    columns = inputTypes.flatMap((dataType) => {
+      if (dataType.kind === 'array') {
+        return [virtualColumn('col', dataTypeFamily(dataType.elementType), '', dataType.elementType)];
+      }
+      if (dataType.kind === 'map') {
+        return [
+          virtualColumn('key', dataTypeFamily(dataType.keyType), '', dataType.keyType),
+          virtualColumn('value', dataTypeFamily(dataType.valueType), '', dataType.valueType),
+        ];
+      }
+      return [virtualColumn('col')];
+    });
   } else if (source.kind === 'jsonTable') {
     const schema = astChild(source, 'schema');
-    columns = schema ? astChildren(schema, 'expressions').map((column) => {
-      const dataType = astChild(column, 'kind');
-      const type = dataType ? astDataTypeText(dataType) : '';
-      return virtualColumn(column.name, typeFamily(type), type, parseSqlDataType(type, context.dialect));
-    }) : [];
+    columns = schema ? astJsonTableColumns(schema, context.dialect) : [];
   }
 
+  const typedAliasColumns = astTypedAliasColumns(relation, source, context.dialect);
+  if (typedAliasColumns.length > 0) columns = typedAliasColumns;
   const explicit = relation.aliasColumns.length > 0 ? relation.aliasColumns : source.aliasColumns;
   if (explicit.length > 0) {
-    columns = explicit.map((name, index) => renameVirtualColumn(name, columns[index], context.dialect));
+    columns = columns.map((column, index) => (
+      explicit[index] ? renameVirtualColumn(explicit[index]!, column, context.dialect) : column
+    ));
+    if (columns.length === 0) {
+      columns = explicit.map((name) => renameVirtualColumn(name, undefined, context.dialect));
+    }
   } else if (columns.length === 0) {
     columns = [virtualColumn(source.outputName || source.name || 'col')];
+  }
+  const offset = astChild(source, 'offset') ?? astChild(relation, 'offset');
+  if (offset && !findColumn(columns, offset.name || 'ordinality', context.dialect)) {
+    columns.push(virtualColumn(offset.name || 'ordinality', 'number'));
   }
   const alias = relation.alias || source.alias || source.name || source.kind;
   return {
@@ -1300,6 +1199,37 @@ function bindAstExpansion(
     columns,
     unresolved: false,
   };
+}
+
+function astJsonTableColumns(schema: SqlAstNode, dialect: SqlDialect): SchemaColumn[] {
+  return astChildren(schema, 'expressions').flatMap((definition) => {
+    const nested = astChild(definition, 'nestedSchema');
+    if (nested) return astJsonTableColumns(nested, dialect);
+    if (!definition.name) return [];
+    if (definition.args.ordinality === true) return [virtualColumn(definition.name, 'number')];
+    const dataTypeNode = astChild(definition, 'kind');
+    const type = dataTypeNode ? astDataTypeText(dataTypeNode) : '';
+    const dataType = parseSqlDataType(type, dialect);
+    return [virtualColumn(definition.name, dataTypeFamily(dataType), type, dataType)];
+  });
+}
+
+function astTypedAliasColumns(
+  relation: SqlAstNode,
+  source: SqlAstNode,
+  dialect: SqlDialect,
+): SchemaColumn[] {
+  const alias = astChild(relation, 'alias') ?? astChild(source, 'alias');
+  if (!alias) return [];
+  return astChildren(alias, 'columns').flatMap((definition) => {
+    if (definition.kind !== 'columnDef') return [];
+    const identifier = astChild(definition, 'this');
+    const dataTypeNode = astChild(definition, 'kind');
+    if (!identifier?.name || !dataTypeNode) return [];
+    const type = astDataTypeText(dataTypeNode);
+    const dataType = parseSqlDataType(type, dialect);
+    return [virtualColumn(identifier.name, dataTypeFamily(dataType), type, dataType)];
+  });
 }
 
 function validateAstUsing(
@@ -1324,6 +1254,7 @@ function validateAstExpression(
   scope: AstScope,
   ctes: ReadonlyMap<string, RelationBinding>,
   context: AstModelContext,
+  environment: AstTypeEnvironment = EMPTY_AST_TYPE_ENVIRONMENT,
 ): void {
   if (overlapsAny({ start: node.start, end: node.end }, context.placeholderRanges)) return;
   if (node.role === 'select' || node.role === 'set-operation') {
@@ -1335,6 +1266,7 @@ function validateAstExpression(
     validateAstColumn(node, scope, context);
     return;
   }
+  if (node.role === 'identifier' && environment.has(normalizeBareIdentifier(node.name, context.dialect))) return;
   if (node.role === 'function') {
     const name = node.name;
     if (node.kind === 'anonymous' && name) {
@@ -1345,25 +1277,28 @@ function validateAstExpression(
       }
     }
   }
-  if (node.kind === 'dot') validateAstNestedField(node, scope, context);
-  forEachAstChild(node, (child) => validateAstExpression(child, scope, ctes, context));
+  if (validateAstHigherOrderExpression(node, scope, ctes, context, environment)) return;
+  if (node.kind === 'dot') validateAstNestedField(node, scope, context, environment);
+  forEachAstChild(node, (child) => validateAstExpression(child, scope, ctes, context, environment));
 }
 
 function validateAstColumn(node: SqlAstNode, scope: AstScope, context: AstModelContext): void {
-  const name = node.name;
-  const qualifier = astColumnQualifier(node);
+  const parts = astColumnPath(node);
+  const name = parts.at(-1) ?? node.name;
+  const qualifier = parts.length > 1 ? parts.slice(0, -1).join('.') : '';
   if (name === '*' && !qualifier) return;
-  const resolution = resolveAstColumn(scope, qualifier, name, context.dialect);
+  const resolution = resolveAstColumnPath(scope, parts, context.dialect);
   if (resolution.status === 'found' || resolution.status === 'unresolved') return;
   if (resolution.status === 'ambiguous') {
     appendAstIssue(context, node, 'ambiguous-column',
-      `Column ${qualifier ? `${qualifier}.` : ''}${name} is ambiguous; qualify it with a table alias.`);
+      `Column ${parts.join('.')} is ambiguous; qualify it with a table alias.`);
   } else if (resolution.status === 'missing-qualifier') {
     const qualifierNode = astChild(node, 'table') ?? astChild(node, 'db') ?? node;
-    appendAstIssue(context, qualifierNode, 'unknown-qualifier', `Unknown table or alias ${qualifier}.`);
+    appendAstIssue(context, qualifierNode, 'unknown-qualifier',
+      `Unknown table or alias ${resolution.qualifier || qualifier}.`);
   } else if (name !== '*') {
     appendAstIssue(context, node, 'unknown-column',
-      `Unknown column ${qualifier ? `${qualifier}.` : ''}${name}.`);
+      `Unknown column ${resolution.missingName || parts.join('.')}.`);
   }
 }
 
@@ -1373,47 +1308,78 @@ function resolveAstColumn(
   name: string,
   dialect: SqlDialect,
 ): AstColumnResolution {
+  const qualifierParts = qualifier ? splitQualifiedName(qualifier).map((part) => part.text) : [];
+  return resolveAstColumnPath(scope, [...qualifierParts, name], dialect);
+}
+
+function resolveAstColumnPath(
+  scope: AstScope | undefined,
+  parts: readonly string[],
+  dialect: SqlDialect,
+): AstColumnResolution {
+  if (parts.length === 0) return { status: 'missing-column' };
   for (let current = scope; current; current = current.parent) {
-    if (qualifier) {
-      const binding = current.relations.find((candidate) => bindingMatchesQualifier(candidate, qualifier, dialect));
+    for (let prefixLength = parts.length - 1; prefixLength >= 1; prefixLength -= 1) {
+      const qualifier = parts.slice(0, prefixLength).join('.');
+      const binding = current.relations.find((candidate) => bindingMatchesExactQualifier(candidate, qualifier, dialect));
       if (binding) {
         if (binding.unresolved) return { status: 'unresolved' };
-        if (name === '*') return { status: 'found' };
-        const column = findColumn(binding.columns, name, dialect);
-        return column ? { status: 'found', column } : { status: 'missing-column' };
-      }
-      if (name !== '*') {
-        const baseMatches = current.relations.flatMap((candidate) => {
-          const column = candidate.unresolved ? undefined : findColumn(candidate.columns, qualifier, dialect);
-          return column ? [column] : [];
-        });
-        if (baseMatches.length === 1) {
-          const nested = fieldDataType(columnDataType(baseMatches[0]!, dialect), name, dialect);
-          return nested
-            ? { status: 'found', column: virtualColumn(name, dataTypeFamily(nested), '', nested) }
-            : { status: 'missing-column' };
+        const columnName = parts[prefixLength]!;
+        if (columnName === '*') return { status: 'found', qualifier };
+        const column = findColumn(binding.columns, columnName, dialect);
+        if (!column) return { status: 'missing-column', qualifier, missingName: columnName };
+        let dataType = columnDataType(column, dialect);
+        for (const field of parts.slice(prefixLength + 1)) {
+          const nested = fieldDataType(dataType, field, dialect);
+          if (!nested) return { status: 'missing-column', qualifier, missingName: field };
+          dataType = nested;
         }
-        if (baseMatches.length > 1) return { status: 'ambiguous' };
+        const outputName = parts.at(-1) ?? column.name;
+        return parts.length === prefixLength + 1
+          ? { status: 'found', column, qualifier }
+          : { status: 'found', column: virtualColumn(outputName, dataTypeFamily(dataType), '', dataType), qualifier };
       }
-      continue;
     }
-    if (current.projectionAliases.has(normalizeBareIdentifier(name, dialect))) return { status: 'found' };
+
+    const name = parts[0]!;
+    if (parts.length === 1 && current.projectionAliases.has(normalizeBareIdentifier(name, dialect))) {
+      return { status: 'found' };
+    }
     const matches = current.relations.flatMap((binding) => {
       const column = binding.unresolved ? undefined : findColumn(binding.columns, name, dialect);
       return column ? [column] : [];
     });
-    if (matches.length === 1) return { status: 'found', column: matches[0] };
+    if (matches.length === 1) {
+      const column = matches[0]!;
+      let dataType = columnDataType(column, dialect);
+      for (const field of parts.slice(1)) {
+        const nested = fieldDataType(dataType, field, dialect);
+        if (!nested) return { status: 'missing-column', missingName: field };
+        dataType = nested;
+      }
+      const outputName = parts.at(-1) ?? column.name;
+      return parts.length === 1
+        ? { status: 'found', column }
+        : { status: 'found', column: virtualColumn(outputName, dataTypeFamily(dataType), '', dataType) };
+    }
     if (matches.length > 1) return { status: 'ambiguous' };
     if (current.relations.some((binding) => binding.unresolved)) return { status: 'unresolved' };
   }
-  return { status: qualifier ? 'missing-qualifier' : 'missing-column' };
+  return parts.length > 1
+    ? { status: 'missing-qualifier', qualifier: parts.slice(0, -1).join('.') }
+    : { status: 'missing-column', missingName: parts[0] };
 }
 
-function validateAstNestedField(node: SqlAstNode, scope: AstScope, context: AstModelContext): void {
+function validateAstNestedField(
+  node: SqlAstNode,
+  scope: AstScope,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): void {
   const base = astChild(node, 'this');
   const field = astChild(node, 'expression');
   if (!base || !field?.name) return;
-  const dataType = inferAstExpressionType(base, scope, context);
+  const dataType = inferAstExpressionType(base, scope, context, environment);
   if (dataType.kind !== 'unknown' && !fieldDataType(dataType, field.name, context.dialect)) {
     appendAstIssue(context, field, 'unknown-column', `Unknown column ${field.name}.`);
   }
@@ -1435,23 +1401,30 @@ function deriveAstProjectionColumns(
       columns.push(...relations.flatMap((binding) => binding.columns));
       continue;
     }
-    const name = projection.alias || projection.outputName || expression.outputName || expression.name;
-    if (!name) continue;
+    const name = projection.alias || projection.outputName || expression.outputName || expression.name
+      || `_col${columns.length + 1}`;
     const dataType = inferAstExpressionType(expression, scope, context);
     columns.push(renameVirtualColumn(name, virtualColumn(name, dataTypeFamily(dataType), '', dataType), context.dialect));
   }
   return columns;
 }
 
-function inferAstExpressionType(node: SqlAstNode, scope: AstScope | undefined, context: AstModelContext): SqlDataType {
+function inferAstExpressionType(
+  node: SqlAstNode,
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment = EMPTY_AST_TYPE_ENVIRONMENT,
+): SqlDataType {
   if (node.role === 'alias') {
     const inner = astChild(node, 'this');
-    return inner ? inferAstExpressionType(inner, scope, context) : UNKNOWN_DATA_TYPE;
+    return inner ? inferAstExpressionType(inner, scope, context, environment) : UNKNOWN_DATA_TYPE;
+  }
+  if (node.role === 'identifier') {
+    return environment.get(normalizeBareIdentifier(node.name, context.dialect)) ?? UNKNOWN_DATA_TYPE;
   }
   if (node.role === 'column') {
-    return resolveAstColumn(scope, astColumnQualifier(node), node.name, context.dialect).column
-      ? columnDataType(resolveAstColumn(scope, astColumnQualifier(node), node.name, context.dialect).column!, context.dialect)
-      : UNKNOWN_DATA_TYPE;
+    const resolution = resolveAstColumnPath(scope, astColumnPath(node), context.dialect);
+    return resolution.column ? columnDataType(resolution.column, context.dialect) : UNKNOWN_DATA_TYPE;
   }
   if (node.role === 'literal') {
     if (node.args.isString === true) return dataTypeFromFamily('string');
@@ -1465,16 +1438,25 @@ function inferAstExpressionType(node: SqlAstNode, scope: AstScope | undefined, c
   if (node.kind === 'dot') {
     const base = astChild(node, 'this');
     const field = astChild(node, 'expression');
-    const baseType = base ? inferAstExpressionType(base, scope, context) : UNKNOWN_DATA_TYPE;
+    const baseType = base ? inferAstExpressionType(base, scope, context, environment) : UNKNOWN_DATA_TYPE;
     return field?.name ? fieldDataType(baseType, field.name, context.dialect) ?? UNKNOWN_DATA_TYPE : UNKNOWN_DATA_TYPE;
+  }
+  if (node.kind === 'bracket') {
+    const base = astChild(node, 'this');
+    const baseType = base ? inferAstExpressionType(base, scope, context, environment) : UNKNOWN_DATA_TYPE;
+    if (baseType.kind === 'array') return baseType.elementType;
+    if (baseType.kind === 'map') return baseType.valueType;
+    return UNKNOWN_DATA_TYPE;
   }
   const normalizedFunction = normalizeBareIdentifier(node.name || node.kind, context.dialect).replace(/^!/u, '');
   const args = astExpressionArguments(node);
+  const higherOrderType = inferAstHigherOrderType(node, normalizedFunction, scope, context, environment);
+  if (higherOrderType) return higherOrderType;
   if (['count', 'row_number', 'rank', 'dense_rank', 'size', 'cardinality'].includes(normalizedFunction)) {
     return dataTypeFromFamily('number');
   }
   if (['sum', 'avg', 'max', 'min'].includes(normalizedFunction) && args[0]) {
-    return inferAstExpressionType(args[0], scope, context);
+    return inferAstExpressionType(args[0], scope, context, environment);
   }
   if (normalizedFunction === 'from_json' && args[1]?.role === 'literal') {
     return parseSqlDataType(args[1].name, context.dialect);
@@ -1483,7 +1465,7 @@ function inferAstExpressionType(node: SqlAstNode, scope: AstScope | undefined, c
     return {
       kind: 'struct',
       fields: args.map((argument, index) => {
-        const dataType = inferAstExpressionType(argument, scope, context);
+        const dataType = inferAstExpressionType(argument, scope, context, environment);
         const name = argument.outputName || argument.name || `col${index + 1}`;
         return virtualColumn(name, dataTypeFamily(dataType), '', dataType);
       }),
@@ -1495,23 +1477,200 @@ function inferAstExpressionType(node: SqlAstNode, scope: AstScope | undefined, c
       const name = args[index]?.role === 'literal' ? args[index]!.name : '';
       const value = args[index + 1];
       if (!name || !value) return UNKNOWN_DATA_TYPE;
-      const dataType = inferAstExpressionType(value, scope, context);
+      const dataType = inferAstExpressionType(value, scope, context, environment);
       fields.push(virtualColumn(name, dataTypeFamily(dataType), '', dataType));
     }
     return { kind: 'struct', fields };
   }
+  if (['lower', 'upper', 'lcase', 'ucase', 'trim', 'ltrim', 'rtrim', 'concat', 'concat_ws', 'substring', 'substr'].includes(normalizedFunction)) {
+    return dataTypeFromFamily('string');
+  }
   if (normalizedFunction === 'split') return { kind: 'array', elementType: dataTypeFromFamily('string') };
   if (normalizedFunction === 'array') {
-    return { kind: 'array', elementType: args[0] ? inferAstExpressionType(args[0], scope, context) : UNKNOWN_DATA_TYPE };
+    return { kind: 'array', elementType: args[0] ? inferAstExpressionType(args[0], scope, context, environment) : UNKNOWN_DATA_TYPE };
   }
-  const source = context.text.slice(node.start, node.end);
-  const fallback = inferExpressionDataType(source, visibleAstRelations(scope), context.dialect);
-  if (fallback.kind !== 'unknown') return fallback;
+  if (normalizedFunction === 'map') {
+    return {
+      kind: 'map',
+      keyType: args[0] ? inferAstExpressionType(args[0], scope, context, environment) : UNKNOWN_DATA_TYPE,
+      valueType: args[1] ? inferAstExpressionType(args[1], scope, context, environment) : UNKNOWN_DATA_TYPE,
+    };
+  }
+  if (['element_at', 'try_element_at'].includes(normalizedFunction) && args[0]) {
+    const container = inferAstExpressionType(args[0], scope, context, environment);
+    if (container.kind === 'array') return container.elementType;
+    if (container.kind === 'map') return container.valueType;
+  }
+  if (node.kind === 'case') {
+    const candidates = astChildren(node, 'ifs').flatMap((branch) => {
+      const result = astChild(branch, 'true');
+      return result ? [inferAstExpressionType(result, scope, context, environment)] : [];
+    });
+    const fallback = astChild(node, 'default');
+    if (fallback) candidates.push(inferAstExpressionType(fallback, scope, context, environment));
+    return commonAstDataType(candidates);
+  }
+  if (['coalesce', 'ifnull', 'nvl', 'greatest', 'least'].includes(normalizedFunction)) {
+    return commonAstDataType(args.map((argument) => inferAstExpressionType(argument, scope, context, environment)));
+  }
+  if (normalizedFunction === 'if') {
+    return commonAstDataType(args.slice(1).map((argument) => inferAstExpressionType(argument, scope, context, environment)));
+  }
   if (['add', 'sub', 'mul', 'div', 'intDiv', 'mod'].includes(node.kind)) return dataTypeFromFamily('number');
   if (['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'and', 'or', 'not', 'is', 'in', 'between'].includes(node.kind)) {
     return dataTypeFromFamily('boolean');
   }
   return UNKNOWN_DATA_TYPE;
+}
+
+function validateAstHigherOrderExpression(
+  node: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): boolean {
+  const name = normalizeBareIdentifier(node.name || node.kind, context.dialect).replace(/^!/u, '');
+  const invocations = astHigherOrderInvocations(node, name, scope, context, environment);
+  if (!invocations) return false;
+  forEachAstChild(node, (child) => {
+    if (child.kind !== 'lambda') validateAstExpression(child, scope, ctes, context, environment);
+  });
+  for (const invocation of invocations) {
+    const lambdaEnvironment = new Map(environment);
+    const parameters = astChildren(invocation.lambda, 'expressions');
+    parameters.forEach((parameter, index) => {
+      lambdaEnvironment.set(
+        normalizeBareIdentifier(parameter.name, context.dialect),
+        invocation.parameterTypes[index] ?? UNKNOWN_DATA_TYPE,
+      );
+    });
+    const body = astChild(invocation.lambda, 'this');
+    if (body) validateAstExpression(body, scope, ctes, context, lambdaEnvironment);
+  }
+  return true;
+}
+
+interface AstLambdaInvocation {
+  readonly lambda: SqlAstNode;
+  readonly parameterTypes: readonly SqlDataType[];
+}
+
+function astHigherOrderInvocations(
+  node: SqlAstNode,
+  name: string,
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): AstLambdaInvocation[] | undefined {
+  const args = astChildren(node, 'expressions');
+  const dedicatedInput = astChild(node, 'this');
+  const input = dedicatedInput ?? args[0];
+  const inputType = input ? inferAstExpressionType(input, scope, context, environment) : UNKNOWN_DATA_TYPE;
+  const elementType = inputType.kind === 'array' ? inputType.elementType : UNKNOWN_DATA_TYPE;
+  const mapKeyType = inputType.kind === 'map' ? inputType.keyType : UNKNOWN_DATA_TYPE;
+  const mapValueType = inputType.kind === 'map' ? inputType.valueType : UNKNOWN_DATA_TYPE;
+  const dedicatedLambda = astChild(node, 'expression');
+  if (name === 'transform' || name === 'arrayfilter' || name === 'filter') {
+    const lambda = dedicatedLambda ?? args[1];
+    return lambda ? [{ lambda, parameterTypes: [elementType] }] : [];
+  }
+  if (name === 'reduce' || name === 'aggregate') {
+    const initial = astChild(node, 'initial') ?? args[1];
+    const stateType = initial ? inferAstExpressionType(initial, scope, context, environment) : UNKNOWN_DATA_TYPE;
+    const merge = astChild(node, 'merge') ?? args[2];
+    const finish = astChild(node, 'finish') ?? args[3];
+    return [
+      ...(merge ? [{ lambda: merge, parameterTypes: [stateType, elementType] }] : []),
+      ...(finish ? [{ lambda: finish, parameterTypes: [stateType] }] : []),
+    ];
+  }
+  if (name === 'zip_with') {
+    const rightType = args[1] ? inferAstExpressionType(args[1], scope, context, environment) : UNKNOWN_DATA_TYPE;
+    const lambda = args[2];
+    return lambda ? [{ lambda, parameterTypes: [elementType, rightType.kind === 'array' ? rightType.elementType : UNKNOWN_DATA_TYPE] }] : [];
+  }
+  if (name === 'map_zip_with') {
+    const rightType = args[1] ? inferAstExpressionType(args[1], scope, context, environment) : UNKNOWN_DATA_TYPE;
+    const lambda = args[2];
+    return lambda ? [{
+      lambda,
+      parameterTypes: [
+        mapKeyType,
+        mapValueType,
+        rightType.kind === 'map' ? rightType.valueType : UNKNOWN_DATA_TYPE,
+      ],
+    }] : [];
+  }
+  if (['transform_keys', 'transform_values', 'map_filter'].includes(name)) {
+    const lambda = args[1];
+    return lambda ? [{ lambda, parameterTypes: [mapKeyType, mapValueType] }] : [];
+  }
+  if (name === 'exists' || name === 'forall') {
+    const lambda = args[1];
+    return lambda ? [{ lambda, parameterTypes: [elementType] }] : [];
+  }
+  if (name === 'array_sort' && args[1]) {
+    return [{ lambda: args[1], parameterTypes: [elementType, elementType] }];
+  }
+  return undefined;
+}
+
+function inferAstHigherOrderType(
+  node: SqlAstNode,
+  name: string,
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): SqlDataType | undefined {
+  const invocations = astHigherOrderInvocations(node, name, scope, context, environment);
+  if (!invocations) return undefined;
+  const args = astChildren(node, 'expressions');
+  const input = astChild(node, 'this') ?? args[0];
+  const inputType = input ? inferAstExpressionType(input, scope, context, environment) : UNKNOWN_DATA_TYPE;
+  const inferLambda = (invocation: AstLambdaInvocation): SqlDataType => {
+    const lambdaEnvironment = new Map(environment);
+    astChildren(invocation.lambda, 'expressions').forEach((parameter, index) => {
+      lambdaEnvironment.set(normalizeBareIdentifier(parameter.name, context.dialect), invocation.parameterTypes[index] ?? UNKNOWN_DATA_TYPE);
+    });
+    const body = astChild(invocation.lambda, 'this');
+    return body ? inferAstExpressionType(body, scope, context, lambdaEnvironment) : UNKNOWN_DATA_TYPE;
+  };
+  if (name === 'transform' || name === 'zip_with') {
+    return { kind: 'array', elementType: invocations[0] ? inferLambda(invocations[0]) : UNKNOWN_DATA_TYPE };
+  }
+  if (name === 'arrayfilter' || name === 'filter' || name === 'array_sort') return inputType;
+  if (name === 'exists' || name === 'forall') return dataTypeFromFamily('boolean');
+  if (name === 'reduce' || name === 'aggregate') {
+    const finish = invocations[1];
+    if (finish) return inferLambda(finish);
+    const initial = astChild(node, 'initial') ?? args[1];
+    return initial ? inferAstExpressionType(initial, scope, context, environment) : UNKNOWN_DATA_TYPE;
+  }
+  if (name === 'map_filter') return inputType;
+  if (name === 'map_zip_with') {
+    return inputType.kind === 'map'
+      ? { kind: 'map', keyType: inputType.keyType, valueType: invocations[0] ? inferLambda(invocations[0]) : UNKNOWN_DATA_TYPE }
+      : UNKNOWN_DATA_TYPE;
+  }
+  if (name === 'transform_keys') {
+    return inputType.kind === 'map'
+      ? { kind: 'map', keyType: invocations[0] ? inferLambda(invocations[0]) : UNKNOWN_DATA_TYPE, valueType: inputType.valueType }
+      : UNKNOWN_DATA_TYPE;
+  }
+  if (name === 'transform_values') {
+    return inputType.kind === 'map'
+      ? { kind: 'map', keyType: inputType.keyType, valueType: invocations[0] ? inferLambda(invocations[0]) : UNKNOWN_DATA_TYPE }
+      : UNKNOWN_DATA_TYPE;
+  }
+  return UNKNOWN_DATA_TYPE;
+}
+
+function commonAstDataType(types: readonly SqlDataType[]): SqlDataType {
+  const known = types.filter((type) => type.kind !== 'unknown');
+  if (known.length === 0) return UNKNOWN_DATA_TYPE;
+  const first = known[0]!;
+  return known.every((type) => areDataTypesCompatible(first, type)) ? first : UNKNOWN_DATA_TYPE;
 }
 
 function analyzeAstInsert(
@@ -1552,7 +1711,7 @@ function analyzeAstInsert(
   for (let index = 0; index < Math.min(targetColumns.length, sourceColumns.length); index += 1) {
     const expected = targetColumns[index]!;
     const actual = sourceColumns[index]!;
-    if (!areTypesCompatible(expected.typeFamily, actual.typeFamily)) {
+    if (!areDataTypesCompatible(columnDataType(expected, context.dialect), columnDataType(actual, context.dialect))) {
       appendAstIssue(context, source ?? insert, 'incompatible-type',
         `Cannot assign ${actual.typeFamily} value to ${expected.name} (${expected.type || expected.typeFamily}).`);
     }
@@ -1587,7 +1746,7 @@ function analyzeAstUpdate(
         ? resolveAstColumn(scope, astColumnQualifier(target), target.name, context.dialect).column
         : undefined;
       const actualType = inferAstExpressionType(value, scope, context);
-      if (expected && !areTypesCompatible(expected.typeFamily, dataTypeFamily(actualType))) {
+      if (expected && !areDataTypesCompatible(columnDataType(expected, context.dialect), actualType)) {
         appendAstIssue(context, value, 'incompatible-type',
           `Cannot assign ${dataTypeFamily(actualType)} value to ${expected.name} (${expected.type || expected.typeFamily}).`);
       }
@@ -1633,11 +1792,11 @@ function astExpressionArguments(node: SqlAstNode): readonly SqlAstNode[] {
 }
 
 function astIdentifierReference(node: SqlAstNode): IdentifierReference {
-  const qualifier = astColumnQualifier(node);
-  const text = qualifier ? `${qualifier}.${node.name}` : node.name;
+  const parts = astColumnPath(node);
+  const text = parts.join('.');
   return {
     text,
-    parts: qualifier ? [...splitQualifiedName(qualifier).map((part) => part.text), node.name] : [node.name],
+    parts,
     start: node.start,
     end: node.end,
     isFunction: false,
@@ -1645,10 +1804,15 @@ function astIdentifierReference(node: SqlAstNode): IdentifierReference {
 }
 
 function astColumnQualifier(node: SqlAstNode): string {
-  return ['catalog', 'db', 'table'].flatMap((key) => {
+  return astColumnPath(node).slice(0, -1).join('.');
+}
+
+function astColumnPath(node: SqlAstNode): string[] {
+  const parts = ['catalog', 'db', 'table', 'this'].flatMap((key) => {
     const part = astChild(node, key);
     return part?.name ? [part.name] : [];
-  }).join('.');
+  });
+  return parts.length > 0 ? parts : (node.name ? [node.name] : []);
 }
 
 function astTableName(node: SqlAstNode): string {
@@ -1696,6 +1860,11 @@ function astNameSpan(node: SqlAstNode): { start: number; end: number } {
 }
 
 function astDataTypeText(node: SqlAstNode): string {
+  if (node.kind === 'columnDef') {
+    const identifier = astChild(node, 'this');
+    const dataType = astChild(node, 'kind');
+    return identifier?.name && dataType ? `${identifier.name}:${astDataTypeText(dataType)}` : '';
+  }
   const nested = astChildren(node, 'expressions');
   const base = node.name || astPrimitiveString(node.args.this);
   if (nested.length === 0) return base;
@@ -1722,12 +1891,6 @@ function renameVirtualColumn(name: string, source: SchemaColumn | undefined, dia
   };
 }
 
-function visibleAstRelations(scope: AstScope | undefined): RelationBinding[] {
-  const result: RelationBinding[] = [];
-  for (let current = scope; current; current = current.parent) result.push(...current.relations);
-  return result;
-}
-
 function appendAstIssue(
   context: AstModelContext,
   node: SqlAstNode | undefined,
@@ -1745,295 +1908,14 @@ function appendAstIssue(
   });
 }
 
-function createScopes(entities: readonly EntityContext[], textLength: number): MutableScope[] {
-  const scopes = new Map<string, MutableScope>();
-  for (const entity of flattenEntities(entities)) {
-    const statement = entity.belongStmt;
-    const start = Math.max(0, statement.position.startIndex);
-    const end = Math.min(textLength, statement.position.endIndex + 1);
-    const key = `${start}:${end}:${statement.scopeDepth}`;
-    if (!scopes.has(key)) {
-      scopes.set(key, {
-        start,
-        end,
-        depth: statement.scopeDepth,
-        relations: [],
-        projectionAliases: new Set<string>(),
-      });
-    }
-  }
-  if (scopes.size === 0) {
-    scopes.set(`0:${textLength}:0`, {
-      start: 0,
-      end: textLength,
-      depth: 0,
-      relations: [],
-      projectionAliases: new Set<string>(),
-    });
-  }
-  return [...scopes.values()];
-}
-
-function bindingForEntity(
-  entity: EntityContext,
-  text: string,
-  dialect: SqlDialect,
-  snapshot: SchemaSnapshot,
-  ctes: ReadonlyMap<string, CteDefinition>,
-  placeholders: readonly RegExp[],
-  placeholderRanges: readonly { start: number; end: number }[],
-): RelationBinding {
-  const dynamic = overlapsAny(entityRange(entity), placeholderRanges);
-  const originalName = text.slice(entity.position.startIndex, entity.position.endIndex + 1);
-  const alias = entity._alias?.text;
-  const aliases = [alias, dynamic ? undefined : entity.text, dynamic ? undefined : splitQualifiedName(entity.text).at(-1)?.text]
-    .filter((value): value is string => Boolean(value))
-    .map((value) => normalizeQualifiedName(value, dialect));
-  if (dynamic) {
-    return {
-      name: alias ?? originalName,
-      aliases,
-      columns: [],
-      unresolved: true,
-      dynamic: true,
-    };
-  }
-  if (isExpressionTable(entity)) {
-    return {
-      name: alias ?? entity.text,
-      aliases,
-      columns: columnsFromRelatedEntities(entity.relatedEntities ?? [], dialect, snapshot, ctes, placeholders),
-      unresolved: false,
-    };
-  }
-  const cte = ctes.get(normalizeQualifiedName(entity.text, dialect));
-  if (cte) {
-    return { name: alias ?? cte.name, aliases, columns: cte.columns, unresolved: false };
-  }
-  const resolution = resolveSchemaTable(snapshot, entity.text, dialect);
-  return {
-    name: alias ?? entity.text,
-    aliases,
-    columns: resolution.table?.columns ?? [],
-    unresolved: resolution.status !== 'found',
-  };
-}
-
-function bindingForLateralView(
-  view: SemanticLateralView,
-  text: string,
-  sourceBindings: readonly RelationBinding[],
-  dialect: SqlDialect,
-): RelationBinding {
-  const input = inferExpressionDataType(
-    text.slice(view.argumentStart, view.argumentEnd),
-    sourceBindings,
-    dialect,
-  );
-  const functionName = normalizeBareIdentifier(view.functionName, dialect).replace(/^!/u, '');
-  const outputTypes: SqlDataType[] = [];
-  const defaultNames: string[] = [];
-  if (functionName === 'posexplode' || functionName === 'posexplode_outer') {
-    outputTypes.push(dataTypeFromFamily('number'));
-    defaultNames.push('pos');
-    if (input.kind === 'array') {
-      outputTypes.push(input.elementType);
-      defaultNames.push('col');
-    } else if (input.kind === 'map') {
-      outputTypes.push(input.keyType, input.valueType);
-      defaultNames.push('key', 'value');
-    }
-  } else if (functionName === 'explode' || functionName === 'explode_outer') {
-    if (input.kind === 'array') {
-      outputTypes.push(input.elementType);
-      defaultNames.push('col');
-    } else if (input.kind === 'map') {
-      outputTypes.push(input.keyType, input.valueType);
-      defaultNames.push('key', 'value');
-    }
-  }
-  const count = Math.max(outputTypes.length, view.outputAliases.length, defaultNames.length);
-  const columns = Array.from({ length: count }, (_, index) => {
-    const name = view.outputAliases[index] ?? defaultNames[index] ?? `col${index + 1}`;
-    const dataType = outputTypes[index] ?? UNKNOWN_DATA_TYPE;
-    return virtualColumn(name, dataTypeFamily(dataType), '', dataType);
-  });
-  const name = view.tableAlias || view.functionName;
-  return {
-    name,
-    aliases: view.tableAlias ? [normalizeQualifiedName(view.tableAlias, dialect)] : [],
-    columns,
-    unresolved: false,
-  };
-}
-
-function referenceFromSemantic(reference: SemanticReference): IdentifierReference {
-  return {
-    text: reference.text,
-    parts: splitQualifiedName(reference.text).map((part) => (
-      part.quoted ? quoteIdentifierPart(part.text) : part.text
-    )),
-    start: reference.start,
-    end: reference.end,
-    isFunction: reference.kind === 'function',
-  };
-}
-
-function quoteIdentifierPart(value: string): string {
-  return `\`${value.replace(/`/gu, '``')}\``;
-}
-
-function columnsFromRelatedEntities(
-  entities: readonly EntityContext[],
-  dialect: SqlDialect,
-  snapshot: SchemaSnapshot,
-  ctes: ReadonlyMap<string, CteDefinition>,
-  placeholders: readonly RegExp[],
-): SchemaColumn[] {
-  const queryResult = flattenEntities(entities).find((entity) => entity.entityContextType === 'queryResult');
-  if (!queryResult || !isCommonEntity(queryResult)) {
-    return [];
-  }
-  return columnsFromQueryResult(queryResult, dialect, snapshot, ctes, placeholders);
-}
-
-function columnsFromQueryResult(
-  queryResult: CommonEntityContext,
-  dialect: SqlDialect,
-  snapshot: SchemaSnapshot,
-  ctes: ReadonlyMap<string, CteDefinition>,
-  placeholders: readonly RegExp[],
-): SchemaColumn[] {
-  const sourceBindings = (queryResult.relatedEntities ?? [])
-    .filter((entity) => entity.entityContextType === 'table')
-    .map((entity) => bindingForEntity(
-      entity,
-      entity.belongStmt.text,
-      dialect,
-      snapshot,
-      ctes,
-      placeholders,
-      [],
-    ));
-  const result: SchemaColumn[] = [];
-  for (const column of queryResult.columns ?? []) {
-    const alias = column._alias?.text;
-    const raw = column.text.trim();
-    if (column.declareType === 1 || raw === '*' || raw.endsWith('.*')) {
-      const qualifier = raw === '*' ? undefined : raw.slice(0, -2);
-      const sources = qualifier
-        ? sourceBindings.filter((binding) => bindingMatchesQualifier(binding, qualifier, dialect))
-        : sourceBindings;
-      result.push(...sources.flatMap((binding) => binding.columns));
-      continue;
-    }
-    if (alias) {
-      const dataType = inferExpressionDataType(raw, sourceBindings, dialect);
-      result.push(virtualColumn(alias, dataTypeFamily(dataType), '', dataType));
-      continue;
-    }
-    if (!/[()+*/%<>=]/u.test(raw)) {
-      const name = splitQualifiedName(raw).at(-1)?.text ?? raw;
-      const sourceColumn = resolveColumnFromBindings(sourceBindings, raw, dialect);
-      result.push(sourceColumn ?? virtualColumn(unquoteIdentifier(name)));
-    } else {
-      const fieldAccess = trailingFieldAccess(raw);
-      if (fieldAccess) {
-        const dataType = inferExpressionDataType(raw, sourceBindings, dialect);
-        result.push(virtualColumn(unquoteIdentifier(fieldAccess.field), dataTypeFamily(dataType), '', dataType));
-      }
-    }
-  }
-  return deduplicateColumns(result);
-}
-
-function extractCtes(
-  text: string,
-  tokens: readonly SqlLexToken[],
-  dialect: SqlDialect,
-  snapshot: SchemaSnapshot,
-  placeholders: readonly RegExp[],
-): Map<string, CteDefinition> {
-  const result = new Map<string, CteDefinition>();
-  for (let index = 0; index < tokens.length; index += 1) {
-    if (tokenUpper(tokens[index]) !== 'WITH') {
-      continue;
-    }
-    let cursor = index + 1;
-    if (tokenUpper(tokens[cursor]) === 'RECURSIVE') {
-      cursor += 1;
-    }
-    while (cursor < tokens.length) {
-      const nameToken = tokens[cursor];
-      if (!nameToken || !isIdentifierToken(nameToken, dialect)) {
-        break;
-      }
-      const name = unquoteIdentifier(nameToken.text);
-      cursor += 1;
-      let explicitColumns: string[] = [];
-      if (tokens[cursor]?.text === '(') {
-        const close = findMatchingToken(tokens, cursor, '(', ')');
-        if (close < 0 || tokenUpper(tokens[close + 1]) !== 'AS') {
-          break;
-        }
-        explicitColumns = tokens.slice(cursor + 1, close)
-          .filter((token) => isIdentifierToken(token, dialect))
-          .map((token) => unquoteIdentifier(token.text));
-        cursor = close + 1;
-      }
-      if (tokenUpper(tokens[cursor]) !== 'AS' || tokens[cursor + 1]?.text !== '(') {
-        break;
-      }
-      const open = cursor + 1;
-      const close = findMatchingToken(tokens, open, '(', ')');
-      if (close < 0) {
-        break;
-      }
-      const queryStart = tokens[open]!.end;
-      const queryEnd = tokens[close]!.start;
-      const queryText = text.slice(queryStart, queryEnd);
-      let columns = deriveQueryColumns(queryText, dialect, snapshot, result, placeholders);
-      if (explicitColumns.length > 0) {
-        columns = explicitColumns.map((columnName, columnIndex) => {
-          const inferred = columns[columnIndex];
-          return virtualColumn(columnName, inferred?.typeFamily ?? 'unknown', inferred?.type ?? '');
-        });
-      }
-      const definition: CteDefinition = {
-        name,
-        normalizedName: normalizeQualifiedName(name, dialect),
-        columns,
-        declarationStart: nameToken.start,
-        declarationEnd: nameToken.end,
-      };
-      result.set(definition.normalizedName, definition);
-      cursor = close + 1;
-      if (tokens[cursor]?.text !== ',') {
-        break;
-      }
-      cursor += 1;
-    }
-  }
-  return result;
-}
-
 function deriveQueryColumns(
   text: string,
   dialect: SqlDialect,
   snapshot: SchemaSnapshot,
-  ctes: ReadonlyMap<string, CteDefinition>,
   placeholders: readonly RegExp[],
 ): SchemaColumn[] {
-  const ast = parseSqlAst(text, dialect, placeholders);
-  if (ast?.statements[0]) {
-    return deriveAstStatementColumns(text, dialect, snapshot, placeholders, ast.statements[0]);
-  }
-  const entities = getSqlEntities(text, dialect, placeholders);
-  const results = flattenEntities(entities)
-    .filter((entity): entity is CommonEntityContext => entity.entityContextType === 'queryResult' && isCommonEntity(entity))
-    .sort((left, right) => left.belongStmt.scopeDepth - right.belongStmt.scopeDepth);
-  const result = results[0];
-  return result ? columnsFromQueryResult(result, dialect, snapshot, ctes, placeholders) : [];
+  const statement = parseSqlAst(text, dialect, placeholders)?.statements[0];
+  return statement ? deriveAstStatementColumns(text, dialect, snapshot, placeholders, statement) : [];
 }
 
 function deriveAstStatementColumns(
@@ -2057,364 +1939,33 @@ function deriveAstStatementColumns(
   return analyzeAstStatement(statement, context, new Map());
 }
 
-function validateReferences(
-  references: readonly IdentifierReference[],
-  scopes: readonly MutableScope[],
-  dialect: SqlDialect,
-  snapshot: SchemaSnapshot,
-  udfs: readonly string[],
-  issues: SqlSemanticIssue[],
-): void {
-  const catalog = getSqlCatalog(dialect);
-  const functions = new Set([
-    ...catalog.functions.map((name) => normalizeQualifiedName(name, dialect)),
-    ...udfs.map((name) => normalizeQualifiedName(name, dialect)),
-  ]);
-  for (const reference of references) {
-    if (reference.isFunction) {
-      if (!functions.has(normalizeQualifiedName(reference.text, dialect))) {
-        issues.push({
-          start: reference.start,
-          end: reference.end,
-          message: `Unknown function ${reference.text}. Add it to aiopsSqlJson.udfs if it is user-defined.`,
-          code: 'unknown-function',
-          severity: 'warning',
-        });
-      }
-      continue;
-    }
-
-    const availableScopes = containingScopes(scopes, reference.start);
-    if (availableScopes.length === 0) {
-      continue;
-    }
-    if (reference.parts.length > 1) {
-      const resolution = resolveMultipartReference(reference.parts, availableScopes, dialect);
-      if (resolution === 'missing-qualifier') {
-        const qualifier = reference.parts.slice(0, -1).join('.');
-        const columnName = reference.parts.at(-1)!;
-        issues.push({
-          start: reference.start,
-          end: reference.end - columnName.length - 1,
-          message: `Unknown table or alias ${qualifier}.`,
-          code: 'unknown-qualifier',
-        });
-      } else if (resolution === 'missing-column') {
-        issues.push({
-          start: reference.start,
-          end: reference.end,
-          message: `Unknown column ${reference.text}.`,
-          code: 'unknown-column',
-        });
-      }
-      continue;
-    }
-
-    const name = reference.parts[0]!;
-    const normalized = normalizeBareIdentifier(name, dialect);
-    if (availableScopes.some((scope) => scope.projectionAliases.has(normalized))) {
-      continue;
-    }
-    let bindings: RelationBinding[] = [];
-    let unresolved = false;
-    for (const scope of availableScopes) {
-      bindings = scope.relations.filter((binding) => !binding.unresolved && Boolean(findColumn(binding.columns, name, dialect)));
-      unresolved = scope.relations.some((binding) => binding.unresolved);
-      if (bindings.length > 0 || unresolved) break;
-    }
-    if (bindings.length === 0 && !unresolved && snapshot.tables.length >= 0) {
-      issues.push({
-        start: reference.start,
-        end: reference.end,
-        message: `Unknown column ${reference.text}.`,
-        code: 'unknown-column',
-      });
-    } else if (bindings.length > 1) {
-      issues.push({
-        start: reference.start,
-        end: reference.end,
-        message: `Column ${reference.text} is ambiguous; qualify it with a table alias.`,
-        code: 'ambiguous-column',
-      });
-    }
-  }
-}
-
-function resolveMultipartReference(
-  parts: readonly string[],
-  scopes: readonly MutableScope[],
-  dialect: SqlDialect,
-): 'found' | 'unresolved' | 'missing-column' | 'missing-qualifier' {
-  for (const scope of scopes) {
-    for (let split = parts.length - 1; split >= 1; split -= 1) {
-      const qualifier = parts.slice(0, split).join('.');
-      const binding = scope.relations.find((candidate) => bindingMatchesQualifier(candidate, qualifier, dialect));
-      if (!binding) continue;
-      if (binding.unresolved) return 'unresolved';
-      const column = findColumn(binding.columns, parts[split]!, dialect);
-      if (!column) return 'missing-column';
-      return resolveNestedFields(columnDataType(column, dialect), parts.slice(split + 1), dialect)
-        ? 'found'
-        : 'missing-column';
-    }
-
-    const baseMatches = scope.relations.flatMap((binding) => {
-      if (binding.unresolved) return [];
-      const column = findColumn(binding.columns, parts[0]!, dialect);
-      return column ? [column] : [];
-    });
-    if (baseMatches.length === 1) {
-      return resolveNestedFields(columnDataType(baseMatches[0]!, dialect), parts.slice(1), dialect)
-        ? 'found'
-        : 'missing-column';
-    }
-    if (baseMatches.length > 1) return 'missing-column';
-    if (scope.relations.some((binding) => binding.unresolved)) return 'unresolved';
-  }
-  return 'missing-qualifier';
-}
-
-function validateFieldAccesses(
-  accesses: readonly SemanticFieldAccess[],
-  text: string,
-  scopes: readonly MutableScope[],
-  dialect: SqlDialect,
-  issues: SqlSemanticIssue[],
-): void {
-  for (const access of accesses) {
-    const scope = smallestContainingScope(scopes, access.start);
-    const dataType = inferExpressionDataType(
-      text.slice(access.baseStart, access.baseEnd),
-      scope?.relations ?? [],
-      dialect,
-    );
-    if (dataType.kind === 'struct' && !findColumn(dataType.fields, access.field, dialect)) {
-      issues.push({
-        start: access.fieldStart,
-        end: access.fieldEnd,
-        message: `Unknown column ${text.slice(access.start, access.end)}.`,
-        code: 'unknown-column',
-      });
-    }
-  }
-}
-
-function validateInsertShapes(
-  text: string,
-  entities: readonly EntityContext[],
-  scopes: readonly MutableScope[],
-  dialect: SqlDialect,
-  issues: SqlSemanticIssue[],
-): void {
-  const flat = flattenEntities(entities);
-  const targets = flat.filter((entity) => (
-    entity.entityContextType === 'table'
-      && entity.belongStmt.stmtContextType === 'insertStmt'
-  ));
-  for (const target of targets) {
-    const scope = smallestContainingScope(scopes, target.position.startIndex);
-    const targetBinding = scope?.relations.find((binding) => bindingMatchesQualifier(binding, target.text, dialect));
-    if (!targetBinding || targetBinding.unresolved) {
-      continue;
-    }
-    const statementText = text.slice(target.belongStmt.position.startIndex, target.belongStmt.position.endIndex + 1);
-    const selectEntities = flat.filter((entity): entity is CommonEntityContext => (
-      entity.entityContextType === 'queryResult'
-        && isCommonEntity(entity)
-        && entity.belongStmt.rootStmt?.position.startIndex === target.belongStmt.position.startIndex
-    ));
-    const projection = selectEntities.at(-1)?.columns ?? [];
-    if (projection.length === 0) {
-      continue;
-    }
-    const insertShape = extractInsertShape(statementText, dialect);
-    const targetSchemaColumns = insertShape.targetColumns.length > 0
-      ? insertShape.targetColumns.flatMap((name) => {
-          const column = targetBinding.columns.find((candidate) => candidate.normalizedName === name);
-          return column ? [column] : [];
-        })
-      : targetBinding.columns.filter((column) => !insertShape.staticPartitionColumns.includes(column.normalizedName));
-    const expectedCount = insertShape.targetColumns.length > 0
-      ? insertShape.targetColumns.length
-      : targetSchemaColumns.length;
-    if (expectedCount !== projection.length) {
-      issues.push({
-        start: target.position.startIndex,
-        end: target.position.endIndex + 1,
-        message: `INSERT writes ${projection.length} value(s) into ${expectedCount} target column(s).`,
-        code: 'insert-column-count',
-      });
-    }
-    for (let index = 0; index < Math.min(targetSchemaColumns.length, projection.length); index += 1) {
-      const targetColumn = targetSchemaColumns[index]!;
-      const sourceColumn = projection[index]!;
-      const sourceScope = smallestContainingScope(scopes, sourceColumn.position.startIndex);
-      const sourceFamily = inferExpressionType(sourceColumn.text, sourceScope?.relations ?? [], dialect);
-      if (!areTypesCompatible(targetColumn.typeFamily, sourceFamily)) {
-        issues.push({
-          start: sourceColumn.position.startIndex,
-          end: sourceColumn.position.endIndex + 1,
-          message: `Cannot assign ${sourceFamily} value to ${targetColumn.name} (${targetColumn.type || targetColumn.typeFamily}).`,
-          code: 'incompatible-type',
-        });
-      }
-    }
-  }
-}
-
-function validateUnionShapes(
-  text: string,
-  dialect: SqlDialect,
-  snapshot: SchemaSnapshot,
-  placeholders: readonly RegExp[],
-  issues: SqlSemanticIssue[],
-): void {
-  const tokens = lexSql(text, dialect, placeholders).filter((token) => token.channel === 0);
-  let depth = 0;
-  const branches: Array<{ start: number; end: number }> = [];
-  let branchStart = 0;
-  for (const token of tokens) {
-    if (token.text === '(') depth += 1;
-    if (token.text === ')') depth = Math.max(0, depth - 1);
-    if (depth === 0 && tokenUpper(token) === 'UNION') {
-      branches.push({ start: branchStart, end: token.start });
-      branchStart = token.end;
-    }
-  }
-  if (branches.length === 0) {
-    return;
-  }
-  branches.push({ start: branchStart, end: text.length });
-  const outputs = branches.map((branch, index) => deriveQueryColumns(
-    normalizeUnionBranch(text.slice(branch.start, branch.end), index),
-    dialect,
-    snapshot,
-    new Map(),
-    placeholders,
-  ));
-  const counts = outputs.map((columns) => columns.length);
-  const expected = counts[0];
-  for (let index = 1; index < counts.length; index += 1) {
-    if (counts[index] !== expected) {
-      const branch = branches[index]!;
-      issues.push({
-        start: branch.start,
-        end: Math.min(branch.start + 6, branch.end),
-        message: `UNION branch returns ${counts[index]} column(s); expected ${expected}.`,
-        code: 'union-column-count',
-      });
-      continue;
-    }
-    for (let columnIndex = 0; columnIndex < (expected ?? 0); columnIndex += 1) {
-      const expectedColumn = outputs[0]?.[columnIndex];
-      const actualColumn = outputs[index]?.[columnIndex];
-      if (expectedColumn && actualColumn && !areTypesCompatible(expectedColumn.typeFamily, actualColumn.typeFamily)) {
-        const branch = branches[index]!;
-        issues.push({
-          start: branch.start,
-          end: Math.min(branch.start + 6, branch.end),
-          message: `UNION column ${columnIndex + 1} has incompatible ${actualColumn.typeFamily} and ${expectedColumn.typeFamily} types.`,
-          code: 'incompatible-type',
-        });
-      }
-    }
-  }
-}
-
-function validateUpdateAssignments(
-  text: string,
-  entities: readonly EntityContext[],
-  scopes: readonly MutableScope[],
-  dialect: SqlDialect,
-  issues: SqlSemanticIssue[],
-): void {
-  const updateTable = flattenEntities(entities).find((entity) => (
-    entity.entityContextType === 'table'
-      && entity.belongStmt.stmtContextType === 'commonStmt'
-      && /^\s*UPDATE\b/iu.test(text.slice(entity.belongStmt.position.startIndex, entity.belongStmt.position.endIndex + 1))
-  ));
-  if (!updateTable) return;
-  const scope = smallestContainingScope(scopes, updateTable.position.startIndex);
-  const binding = scope?.relations.find((candidate) => bindingMatchesQualifier(candidate, updateTable.text, dialect));
-  if (!binding || binding.unresolved) return;
-  const assignmentPattern = /(?:\bSET\b|,)\s*(?<column>(?:`[^`]+`|"[^"]+"|\[[^\]]+\]|[\w$]+))\s*=\s*(?<value>'(?:[^']|'')*'|[-+]?\d+(?:\.\d+)?|TRUE|FALSE)/giu;
-  for (const match of text.matchAll(assignmentPattern)) {
-    const columnName = match.groups?.column;
-    const value = match.groups?.value;
-    if (!columnName || !value || match.index === undefined) continue;
-    const column = findColumn(binding.columns, columnName, dialect);
-    if (!column) continue;
-    const sourceFamily = inferExpressionType(value, [], dialect);
-    if (!areTypesCompatible(column.typeFamily, sourceFamily)) {
-      const valueOffset = match.index + match[0].lastIndexOf(value);
-      issues.push({
-        start: valueOffset,
-        end: valueOffset + value.length,
-        message: `Cannot assign ${sourceFamily} value to ${column.name} (${column.type || column.typeFamily}).`,
-        code: 'incompatible-type',
-      });
-    }
-  }
-}
-
-function normalizeUnionBranch(branch: string, index: number): string {
-  return index === 0 ? branch : branch.replace(/^\s*(?:ALL|DISTINCT)\b/iu, '');
-}
-
 function areTypesCompatible(target: SqlTypeFamily, source: SqlTypeFamily): boolean {
   if (target === 'unknown' || source === 'unknown' || target === source) return true;
   return (target === 'date' && source === 'time') || (target === 'time' && source === 'date');
 }
 
-function extractViewDefinition(
-  text: string,
-  entity: EntityContext,
-  dialect: SqlDialect,
-  source: string,
-): SchemaViewDefinition | undefined {
-  const statementStart = entity.belongStmt.position.startIndex;
-  const statementEnd = entity.belongStmt.position.endIndex + 1;
-  const tokens = lexSql(text, dialect).filter((token) => (
-    token.channel === 0 && token.start >= statementStart && token.end <= statementEnd
-  ));
-  const asIndex = tokens.findIndex((token) => (
-    token.start > entity.position.endIndex && tokenUpper(token) === 'AS'
-  ));
-  const queryStart = tokens[asIndex + 1]?.start;
-  const queryEnd = statementEnd;
-  if (asIndex < 0 || queryStart === undefined) return undefined;
-  if (queryEnd <= queryStart) return undefined;
-  const name = entity.text.trim();
-  const parts = splitQualifiedName(name);
-  let explicitColumns = isCommonEntity(entity)
-    ? (entity.columns ?? [])
-      .filter((column) => column.entityContextType === 'columnCreate')
-      .map((column) => unquoteIdentifier(column.text))
-    : [];
-  if (explicitColumns.length === 0) {
-    const between = tokens.slice(0, asIndex).filter((token) => token.start > entity.position.endIndex);
-    const open = between.findIndex((token) => token.text === '(');
-    const close = open >= 0 ? findMatchingToken(between, open, '(', ')') : -1;
-    if (open >= 0 && close > open) {
-      explicitColumns = between.slice(open + 1, close)
-        .filter((token) => isIdentifierToken(token, dialect))
-        .map((token) => unquoteIdentifier(token.text));
-    }
+function areDataTypesCompatible(target: SqlDataType, source: SqlDataType): boolean {
+  if (target.kind === 'unknown' || source.kind === 'unknown') return true;
+  if (target.kind === 'scalar' && source.kind === 'scalar') {
+    return areTypesCompatible(target.family, source.family);
   }
-  return {
-    name,
-    normalizedName: normalizeQualifiedName(name, dialect),
-    normalizedLeafName: parts.at(-1)
-      ? normalizeIdentifier(parts.at(-1)!.text, parts.at(-1)!.quoted, dialect)
-      : '',
-    query: text.slice(queryStart, queryEnd),
-    explicitColumns,
-    dialect,
-    source,
-    start: entity.position.startIndex,
-    end: entity.position.endIndex + 1,
-    queryStart,
-  };
+  if (target.kind === 'array' && source.kind === 'array') {
+    return areDataTypesCompatible(target.elementType, source.elementType);
+  }
+  if (target.kind === 'map' && source.kind === 'map') {
+    return areDataTypesCompatible(target.keyType, source.keyType)
+      && areDataTypesCompatible(target.valueType, source.valueType);
+  }
+  if (target.kind === 'struct' && source.kind === 'struct') {
+    return target.fields.length === source.fields.length
+      && target.fields.every((field, index) => {
+        const actual = source.fields[index];
+        return actual
+          ? areDataTypesCompatible(columnDataType(field, 'generic'), columnDataType(actual, 'generic'))
+          : false;
+      });
+  }
+  return false;
 }
 
 function isSchemaViewDefinition(
@@ -2426,38 +1977,6 @@ function isSchemaViewDefinition(
 function isUsableOutputColumn(name: string): boolean {
   const trimmed = name.trim();
   return trimmed.length > 0 && !/^[-+]?\d/u.test(trimmed) && !/[()+*/%<>=]/u.test(trimmed);
-}
-
-function extractDeclaredColumns(entity: EntityContext, dialect: SqlDialect): SchemaColumn[] {
-  if (!isCommonEntity(entity)) {
-    return [];
-  }
-  return (entity.columns ?? []).flatMap((column) => {
-    let name = column.text.trim();
-    let type = column._colType?.text?.trim() ?? '';
-    if (!type) {
-      const match = /^(?<name>(?:`[^`]+`|"[^"]+"|\[[^\]]+\]|[^\s]+))\s+(?<type>.+)$/u.exec(name);
-      if (match?.groups) {
-        name = match.groups.name ?? name;
-        type = match.groups.type ?? '';
-      }
-    }
-    if (!name) {
-      return [];
-    }
-    const quoted = isQuotedIdentifier(name);
-    const visibleName = unquoteIdentifier(name);
-    const dataType = parseSqlDataType(type, dialect);
-    return [{
-      name: visibleName,
-      normalizedName: normalizeIdentifier(visibleName, quoted, dialect),
-      type,
-      typeFamily: dataTypeFamily(dataType),
-      dataType,
-      start: column.position.startIndex,
-      end: column.position.endIndex + 1,
-    }];
-  });
 }
 
 function declaredColumn(
@@ -2524,106 +2043,6 @@ function extractInsertShape(
   return { targetColumns, staticPartitionColumns };
 }
 
-function inferExpressionType(
-  expression: string,
-  bindings: readonly RelationBinding[],
-  dialect: SqlDialect,
-): SqlTypeFamily {
-  return dataTypeFamily(inferExpressionDataType(expression, bindings, dialect));
-}
-
-function inferExpressionDataType(
-  expression: string,
-  bindings: readonly RelationBinding[],
-  dialect: SqlDialect,
-): SqlDataType {
-  const trimmed = trimOuterParentheses(expression.trim());
-  const direct = resolveColumnFromBindings(bindings, trimmed, dialect);
-  if (direct) return columnDataType(direct, dialect);
-  if (/^[-+]?\d+(?:\.\d+)?$/u.test(trimmed)) return dataTypeFromFamily('number');
-  if (/^'(?:[^']|'')*'$/su.test(trimmed)) return dataTypeFromFamily('string');
-  if (/^(?:TRUE|FALSE)$/iu.test(trimmed)) return dataTypeFromFamily('boolean');
-
-  const fieldAccess = trailingFieldAccess(trimmed);
-  if (fieldAccess) {
-    const baseType = inferExpressionDataType(fieldAccess.base, bindings, dialect);
-    return fieldDataType(baseType, fieldAccess.field, dialect) ?? UNKNOWN_DATA_TYPE;
-  }
-
-  const invocation = parseFunctionInvocation(trimmed);
-  if (!invocation) return UNKNOWN_DATA_TYPE;
-  const name = normalizeBareIdentifier(invocation.name.split('.').at(-1) ?? invocation.name, dialect)
-    .replace(/^!/u, '');
-  const arguments_ = splitTopLevel(invocation.arguments, ',');
-  if (name === 'from_json' && arguments_[1]) {
-    const schema = unquoteSqlString(arguments_[1].trim());
-    return schema === undefined ? UNKNOWN_DATA_TYPE : parseSqlDataType(schema, dialect);
-  }
-  if (name === 'struct') {
-    const fields = arguments_.map((argument, index) => {
-      const outputName = expressionOutputName(argument, index);
-      const dataType = inferExpressionDataType(argument, bindings, dialect);
-      return virtualColumn(outputName, dataTypeFamily(dataType), '', dataType);
-    });
-    return { kind: 'struct', fields };
-  }
-  if (name === 'named_struct') {
-    const fields: SchemaColumn[] = [];
-    for (let index = 0; index + 1 < arguments_.length; index += 2) {
-      const fieldName = unquoteSqlString(arguments_[index]!.trim());
-      if (fieldName === undefined) return UNKNOWN_DATA_TYPE;
-      const dataType = inferExpressionDataType(arguments_[index + 1]!, bindings, dialect);
-      fields.push(virtualColumn(fieldName, dataTypeFamily(dataType), '', dataType));
-    }
-    return { kind: 'struct', fields };
-  }
-  if (name === 'split') {
-    return { kind: 'array', elementType: dataTypeFromFamily('string') };
-  }
-  if (name === 'size' || name === 'cardinality') {
-    return dataTypeFromFamily('number');
-  }
-  if (name === 'array') {
-    return {
-      kind: 'array',
-      elementType: arguments_[0]
-        ? inferExpressionDataType(arguments_[0], bindings, dialect)
-        : UNKNOWN_DATA_TYPE,
-    };
-  }
-  if (name === 'map') {
-    return {
-      kind: 'map',
-      keyType: arguments_[0]
-        ? inferExpressionDataType(arguments_[0], bindings, dialect)
-        : UNKNOWN_DATA_TYPE,
-      valueType: arguments_[1]
-        ? inferExpressionDataType(arguments_[1], bindings, dialect)
-        : UNKNOWN_DATA_TYPE,
-    };
-  }
-  return UNKNOWN_DATA_TYPE;
-}
-
-function resolveColumnFromBindings(
-  bindings: readonly RelationBinding[],
-  reference: string,
-  dialect: SqlDialect,
-): SchemaColumn | undefined {
-  const parts = splitQualifiedName(reference);
-  const name = parts.at(-1)?.text ?? reference;
-  if (parts.length > 1) {
-    const qualifier = parts.slice(0, -1).map((part) => part.text).join('.');
-    const binding = bindings.find((candidate) => bindingMatchesQualifier(candidate, qualifier, dialect));
-    return binding ? findColumn(binding.columns, name, dialect) : undefined;
-  }
-  const matches = bindings.flatMap((binding) => {
-    const column = findColumn(binding.columns, name, dialect);
-    return column ? [column] : [];
-  });
-  return matches.length === 1 ? matches[0] : undefined;
-}
-
 function typeFamily(type: string): SqlTypeFamily {
   const upper = type.toUpperCase();
   if (/\b(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|DECIMAL|NUMERIC|FLOAT|REAL|DOUBLE|NUMBER|MONEY)\b/u.test(upper)) return 'number';
@@ -2686,21 +2105,6 @@ function dataTypeFromFamily(family: SqlTypeFamily): SqlDataType {
 
 function columnDataType(column: SchemaColumn, dialect: SqlDialect): SqlDataType {
   return column.dataType ?? (column.type ? parseSqlDataType(column.type, dialect) : dataTypeFromFamily(column.typeFamily));
-}
-
-function resolveNestedFields(
-  dataType: SqlDataType,
-  fields: readonly string[],
-  dialect: SqlDialect,
-): boolean {
-  let current = dataType;
-  for (const field of fields) {
-    if (current.kind === 'unknown') return true;
-    const next = fieldDataType(current, field, dialect);
-    if (!next) return false;
-    current = next;
-  }
-  return true;
 }
 
 function fieldDataType(dataType: SqlDataType, field: string, dialect: SqlDialect): SqlDataType | undefined {
@@ -2783,77 +2187,6 @@ function splitTopLevel(value: string, separator: string): string[] {
   return result;
 }
 
-function trimOuterParentheses(value: string): string {
-  let current = value;
-  while (current.startsWith('(') && current.endsWith(')')) {
-    let depth = 0;
-    let closesAtEnd = false;
-    for (let index = 0; index < current.length; index += 1) {
-      if (current[index] === '(') depth += 1;
-      if (current[index] === ')') {
-        depth -= 1;
-        if (depth === 0) {
-          closesAtEnd = index === current.length - 1;
-          break;
-        }
-      }
-    }
-    if (!closesAtEnd) break;
-    current = current.slice(1, -1).trim();
-  }
-  return current;
-}
-
-function trailingFieldAccess(value: string): { base: string; field: string } | undefined {
-  let round = 0;
-  let angle = 0;
-  let quote = '';
-  let lastDot = -1;
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index]!;
-    if (quote) {
-      if (character === quote) quote = '';
-      continue;
-    }
-    if (character === "'" || character === '"' || character === '`') quote = character;
-    else if (character === '(') round += 1;
-    else if (character === ')') round = Math.max(0, round - 1);
-    else if (character === '<') angle += 1;
-    else if (character === '>') angle = Math.max(0, angle - 1);
-    else if (character === '.' && round === 0 && angle === 0) lastDot = index;
-  }
-  if (lastDot <= 0) return undefined;
-  const field = value.slice(lastDot + 1).trim();
-  return field && /^(?:`[^`]+`|"[^"]+"|[\p{L}_$][\p{L}\p{N}_$]*)$/u.test(field)
-    ? { base: value.slice(0, lastDot).trim(), field }
-    : undefined;
-}
-
-function parseFunctionInvocation(value: string): { name: string; arguments: string } | undefined {
-  const open = value.indexOf('(');
-  if (open <= 0 || !value.endsWith(')')) return undefined;
-  const name = value.slice(0, open).trim();
-  if (!/^(?:`[^`]+`|"[^"]+"|[\p{L}_$][\p{L}\p{N}_$]*)(?:\.(?:`[^`]+`|"[^"]+"|[\p{L}_$][\p{L}\p{N}_$]*))*$/u.test(name)) {
-    return undefined;
-  }
-  return { name, arguments: value.slice(open + 1, -1) };
-}
-
-function unquoteSqlString(value: string): string | undefined {
-  return value.startsWith("'") && value.endsWith("'")
-    ? value.slice(1, -1).replace(/''/gu, "'")
-    : undefined;
-}
-
-function expressionOutputName(expression: string, index: number): string {
-  const trimmed = expression.trim();
-  const parts = splitQualifiedName(trimmed);
-  if (parts.length > 0 && !/[()+*/%<>=]/u.test(trimmed)) {
-    return parts.at(-1)!.text;
-  }
-  return `col${index + 1}`;
-}
-
 function virtualColumn(
   name: string,
   family: SqlTypeFamily = 'unknown',
@@ -2880,6 +2213,11 @@ function bindingMatchesQualifier(binding: RelationBinding, qualifier: string, di
   const normalized = normalizeQualifiedName(qualifier, dialect);
   const leaf = normalized.split('.').at(-1);
   return binding.aliases.some((alias) => alias === normalized || alias.split('.').at(-1) === leaf);
+}
+
+function bindingMatchesExactQualifier(binding: RelationBinding, qualifier: string, dialect: SqlDialect): boolean {
+  const normalized = normalizeQualifiedName(qualifier, dialect);
+  return binding.aliases.some((alias) => alias === normalized);
 }
 
 function normalizeQualifiedName(name: string, dialect: SqlDialect): string {
@@ -2959,46 +2297,6 @@ function isIdentifierToken(token: SqlLexToken, dialect: SqlDialect): boolean {
   return !getSqlCatalog(dialect).keywords.includes(token.text.toUpperCase());
 }
 
-function flattenEntities(entities: readonly EntityContext[]): EntityContext[] {
-  const result: EntityContext[] = [];
-  const seen = new Set<EntityContext>();
-  const visit = (entity: EntityContext): void => {
-    if (seen.has(entity)) return;
-    seen.add(entity);
-    result.push(entity);
-    for (const related of entity.relatedEntities ?? []) visit(related);
-    if (isCommonEntity(entity)) {
-      for (const column of entity.columns ?? []) visit(column);
-    }
-  };
-  entities.forEach(visit);
-  return result;
-}
-
-function isCommonEntity(entity: EntityContext): entity is CommonEntityContext {
-  return 'columns' in entity || entity.entityContextType === 'table' || entity.entityContextType === 'tableCreate'
-    || entity.entityContextType === 'view' || entity.entityContextType === 'viewCreate'
-    || entity.entityContextType === 'queryResult';
-}
-
-function isExpressionTable(entity: EntityContext): boolean {
-  return ('declareType' in entity && entity.declareType === 1) || entity.text.trimStart().startsWith('(');
-}
-
-function scopeForStatement(
-  scopes: readonly MutableScope[],
-  start: number,
-  end: number,
-  depth: number,
-): MutableScope | undefined {
-  return scopes.find((scope) => scope.start === start && scope.end === end && scope.depth === depth)
-    ?? scopes.find((scope) => scope.start <= start && scope.end >= end && scope.depth === depth);
-}
-
-function smallestContainingScope(scopes: readonly MutableScope[], offset: number): MutableScope | undefined {
-  return containingScopes(scopes, offset)[0];
-}
-
 function containingScopes(scopes: readonly MutableScope[], offset: number): MutableScope[] {
   return scopes.filter((scope) => offset >= scope.start && offset <= scope.end)
     .sort((left, right) => right.depth - left.depth || (left.end - left.start) - (right.end - right.start));
@@ -3030,19 +2328,6 @@ function overlapsAny(
   ranges: readonly { start: number; end: number }[],
 ): boolean {
   return ranges.some((range) => span.start < range.end && range.start < span.end);
-}
-
-function entityRange(entity: EntityContext): { start: number; end: number } {
-  return { start: entity.position.startIndex, end: entity.position.endIndex + 1 };
-}
-
-function deduplicateColumns(columns: readonly SchemaColumn[]): SchemaColumn[] {
-  const seen = new Set<string>();
-  return columns.filter((column) => {
-    if (seen.has(column.normalizedName)) return false;
-    seen.add(column.normalizedName);
-    return true;
-  });
 }
 
 function deduplicateSemanticIssues(issues: readonly SqlSemanticIssue[]): SqlSemanticIssue[] {
