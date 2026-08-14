@@ -9,7 +9,7 @@ A VS Code extension for AIOps Spark job configurations. It lets strings in `*.sq
 - Accepts configurable placeholders in strings, bare values, unquoted property keys, and embedded bare tokens.
 - Validates and highlights SQL strings selected by configurable property-name patterns such as `*Sql`.
 - Completes dialect keywords, built-in functions, configured UDFs, and context-relevant fields in both regular SQL and embedded SQL strings.
-- Gives recognized SQL strings code-like pair editing for brackets and quotes, including overtyping, pair deletion, selection surrounding, and JSON-safe escaped double quotes.
+- Uses VS Code's native pair editing throughout SQL JSON documents for brackets, single quotes, and backticks, without intercepting text input or IME composition.
 - Colorizes nested SQL bracket pairs using the active VS Code theme and supports jumping between matching SQL brackets.
 - Maps the standard comment shortcuts to safe `/* ... */` comments inside recognized SQL strings.
 - Supports Spark, Hive, Flink, MySQL, PostgreSQL, Trino, Impala, and Generic SQL. Spark SQL is the default.
@@ -141,13 +141,13 @@ Definitions are lexical-first. For example, a reference to `r.total` from a CTE 
 
 ## Editing embedded SQL
 
-The extension applies SQL editing behavior only to direct string values whose property names match `aiopsSqlJson.keyPatterns`. Parentheses, square brackets, braces, single quotes, and backticks close in pairs; typing a closing delimiter over an existing one advances the cursor, Backspace removes an empty pair, and typing an opening delimiter around a selection surrounds it.
+The SQL JSON language configuration lets VS Code handle parentheses, square brackets, braces, single quotes, and backticks natively throughout the document, including SQL strings, other JSON strings, and incomplete text. Typing a closing delimiter over an automatically inserted one advances the cursor, Backspace removes an empty pair, and typing an opening delimiter around a selection surrounds it. Because the extension does not override VS Code's global typing command, normal text and IME composition continue through the editor's synchronous input path even after the document's language mode is changed.
 
-Because the outer document is JSON, typing a double quote inside recognized SQL inserts the JSON-safe source text `\"\"` and leaves the cursor between the two decoded SQL quotes. The behavior follows VS Code's `editor.autoClosingBrackets`, `editor.autoClosingQuotes`, `editor.autoSurround`, `editor.autoClosingDelete`, and `editor.autoClosingOvertype` settings.
+Double quotes retain normal JSON behavior: VS Code can pair them where a JSON string may begin, but the extension does not insert or pair escaped `\"` sequences inside an existing string. Type both JSON escapes explicitly when two SQL double quotes are required. Native pair behavior follows VS Code's `editor.autoClosingBrackets`, `editor.autoClosingQuotes`, `editor.autoSurround`, `editor.autoClosingDelete`, and `editor.autoClosingOvertype` settings.
 
-When `editor.bracketPairColorization.enabled` is enabled, recognized SQL brackets use the active theme's bracket colors. The standard matching-bracket shortcut (`Ctrl+Shift+\` on Windows/Linux or `Cmd+Shift+\` on macOS) works inside these strings. The standard line and block comment shortcuts create `/* ... */` comments because `--` comments can cross physical lines after the target platform removes line endings.
+When `editor.bracketPairColorization.enabled` is enabled, recognized SQL brackets cycle through the three bracket colors guaranteed to be visible in VS Code's built-in themes. The standard matching-bracket shortcut (`Ctrl+Shift+\` on Windows/Linux or `Cmd+Shift+\` on macOS) works inside these strings. The standard line and block comment shortcuts create `/* ... */` comments because `--` comments can cross physical lines after the target platform removes line endings.
 
-The matched regions are computed dynamically, so changing `aiopsSqlJson.keyPatterns` takes effect without reloading VS Code. VS Code does not expose a way to assign a native embedded-language ID to dynamically computed ranges; native bracket guide lines and automatic integration with unrelated SQL extensions therefore remain unavailable inside `.sql.json` strings.
+SQL highlighting, diagnostics, matching-bracket decoration, navigation, and comments still use regions computed dynamically from `aiopsSqlJson.keyPatterns`, so changing the setting takes effect without reloading VS Code. Pair editing is intentionally file-wide and independent of those regions. VS Code does not expose a way to assign a native embedded-language ID to dynamically computed ranges; native bracket guide lines and automatic integration with unrelated SQL extensions therefore remain unavailable inside `.sql.json` strings.
 
 ## JSON Schema
 

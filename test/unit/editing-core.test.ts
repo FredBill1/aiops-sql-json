@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { analyzeSqlEditingStructure, findBracketAt, lexicalStateAt } from '../../src/editingCore';
+import {
+  analyzeSqlEditingStructure,
+  findBracketAt,
+  lexicalStateAt,
+  visibleBracketColorIndex,
+} from '../../src/editingCore';
 import { decodedOffsetAtOriginalOffset, type DecodedSqlText } from '../../src/regions';
 
 describe('SQL editing structure', () => {
@@ -14,6 +19,10 @@ describe('SQL editing structure', () => {
     expect(brackets.every((item) => !item.unexpected && item.pairOffset !== undefined)).toBe(true);
     expect(findBracketAt(structure, 5)?.character).toBe('(');
     expect(findBracketAt(structure, 6)?.character).toBe('{');
+  });
+
+  it('cycles deep bracket levels through the three visible default theme colors', () => {
+    expect([0, 1, 2, 3, 4, 5].map(visibleBracketColorIndex)).toEqual([0, 1, 2, 0, 1, 2]);
   });
 
   it('marks mismatched brackets as unexpected', () => {

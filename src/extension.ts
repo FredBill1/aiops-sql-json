@@ -3,7 +3,6 @@ import * as vscode from 'vscode';
 import { getExtensionConfiguration } from './config';
 import { DiagnosticController } from './diagnostics';
 import { SqlBracketDecorationController } from './bracketDecorations';
-import { SqlEditingController } from './editing';
 import { SqlEditingCommands } from './editingCommands';
 import { SqlEditingContextService } from './editingContext';
 import { JsonServiceManager } from './jsonService';
@@ -33,7 +32,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const semanticTokens = new SqlSemanticTokensProvider(jsonServices);
   const schemas = new SqlSchemaService();
   const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh(), schemas);
-  const editing = new SqlEditingController(editingContexts);
   const bracketDecorations = new SqlBracketDecorationController(editingContexts);
   const editingCommands = new SqlEditingCommands(editingContexts);
 
@@ -41,7 +39,6 @@ export function activate(context: vscode.ExtensionContext): void {
     semanticTokens,
     schemas,
     diagnostics,
-    editing,
     bracketDecorations,
     editingCommands,
     vscode.commands.registerCommand(REBUILD_SCHEMA_INDEX_COMMAND, async () => {

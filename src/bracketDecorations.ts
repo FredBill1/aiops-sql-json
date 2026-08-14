@@ -1,13 +1,15 @@
 import * as vscode from 'vscode';
 
-import { findBracketAt } from './editingCore';
+import {
+  findBracketAt,
+  visibleBracketColorIndex,
+  VISIBLE_BRACKET_COLOR_COUNT,
+} from './editingCore';
 import type { SqlEditingContextService, SqlEditingRegion } from './editingContext';
 import { decodedOffsetAtOriginalOffset, mapDecodedRange } from './regions';
 
-const COLOR_COUNT = 6;
-
 export class SqlBracketDecorationController implements vscode.Disposable {
-  private readonly levelDecorations = Array.from({ length: COLOR_COUNT }, (_, index) => (
+  private readonly levelDecorations = Array.from({ length: VISIBLE_BRACKET_COLOR_COUNT }, (_, index) => (
     vscode.window.createTextEditorDecorationType({
       color: new vscode.ThemeColor(`editorBracketHighlight.foreground${index + 1}`),
     })
@@ -84,7 +86,7 @@ export class SqlBracketDecorationController implements vscode.Disposable {
       'bracketPairColorization.independentColorPoolPerBracketType',
       false,
     );
-    const levels = Array.from({ length: COLOR_COUNT }, () => [] as vscode.Range[]);
+    const levels = Array.from({ length: VISIBLE_BRACKET_COLOR_COUNT }, () => [] as vscode.Range[]);
     const unexpected: vscode.Range[] = [];
     const analysis = this.contexts.get(editor.document);
 
@@ -99,7 +101,7 @@ export class SqlBracketDecorationController implements vscode.Disposable {
             unexpected.push(range);
           } else {
             const level = independentColors ? bracket.independentLevel : bracket.level;
-            levels[level % COLOR_COUNT]?.push(range);
+            levels[visibleBracketColorIndex(level)]?.push(range);
           }
         }
       }

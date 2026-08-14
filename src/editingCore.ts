@@ -16,6 +16,14 @@ export interface SqlEditingStructure {
   states: readonly SqlLexicalState[];
 }
 
+/** VS Code's default themes assign visible colors only to foreground1-3. */
+export const VISIBLE_BRACKET_COLOR_COUNT = 3;
+
+export function visibleBracketColorIndex(level: number): number {
+  const normalized = Math.max(0, Math.trunc(level));
+  return normalized % VISIBLE_BRACKET_COLOR_COUNT;
+}
+
 const OPEN_TO_CLOSE = new Map<SqlBracketCharacter, SqlBracketCharacter>([
   ['(', ')'],
   ['[', ']'],

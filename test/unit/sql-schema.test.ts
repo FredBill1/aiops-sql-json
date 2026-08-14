@@ -169,6 +169,19 @@ WHERE o.amount > 0`;
     )).toEqual([]);
   });
 
+  it('keeps known CTE fields available beside dynamic projections and relations', () => {
+    const sql = "WITH valid_data AS (SELECT ${othercols}, e, FROM ${tablename}) "
+      + "SELECT $othercols2, concat_ws('_', a, b) AS c, d, e FROM valid_data";
+    const placeholders = [/\$\{[^}]+\}/gu, /\$\w+/gu];
+
+    expect(analyzeSqlSemantics(sql, 'spark', placeholders, { tables: [], issues: [] }, [])).toEqual([]);
+    const outerField = getSqlScopeInfo(sql, sql.lastIndexOf(', e') + 2, 'spark', placeholders, {
+      tables: [],
+      issues: [],
+    });
+    expect(outerField.fields).toContain('e');
+  });
+
   it('checks INSERT, UNION, and simple UPDATE shapes when types are known', () => {
     expect(analyzeSqlSemantics(
       'INSERT INTO sales.orders (id, amount) SELECT id FROM sales.customers',
@@ -198,6 +211,25 @@ WHERE o.amount > 0`;
       schema,
       [],
     ).some((issue) => issue.code === 'incompatible-type')).toBe(true);
+  });
+
+  it('validates parenthesized INSERT SELECT sources', () => {
+    const invalid = 'CREATE TABLE t1 (a INT); INSERT INTO t1 (SELECT b FROM t1);';
+    const issues = analyzeSqlSemantics(invalid, 'spark', [], { tables: [], issues: [] }, []);
+    expect(issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'unknown-column',
+        start: invalid.indexOf('b FROM'),
+      }),
+    ]));
+
+    expect(analyzeSqlSemantics(
+      'CREATE TABLE t1 (a INT); INSERT INTO t1 (SELECT a FROM t1);',
+      'spark',
+      [],
+      { tables: [], issues: [] },
+      [],
+    )).toEqual([]);
   });
 
   it('collects current-file fields and returns schema fields in scope', () => {

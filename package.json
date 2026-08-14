@@ -2,7 +2,7 @@
   "name": "aiops-sql-json",
   "displayName": "AIOps SQL JSON",
   "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "icon": "images/icon.png",
   "license": "MIT",
   "engines": {
@@ -87,11 +87,6 @@
       }
     ],
     "keybindings": [
-      {
-        "key": "backspace",
-        "command": "aiopsSqlJson.deleteLeft",
-        "when": "editorTextFocus && editorLangId == sql-json && !editorReadonly"
-      },
       {
         "key": "ctrl+shift+\\",
         "mac": "cmd+shift+\\",

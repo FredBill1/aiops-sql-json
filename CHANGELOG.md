@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.0.6
+
+- Removed the global typing and Backspace command overrides that could corrupt Microsoft Chinese IME composition, including after changing the document language mode.
+- Switched brackets, single quotes, and backticks to VS Code's native file-wide pair editing, and stopped automatically pairing escaped double quotes inside strings.
+- Kept deeply nested SQL brackets visible by cycling through the three bracket colors defined by VS Code's built-in themes.
+- Fixed dynamic CTE projections suppressing known fields or producing false unknown-column diagnostics.
+- Fixed a SELECT expression resolving to its own same-name projection alias instead of the underlying table column.
+- Added semantic validation, Hover, and Go to Definition inside parenthesized INSERT SELECT sources.
+
 ## 0.0.5
 
 - Added AST-based SQL Hover and Go to Definition for regular `.sql` files and recognized SQL regions in `.sql.json` files.

@@ -186,12 +186,7 @@ suite('AIOps SQL JSON extension', () => {
     assert.ok(sqlDiagnostic.range.start.line >= 1);
   });
 
-  test('provides dynamic SQL pair editing without changing unmatched strings', async () => {
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
-      'keyPatterns',
-      ['query', '*Sql'],
-      vscode.ConfigurationTarget.Global,
-    );
+  test('uses native pair editing throughout SQL JSON documents', async () => {
     const document = await openFile(
       'pair-editing.sql.json',
       '{"query":"SELECT ","name":"plain","otherSql":"FROM "}',
@@ -202,31 +197,25 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.commands.executeCommand('type', { text: '(' });
     assert.equal(document.getText(), '{"query":"SELECT ()","name":"plain","otherSql":"FROM "}');
 
+    await vscode.commands.executeCommand('deleteLeft');
+    assert.equal(document.getText(), '{"query":"SELECT ","name":"plain","otherSql":"FROM "}');
+
+    await vscode.commands.executeCommand('type', { text: '(' });
     await vscode.commands.executeCommand('type', { text: ')' });
     assert.equal(document.getText(), '{"query":"SELECT ()","name":"plain","otherSql":"FROM "}');
     assert.equal(document.offsetAt(editor.selection.active), document.getText().indexOf('SELECT ()') + 'SELECT ()'.length);
 
-    const emptyPairCaret = document.getText().indexOf('SELECT ()') + 'SELECT ('.length;
-    setCaret(editor, emptyPairCaret);
-    await vscode.commands.executeCommand('aiopsSqlJson.deleteLeft');
-    assert.equal(document.getText(), '{"query":"SELECT ","name":"plain","otherSql":"FROM "}');
-
     setCaret(editor, document.getText().indexOf('plain') + 'plain'.length);
     await vscode.commands.executeCommand('type', { text: '(' });
-    assert.equal(document.getText(), '{"query":"SELECT ","name":"plain(","otherSql":"FROM "}');
+    assert.equal(document.getText(), '{"query":"SELECT ()","name":"plain()","otherSql":"FROM "}');
 
-    const queryCaret = document.getText().indexOf('SELECT ') + 'SELECT '.length;
     const otherCaret = document.getText().indexOf('FROM ') + 'FROM '.length;
-    editor.selections = [
-      new vscode.Selection(document.positionAt(queryCaret), document.positionAt(queryCaret)),
-      new vscode.Selection(document.positionAt(otherCaret), document.positionAt(otherCaret)),
-    ];
+    setCaret(editor, otherCaret);
     await vscode.commands.executeCommand('type', { text: '{' });
-    assert.ok(document.getText().includes('SELECT {}'));
     assert.ok(document.getText().includes('FROM {}'));
   });
 
-  test('escapes SQL double quotes and surrounds selected SQL text', async () => {
+  test('surrounds text natively and does not auto-pair escaped double quotes', async () => {
     const document = await openFile('quote-editing.sql.json', '{"trainSql":"SELECT value "}');
     const editor = activeEditorFor(document);
     const valueStart = document.getText().indexOf('value');
@@ -239,22 +228,12 @@ suite('AIOps SQL JSON extension', () => {
     assert.equal(document.getText(editor.selection), 'value');
 
     setCaret(editor, document.getText().indexOf(' "}') + 1);
-    await vscode.commands.executeCommand('type', { text: '"' });
-    assert.equal(document.getText(), String.raw`{"trainSql":"SELECT 'value' \"\""}`);
-    assert.equal(document.offsetAt(editor.selection.active), document.getText().indexOf(String.raw`\"\"`) + 2);
-
-    const manualEscapeDocument = await openFile('manual-escape.sql.json', '{"trainSql":"SELECT "}');
-    const manualEscapeEditor = activeEditorFor(manualEscapeDocument);
-    setCaret(
-      manualEscapeEditor,
-      manualEscapeDocument.getText().indexOf('SELECT ') + 'SELECT '.length,
-    );
     await vscode.commands.executeCommand('type', { text: '\\' });
     await vscode.commands.executeCommand('type', { text: '"' });
-    assert.equal(manualEscapeDocument.getText(), String.raw`{"trainSql":"SELECT \"\""}`);
+    assert.equal(document.getText(), String.raw`{"trainSql":"SELECT 'value' \""}`);
   });
 
-  test('applies key pattern changes to editing without a reload', async () => {
+  test('keeps native pairs independent of SQL key patterns', async () => {
     const document = await openFile('dynamic-pattern.sql.json', '{"query":"SELECT ","trainSql":"FROM "}');
     const editor = activeEditorFor(document);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
@@ -273,11 +252,29 @@ suite('AIOps SQL JSON extension', () => {
     );
     setCaret(editor, document.getText().indexOf('SELECT []') + 'SELECT []'.length);
     await vscode.commands.executeCommand('type', { text: '{' });
-    assert.ok(document.getText().includes('SELECT []{'));
+    assert.ok(document.getText().includes('SELECT []{}'));
 
     setCaret(editor, document.getText().indexOf('FROM ') + 'FROM '.length);
     await vscode.commands.executeCommand('type', { text: '{' });
     assert.ok(document.getText().includes('FROM {}'));
+  });
+
+  test('does not rewrite Unicode input in SQL JSON or after a language-mode change', async () => {
+    const sqlJsonDocument = await openFile('unicode-input.sql.json', '{"Sql":"select \'你好\'"}');
+    const sqlJsonEditor = activeEditorFor(sqlJsonDocument);
+    setCaret(sqlJsonEditor, sqlJsonDocument.getText().indexOf('你好') + '你好'.length);
+    await vscode.commands.executeCommand('type', { text: '，' });
+    assert.equal(sqlJsonDocument.getText(), '{"Sql":"select \'你好，\'"}');
+
+    const markdownDocument = await openFile(
+      'unicode-markdown.sql.json',
+      '你好\n\n{"trainSql":"select \'hello world\'"}',
+    );
+    await vscode.languages.setTextDocumentLanguage(markdownDocument, 'markdown');
+    const markdownEditor = activeEditorFor(markdownDocument);
+    setCaret(markdownEditor, markdownDocument.getText().indexOf('你好') + '你好'.length);
+    await vscode.commands.executeCommand('type', { text: '，' });
+    assert.equal(markdownDocument.getText(), '你好，\n\n{"trainSql":"select \'hello world\'"}');
   });
 
   test('respects disabled bracket autoclosing', async () => {

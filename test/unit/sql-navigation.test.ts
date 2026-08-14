@@ -128,6 +128,32 @@ describe('AST SQL symbol resolver', () => {
     expect(symbol(sql, 'id', 'spark', { tables: [], issues: [] }, 2)).toBeUndefined();
   });
 
+  it('resolves a projection expression before publishing its same-name alias', () => {
+    const sql = 'CREATE TABLE test_table (a INT); SELECT a AS a FROM test_table;';
+    const ddlColumn = sql.indexOf('a INT');
+    const expressionOffset = sql.indexOf('SELECT a') + 'SELECT '.length;
+    const aliasOffset = sql.indexOf('AS a') + 'AS '.length;
+
+    const expression = getSqlSymbolAtOffset(sql, expressionOffset, 'spark', [], { tables: [], issues: [] });
+    expect(expression?.kind).toBe('column');
+    expect(expression?.definitions[0]?.location.source).toBe(CURRENT_SQL_DOCUMENT_SOURCE);
+    expect(expression?.definitions[0]?.location.selectionStart).toBe(ddlColumn);
+
+    const alias = getSqlSymbolAtOffset(sql, aliasOffset, 'spark', [], { tables: [], issues: [] });
+    expect(alias?.kind).toBe('projection');
+    expect(alias?.definitions[0]?.location.selectionStart).toBe(ddlColumn);
+  });
+
+  it('resolves columns inside a parenthesized INSERT SELECT', () => {
+    const sql = 'CREATE TABLE t1 (a INT); INSERT INTO t1 (SELECT a FROM t1);';
+    const usageOffset = sql.indexOf('SELECT a') + 'SELECT '.length;
+    const usage = getSqlSymbolAtOffset(sql, usageOffset, 'spark', [], { tables: [], issues: [] });
+
+    expect(usage?.kind).toBe('column');
+    expect(usage?.definitions[0]?.location.source).toBe(CURRENT_SQL_DOCUMENT_SOURCE);
+    expect(usage?.definitions[0]?.location.selectionStart).toBe(sql.indexOf('a INT'));
+  });
+
   it('maps from_json STRUCT field origins into the schema literal', () => {
     const sql = "SELECT from_json(json_data, 'STRUCT<name: STRING, nested: STRUCT<value: INT>>').nested.value FROM t";
     const snapshot = createSchemaSnapshot([parseDdlSchema(
