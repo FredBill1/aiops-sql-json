@@ -19,6 +19,8 @@ export type SqlDataType =
   | { kind: 'map'; keyType: SqlDataType; valueType: SqlDataType }
   | { kind: 'struct'; fields: readonly SchemaColumn[] };
 
+type SparkStoreAssignmentPolicy = 'ansi' | 'legacy' | 'strict';
+
 export type SqlSymbolKind =
   | 'table'
   | 'view'
@@ -548,7 +550,14 @@ export function analyzeSqlSemantics(
   }
   const state = createLocalSchemaState();
   const issues: SqlSemanticIssue[] = [];
+  let sparkStoreAssignmentPolicy: SparkStoreAssignmentPolicy = 'ansi';
   for (const statement of splitSqlStatements(text, dialect, placeholders)) {
+    if (dialect === 'spark') {
+      sparkStoreAssignmentPolicy = nextSparkStoreAssignmentPolicy(
+        statement.text,
+        sparkStoreAssignmentPolicy,
+      );
+    }
     const kind = sqlStatementKind(statement.text);
     if (kind === 'create' || kind === 'drop') {
       issues.push(...applyLocalDdl(statement, dialect, placeholders, snapshot, state, udfs, true));
@@ -561,6 +570,7 @@ export function analyzeSqlSemantics(
         placeholders,
         udfs,
         true,
+        sparkStoreAssignmentPolicy,
       ).issues.map((issue) => offsetSemanticIssue(issue, statement.start)));
     }
   }
@@ -1017,6 +1027,21 @@ function withoutLeadingSqlComments(text: string): string {
   }
 }
 
+function nextSparkStoreAssignmentPolicy(
+  text: string,
+  current: SparkStoreAssignmentPolicy,
+): SparkStoreAssignmentPolicy {
+  const body = withoutLeadingSqlComments(text).trim().replace(/;\s*$/u, '').trim();
+  const setting = '(?:`spark\\.sql\\.storeAssignmentPolicy`|spark\\.sql\\.storeAssignmentPolicy)';
+  if (new RegExp(`^RESET(?:\\s+${setting})?$`, 'iu').test(body)) return 'ansi';
+  const match = new RegExp(
+    `^SET\\s+${setting}\\s*=\\s*['"]?(ANSI|LEGACY|STRICT)['"]?$`,
+    'iu',
+  ).exec(body);
+  const policy = match?.[1]?.toLocaleLowerCase();
+  return policy === 'ansi' || policy === 'legacy' || policy === 'strict' ? policy : current;
+}
+
 function prepareReplacement(
   state: LocalSchemaState,
   existing: SchemaTable | undefined,
@@ -1058,6 +1083,7 @@ function buildSqlModel(
   placeholders: readonly RegExp[],
   udfs: readonly string[],
   validate: boolean,
+  sparkStoreAssignmentPolicy: SparkStoreAssignmentPolicy = 'ansi',
 ): {
   scopes: MutableScope[];
   references: IdentifierReference[];
@@ -1066,7 +1092,16 @@ function buildSqlModel(
 } {
   const ast = parseSqlAst(text, dialect, placeholders);
   if (ast && ast.statements.length > 0) {
-    return buildAstSqlModel(text, dialect, snapshot, placeholders, udfs, validate, ast.statements);
+    return buildAstSqlModel(
+      text,
+      dialect,
+      snapshot,
+      placeholders,
+      udfs,
+      validate,
+      ast.statements,
+      sparkStoreAssignmentPolicy,
+    );
   }
   // Syntax has already been checked by the caller. If normalization is not
   // possible, skip claims that cannot be proven instead of guessing from DT
@@ -1095,6 +1130,7 @@ interface AstModelContext {
   readonly builtinFunctions: ReadonlySet<string>;
   readonly udfs: ReadonlySet<string>;
   readonly validate: boolean;
+  readonly sparkStoreAssignmentPolicy: SparkStoreAssignmentPolicy;
   readonly scopes: AstScope[];
   readonly references: IdentifierReference[];
   readonly issues: SqlSemanticIssue[];
@@ -1135,6 +1171,7 @@ function buildAstSqlModel(
   udfs: readonly string[],
   validate: boolean,
   statements: readonly SqlAstNode[],
+  sparkStoreAssignmentPolicy: SparkStoreAssignmentPolicy,
 ): {
   scopes: MutableScope[];
   references: IdentifierReference[];
@@ -1161,6 +1198,7 @@ function buildAstSqlModel(
     builtinFunctions,
     udfs: configuredUdfs,
     validate,
+    sparkStoreAssignmentPolicy,
     scopes: [],
     references: [],
     issues: [],
@@ -1217,6 +1255,16 @@ function analyzeAstQuery(
       : { columns: [], open: false };
     const leftColumns = leftResult.columns;
     const rightColumns = rightResult.columns;
+    const commonTypes = leftColumns.map((column, index) => {
+      const rightColumn = rightColumns[index];
+      return rightColumn
+        ? commonSetOperationDataType(
+            columnDataType(column, context.dialect),
+            columnDataType(rightColumn, context.dialect),
+            context.dialect,
+          )
+        : undefined;
+    });
     if (context.validate && left && right) {
       if (leftColumns.length !== rightColumns.length) {
         appendAstIssue(context, right, 'union-column-count',
@@ -1225,7 +1273,7 @@ function analyzeAstQuery(
         for (let index = 0; index < leftColumns.length; index += 1) {
           const expected = leftColumns[index]!;
           const actual = rightColumns[index]!;
-          if (!areDataTypesCompatible(columnDataType(expected, context.dialect), columnDataType(actual, context.dialect))) {
+          if (!commonTypes[index]) {
             appendAstIssue(context, right, 'incompatible-type',
               `UNION column ${index + 1} has incompatible ${actual.typeFamily} and ${expected.typeFamily} types.`);
           }
@@ -1238,7 +1286,10 @@ function analyzeAstQuery(
         ...(column.definitions ?? []),
         ...(rightColumn?.definitions ?? []),
       ]);
-      return definitions.length > 0 ? { ...column, definitions } : column;
+      const commonType = commonTypes[index];
+      return commonType
+        ? schemaColumnWithDataType(column, commonType, definitions)
+        : definitions.length > 0 ? { ...column, definitions } : column;
     });
     return { columns, open: leftResult.open || rightResult.open };
   }
@@ -2351,6 +2402,71 @@ function commonAstDataType(types: readonly SqlDataType[]): SqlDataType {
   return known.every((type) => areDataTypesCompatible(first, type)) ? first : UNKNOWN_DATA_TYPE;
 }
 
+function commonSetOperationDataType(
+  left: SqlDataType,
+  right: SqlDataType,
+  dialect: SqlDialect,
+): SqlDataType | undefined {
+  if (left.kind === 'unknown') return right;
+  if (right.kind === 'unknown') return left;
+  if (dialect !== 'spark') return areDataTypesCompatible(left, right) ? left : undefined;
+  if (left.kind === 'scalar' && right.kind === 'scalar') {
+    if (left.family === 'string') return left;
+    if (right.family === 'string') return right;
+    if (left.family === right.family) {
+      return left.family === 'time' && isSparkTrueTime(left) !== isSparkTrueTime(right)
+        ? undefined
+        : left;
+    }
+    if (isSparkDateOrTimestamp(left) && isSparkDateOrTimestamp(right)) {
+      return left.family === 'time' ? left : right;
+    }
+    return undefined;
+  }
+  if (left.kind === 'array' && right.kind === 'array') {
+    const elementType = commonSetOperationDataType(left.elementType, right.elementType, dialect);
+    return elementType ? { kind: 'array', elementType } : undefined;
+  }
+  if (left.kind === 'map' && right.kind === 'map') {
+    const keyType = commonSetOperationDataType(left.keyType, right.keyType, dialect);
+    const valueType = commonSetOperationDataType(left.valueType, right.valueType, dialect);
+    return keyType && valueType ? { kind: 'map', keyType, valueType } : undefined;
+  }
+  if (left.kind === 'struct' && right.kind === 'struct' && left.fields.length === right.fields.length) {
+    const fields: SchemaColumn[] = [];
+    for (let index = 0; index < left.fields.length; index += 1) {
+      const leftField = left.fields[index]!;
+      const rightField = right.fields[index]!;
+      const fieldType = commonSetOperationDataType(
+        columnDataType(leftField, dialect),
+        columnDataType(rightField, dialect),
+        dialect,
+      );
+      if (!fieldType) return undefined;
+      fields.push(schemaColumnWithDataType(leftField, fieldType, deduplicateDefinitions([
+        ...(leftField.definitions ?? []),
+        ...(rightField.definitions ?? []),
+      ])));
+    }
+    return { kind: 'struct', fields };
+  }
+  return undefined;
+}
+
+function schemaColumnWithDataType(
+  column: SchemaColumn,
+  dataType: SqlDataType,
+  definitions: readonly SqlSymbolDefinition[] = column.definitions ?? [],
+): SchemaColumn {
+  return {
+    ...column,
+    type: displaySqlDataType(dataType),
+    typeFamily: dataTypeFamily(dataType),
+    dataType,
+    ...(definitions.length > 0 ? { definitions } : {}),
+  };
+}
+
 function analyzeAstInsert(
   insert: SqlAstNode,
   context: AstModelContext,
@@ -2358,7 +2474,8 @@ function analyzeAstInsert(
 ): SchemaColumn[] {
   const targetNode = astChild(insert, 'this');
   const targetTable = targetNode?.role === 'schema' ? astChild(targetNode, 'this') : targetNode;
-  const targetName = targetTable ? astTableName(targetTable) : '';
+  const directoryTarget = targetTable?.kind === 'directory';
+  const targetName = targetTable && !directoryTarget ? astTableName(targetTable) : '';
   const target = targetName ? resolveSchemaTable(context.snapshot, targetName, context.dialect) : { status: 'missing' as const };
   if (targetTable && target.status === 'found' && target.table) {
     const binding: RelationBinding = {
@@ -2386,10 +2503,13 @@ function analyzeAstInsert(
   }
   const source = astChild(insert, 'expression');
   const sourceColumns = source ? analyzeAstQuery(source, context, undefined, ctes).columns : [];
+  if (directoryTarget) return sourceColumns;
   if (!context.validate || target.status !== 'found' || !target.table) return sourceColumns;
 
   const explicit = targetNode?.role === 'schema' ? astChildren(targetNode, 'expressions') : [];
-  const shape = extractInsertShape(context.text, context.dialect);
+  const staticPartitionColumns = targetTable
+    ? astStaticPartitionColumns(targetTable, context.dialect)
+    : [];
   const targetColumns = explicit.length > 0
     ? explicit.flatMap((identifier) => {
         const column = findColumn(target.table!.columns, identifier.name, context.dialect);
@@ -2408,21 +2528,49 @@ function analyzeAstInsert(
         });
         return [column];
       })
-    : target.table.columns.filter((column) => !shape.staticPartitionColumns.includes(column.normalizedName));
+    : target.table.columns.filter((column) => !staticPartitionColumns.includes(column.normalizedName));
   const expectedCount = explicit.length > 0 ? explicit.length : targetColumns.length;
   if (sourceColumns.length > 0 && sourceColumns.length !== expectedCount) {
     appendAstIssue(context, targetTable, 'insert-column-count',
       `INSERT writes ${sourceColumns.length} value(s) into ${expectedCount} target column(s).`);
   }
-  for (let index = 0; index < Math.min(targetColumns.length, sourceColumns.length); index += 1) {
-    const expected = targetColumns[index]!;
-    const actual = sourceColumns[index]!;
-    if (!areDataTypesCompatible(columnDataType(expected, context.dialect), columnDataType(actual, context.dialect))) {
+  const byName = context.dialect === 'spark' && insert.args.byName === true;
+  const assignments = byName
+    ? sourceColumns.flatMap((actual) => {
+        const expected = findColumn(targetColumns, actual.name, context.dialect);
+        if (!expected) {
+          appendAstIssue(context, source ?? insert, 'unknown-column',
+            `INSERT BY NAME output ${actual.name} has no matching target column.`);
+          return [];
+        }
+        return [{ expected, actual }];
+      })
+    : targetColumns.slice(0, sourceColumns.length).map((expected, index) => ({
+        expected,
+        actual: sourceColumns[index]!,
+      }));
+  for (const { expected, actual } of assignments) {
+    if (!canStoreAssignDataType(
+      columnDataType(expected, context.dialect),
+      columnDataType(actual, context.dialect),
+      context.dialect,
+      context.sparkStoreAssignmentPolicy,
+    )) {
       appendAstIssue(context, source ?? insert, 'incompatible-type',
         `Cannot assign ${actual.typeFamily} value to ${expected.name} (${expected.type || expected.typeFamily}).`);
     }
   }
   return sourceColumns;
+}
+
+function astStaticPartitionColumns(table: SqlAstNode, dialect: SqlDialect): string[] {
+  const partition = astChild(table, 'partition');
+  if (!partition) return [];
+  return astChildren(partition, 'expressions').flatMap((expression) => {
+    if (expression.kind !== 'eq') return [];
+    const column = astChild(expression, 'this');
+    return column?.name ? [normalizeBareIdentifier(column.name, dialect)] : [];
+  });
 }
 
 function analyzeAstUpdate(
@@ -2955,6 +3103,7 @@ function deriveAstStatementColumns(
     builtinFunctions: new Set(),
     udfs: new Set(),
     validate: false,
+    sparkStoreAssignmentPolicy: 'ansi',
     scopes: [],
     references: [],
     issues: [],
@@ -2990,6 +3139,61 @@ function areDataTypesCompatible(target: SqlDataType, source: SqlDataType): boole
       });
   }
   return false;
+}
+
+function canStoreAssignDataType(
+  target: SqlDataType,
+  source: SqlDataType,
+  dialect: SqlDialect,
+  policy: SparkStoreAssignmentPolicy,
+): boolean {
+  if (dialect !== 'spark' || policy === 'strict') return areDataTypesCompatible(target, source);
+  if (target.kind === 'unknown' || source.kind === 'unknown') return true;
+  if (target.kind === 'scalar' && source.kind === 'scalar') {
+    if (policy === 'legacy') return true;
+    if (target.family === 'string') return true;
+    if (target.family === 'number') return source.family === 'number';
+    if (target.family === 'boolean') return source.family === 'boolean';
+    if (target.family === 'binary') return source.family === 'binary';
+    if (isSparkTrueTime(target)) {
+      return isSparkTrueTime(source) || source.family === 'string';
+    }
+    if (isSparkDateOrTimestamp(target)) return isSparkDateOrTimestamp(source);
+    return target.family === source.family;
+  }
+  if (target.kind === 'array' && source.kind === 'array') {
+    return canStoreAssignDataType(target.elementType, source.elementType, dialect, policy);
+  }
+  if (target.kind === 'map' && source.kind === 'map') {
+    return canStoreAssignDataType(target.keyType, source.keyType, dialect, policy)
+      && canStoreAssignDataType(target.valueType, source.valueType, dialect, policy);
+  }
+  if (target.kind === 'struct' && source.kind === 'struct') {
+    return target.fields.length === source.fields.length
+      && target.fields.every((field, index) => {
+        const actual = source.fields[index];
+        return actual
+          ? canStoreAssignDataType(
+              columnDataType(field, dialect),
+              columnDataType(actual, dialect),
+              dialect,
+              policy,
+            )
+          : false;
+      });
+  }
+  return false;
+}
+
+function isSparkTrueTime(dataType: SqlDataType): boolean {
+  return dataType.kind === 'scalar'
+    && dataType.family === 'time'
+    && /^TIME(?:\s*\(|$)/iu.test(dataType.name.trim());
+}
+
+function isSparkDateOrTimestamp(dataType: SqlDataType): boolean {
+  return dataType.kind === 'scalar'
+    && (dataType.family === 'date' || (dataType.family === 'time' && !isSparkTrueTime(dataType)));
 }
 
 function isSchemaViewDefinition(
@@ -3172,49 +3376,6 @@ function astDataTypeChildren(node: SqlAstNode): SqlAstNode[] {
 
 function firstAstDataTypeChild(node: SqlAstNode): SqlAstNode | undefined {
   return astDataTypeChildren(node)[0];
-}
-
-function extractInsertShape(
-  statement: string,
-  dialect: SqlDialect,
-): { targetColumns: string[]; staticPartitionColumns: string[] } {
-  const tokens = lexSql(statement, dialect).filter((token) => token.channel === 0);
-  const into = tokens.findIndex((token) => tokenUpper(token) === 'INTO');
-  if (into < 0) return { targetColumns: [], staticPartitionColumns: [] };
-  let cursor = into + 1;
-  while (cursor < tokens.length && tokens[cursor]?.text !== '('
-    && tokenUpper(tokens[cursor]) !== 'PARTITION'
-    && tokenUpper(tokens[cursor]) !== 'VALUES'
-    && tokenUpper(tokens[cursor]) !== 'SELECT') {
-    cursor += 1;
-  }
-  let targetColumns: string[] = [];
-  if (tokens[cursor]?.text === '(') {
-    const close = findMatchingToken(tokens, cursor, '(', ')');
-    if (close > cursor) {
-      targetColumns = tokens.slice(cursor + 1, close)
-        .filter((token, index, columns) => isIdentifierToken(token, dialect)
-          && (index === 0 || columns[index - 1]?.text === ','))
-        .map((token) => normalizeBareIdentifier(token.text, dialect));
-      cursor = close + 1;
-    }
-  }
-  const partition = tokens.findIndex((token, index) => index >= cursor && tokenUpper(token) === 'PARTITION');
-  const staticPartitionColumns: string[] = [];
-  if (partition >= 0 && tokens[partition + 1]?.text === '(') {
-    const open = partition + 1;
-    const close = findMatchingToken(tokens, open, '(', ')');
-    let depth = 0;
-    for (let index = open + 1; index < close; index += 1) {
-      const token = tokens[index]!;
-      if (token.text === '(') depth += 1;
-      if (token.text === ')') depth = Math.max(0, depth - 1);
-      if (depth === 0 && isIdentifierToken(token, dialect) && tokens[index + 1]?.text === '=') {
-        staticPartitionColumns.push(normalizeBareIdentifier(token.text, dialect));
-      }
-    }
-  }
-  return { targetColumns, staticPartitionColumns };
 }
 
 function typeFamily(type: string): SqlTypeFamily {
@@ -3455,44 +3616,9 @@ function isQuotedIdentifier(value: string): boolean {
     || (trimmed.startsWith('[') && trimmed.endsWith(']'));
 }
 
-function isIdentifierToken(token: SqlLexToken, dialect: SqlDialect): boolean {
-  const symbolic = token.symbolicName.toUpperCase();
-  if (symbolic.startsWith('KW_') || symbolic.includes('STRING') || symbolic.includes('NUMBER')
-    || symbolic.includes('COMMENT')) {
-    return false;
-  }
-  if (symbolic.includes('IDENTIFIER') || symbolic === 'ID') {
-    return true;
-  }
-  if (isQuotedIdentifier(token.text)) {
-    return true;
-  }
-  if (!/^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(token.text)) {
-    return false;
-  }
-  return !getSqlCatalog(dialect).keywords.includes(token.text.toUpperCase());
-}
-
 function containingScopes(scopes: readonly MutableScope[], offset: number): MutableScope[] {
   return scopes.filter((scope) => offset >= scope.start && offset <= scope.end)
     .sort((left, right) => right.depth - left.depth || (left.end - left.start) - (right.end - right.start));
-}
-
-function findMatchingToken(
-  tokens: readonly SqlLexToken[],
-  openIndex: number,
-  open: string,
-  close: string,
-): number {
-  let depth = 0;
-  for (let index = openIndex; index < tokens.length; index += 1) {
-    if (tokens[index]?.text === open) depth += 1;
-    if (tokens[index]?.text === close) {
-      depth -= 1;
-      if (depth === 0) return index;
-    }
-  }
-  return -1;
 }
 
 function tokenUpper(token: SqlLexToken | undefined): string {

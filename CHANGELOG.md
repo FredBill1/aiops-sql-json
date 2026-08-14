@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.0.7
+
+- Fixed false Spark INSERT column-count diagnostics by deriving static partition columns from the SQL AST, including INSERT OVERWRITE variants without the optional TABLE keyword.
+- Added Spark store-assignment semantics for ANSI, LEGACY, and STRICT policies, including statement-ordered SET and RESET handling, directional scalar conversions, and recursive ARRAY, MAP, and STRUCT compatibility.
+- Fixed Spark INSERT BY NAME validation to match query outputs to writable target columns by name, and stopped treating INSERT OVERWRITE DIRECTORY paths as tables while retaining source-query validation.
+- Added Spark set-operation common-type inference and propagation for compatible scalar, ARRAY, MAP, and STRUCT columns without relaxing other SQL dialects.
+
 ## 0.0.6
 
 - Removed the global typing and Backspace command overrides that could corrupt Microsoft Chinese IME composition, including after changing the document language mode.
