@@ -94,6 +94,19 @@ describe('schema file pattern variables', () => {
     expect(looseBesideAnotherWorkspace.patterns[0]?.baseLocation).toBe('C:/loose/relative');
   });
 
+  it('resolves untitled resources against their selected workspace', () => {
+    const result = resolveSchemaPatterns(['${workspaceFolder}/schema/*.sql', 'relative/*.sql'], {
+      ...windowsContext,
+      resourceLocation: 'untitled:Untitled-1',
+      resourceWorkspaceName: 'Main',
+    });
+    expect(result.patterns.map((pattern) => pattern.baseLocation)).toEqual([
+      'C:/work/main/schema',
+      'C:/work/main/relative',
+    ]);
+    expect(result.issues).toEqual([]);
+  });
+
   it('preserves local and URI roots when the wildcard starts directly beneath them', () => {
     const result = resolveSchemaPatterns([
       'C:/*.sql',

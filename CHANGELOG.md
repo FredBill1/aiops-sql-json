@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.0.8
+
+- Fixed unsaved SQL and SQL JSON documents failing to load DDL Schema files through `${workspaceFolder}` or relative globs; untitled documents now use the first workspace folder, including its resource-scoped settings.
+
 ## 0.0.7
 
 - Fixed false Spark INSERT column-count diagnostics by deriving static partition columns from the SQL AST, including INSERT OVERWRITE variants without the optional TABLE keyword.

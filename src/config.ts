@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 
 import { compileGlobs, compilePlaceholderPatterns } from './patterns';
+import { getConfigurationResource } from './resourceContext';
 import { isSqlDialect, type SqlDialect } from './sql';
 
 export const DEFAULT_SCHEMA_FILE_GLOBS = ['${workspaceFolder}/schema/*.sql'];
@@ -22,7 +23,7 @@ export interface ExtensionConfiguration {
 }
 
 export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfiguration {
-  const configuration = vscode.workspace.getConfiguration('aiopsSqlJson', resource);
+  const configuration = vscode.workspace.getConfiguration('aiopsSqlJson', getConfigurationResource(resource));
   const keyPatternSources = configuration.get<string[]>('keyPatterns', ['*Sql']).filter(isString);
   const placeholderSources = configuration.get<string[]>('placeholderPatterns', []).filter(isString);
   const schemaFileGlobs = configuration.get<string[]>('schemaFiles', DEFAULT_SCHEMA_FILE_GLOBS).filter(isNonEmptyString);

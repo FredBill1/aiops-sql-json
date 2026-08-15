@@ -8,6 +8,7 @@ import {
   type ResolvedSchemaPattern,
   type SchemaPatternContext,
 } from './schemaPatterns';
+import { getResourceWorkspaceFolder } from './resourceContext';
 import { createSchemaSnapshot, parseDdlSchema, type SchemaIssue, type SchemaSnapshot } from './sqlSchemaCore';
 
 const EMPTY_SCHEMA: SchemaSnapshot = { tables: [], issues: [] };
@@ -361,7 +362,7 @@ function positionAt(text: string, requestedOffset: number): vscode.Position {
 
 function createPatternContext(resource: vscode.Uri): SchemaPatternContext {
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
-  const resourceWorkspace = vscode.workspace.getWorkspaceFolder(resource);
+  const resourceWorkspace = getResourceWorkspaceFolder(resource);
   return {
     resourceLocation: locationFromUri(resource),
     workspaceFolders: workspaceFolders.map((folder) => ({

@@ -2,7 +2,7 @@
   "name": "aiops-sql-json",
   "displayName": "AIOps SQL JSON",
   "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "icon": "images/icon.png",
   "license": "MIT",
   "engines": {

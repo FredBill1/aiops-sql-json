@@ -453,6 +453,147 @@ suite('AIOps SQL JSON extension', () => {
     assert.ok(result.items.some((item) => completionLabel(item) === 'customer_id'));
   });
 
+  test('uses the first workspace Schema for unsaved SQL and SQL JSON documents', async () => {
+    const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+    assert.equal(workspaceFolders.length, 2, 'The integration host must use the two-folder test workspace.');
+    const firstWorkspace = workspaceFolders[0]!;
+    const secondWorkspace = workspaceFolders[1]!;
+    const firstSchemaDirectory = path.join(firstWorkspace.uri.fsPath, 'schema');
+    const secondSchemaDirectory = path.join(secondWorkspace.uri.fsPath, 'schema');
+    const firstSchemaPath = path.join(firstSchemaDirectory, 'catalog.sql');
+    await Promise.all([
+      fs.mkdir(firstSchemaDirectory, { recursive: true }),
+      fs.mkdir(secondSchemaDirectory, { recursive: true }),
+    ]);
+    await Promise.all([
+      fs.writeFile(firstSchemaPath, 'CREATE TABLE first_root_table (first_id BIGINT);', 'utf8'),
+      fs.writeFile(
+        path.join(secondSchemaDirectory, 'catalog.sql'),
+        'CREATE TABLE second_root_table (second_id BIGINT);',
+        'utf8',
+      ),
+    ]);
+
+    const firstConfiguration = vscode.workspace.getConfiguration('aiopsSqlJson', firstWorkspace.uri);
+    const secondConfiguration = vscode.workspace.getConfiguration('aiopsSqlJson', secondWorkspace.uri);
+    try {
+      for (const configuration of [firstConfiguration, secondConfiguration]) {
+        await configuration.update(
+          'schemaFiles',
+          ['${workspaceFolder}/schema/*.sql'],
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+        await configuration.update(
+          'schemaValidation.enabled',
+          true,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+      }
+
+      const sqlDocument = await vscode.workspace.openTextDocument({
+        language: 'sql',
+        content: 'SELECT f.fi FROM first_root_table f',
+      });
+      await vscode.window.showTextDocument(sqlDocument);
+      assert.equal(sqlDocument.isUntitled, true);
+      const sqlPartialOffset = sqlDocument.getText().indexOf('f.fi') + 'f.fi'.length;
+      const sqlCompletions = await waitForCompletionItems(
+        sqlDocument,
+        sqlPartialOffset,
+        (items) => items.some((item) => completionLabel(item) === 'first_id'),
+      );
+      assert.ok(sqlCompletions.some((item) => completionLabel(item) === 'first_id'));
+
+      const sqlEdit = new vscode.WorkspaceEdit();
+      const sqlPartialStart = sqlDocument.getText().indexOf('f.fi');
+      sqlEdit.replace(
+        sqlDocument.uri,
+        new vscode.Range(
+          sqlDocument.positionAt(sqlPartialStart),
+          sqlDocument.positionAt(sqlPartialStart + 'f.fi'.length),
+        ),
+        'f.first_id',
+      );
+      assert.equal(await vscode.workspace.applyEdit(sqlEdit), true);
+      assert.equal(sqlDocument.isUntitled, true);
+
+      const sqlFieldOffset = sqlDocument.getText().indexOf('first_id');
+      const sqlHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        sqlDocument.uri,
+        sqlDocument.positionAt(sqlFieldOffset),
+      );
+      assert.ok(sqlHovers.some((hover) => hoverText(hover).toUpperCase().includes('BIGINT')));
+      const sqlDefinitions = await executeDefinitions(sqlDocument, sqlFieldOffset);
+      assert.equal(sqlDefinitions.length, 1);
+      assert.equal(definitionUri(sqlDefinitions[0]!).fsPath.toLocaleLowerCase(), firstSchemaPath.toLocaleLowerCase());
+      const sqlDiagnostics = await waitForDiagnostics(
+        sqlDocument.uri,
+        (items) => !items.some((item) => item.code === 'unknown-table' || item.code === 'unknown-column'),
+      );
+      assert.ok(!sqlDiagnostics.some((item) => item.code === 'unknown-table' || item.code === 'unknown-column'));
+
+      const secondRootDocument = await vscode.workspace.openTextDocument({
+        language: 'sql',
+        content: 'SELECT second_id FROM second_root_table',
+      });
+      await vscode.window.showTextDocument(secondRootDocument);
+      assert.equal(secondRootDocument.isUntitled, true);
+      const secondRootDiagnostics = await waitForDiagnostics(
+        secondRootDocument.uri,
+        (items) => items.some((item) => item.code === 'unknown-table'),
+      );
+      assert.ok(secondRootDiagnostics.some((item) => item.code === 'unknown-table'));
+
+      const sqlJsonDocument = await vscode.workspace.openTextDocument({
+        language: 'sql-json',
+        content: '{"trainSql":"SELECT f.fi FROM first_root_table f"}',
+      });
+      await vscode.window.showTextDocument(sqlJsonDocument);
+      assert.equal(sqlJsonDocument.isUntitled, true);
+      const sqlJsonPartialOffset = sqlJsonDocument.getText().indexOf('f.fi') + 'f.fi'.length;
+      const sqlJsonCompletions = await waitForCompletionItems(
+        sqlJsonDocument,
+        sqlJsonPartialOffset,
+        (items) => items.some((item) => completionLabel(item) === 'first_id'),
+      );
+      assert.ok(sqlJsonCompletions.some((item) => completionLabel(item) === 'first_id'));
+
+      const sqlJsonEdit = new vscode.WorkspaceEdit();
+      const sqlJsonPartialStart = sqlJsonDocument.getText().indexOf('f.fi');
+      sqlJsonEdit.replace(
+        sqlJsonDocument.uri,
+        new vscode.Range(
+          sqlJsonDocument.positionAt(sqlJsonPartialStart),
+          sqlJsonDocument.positionAt(sqlJsonPartialStart + 'f.fi'.length),
+        ),
+        'f.first_id',
+      );
+      assert.equal(await vscode.workspace.applyEdit(sqlJsonEdit), true);
+      assert.equal(sqlJsonDocument.isUntitled, true);
+      const sqlJsonDiagnostics = await waitForDiagnostics(
+        sqlJsonDocument.uri,
+        (items) => !items.some((item) => item.code === 'unknown-table' || item.code === 'unknown-column'),
+      );
+      assert.ok(!sqlJsonDiagnostics.some((item) => (
+        item.code === 'unknown-table' || item.code === 'unknown-column'
+      )));
+    } finally {
+      for (const configuration of [firstConfiguration, secondConfiguration]) {
+        await configuration.update(
+          'schemaValidation.enabled',
+          undefined,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+        await configuration.update(
+          'schemaFiles',
+          undefined,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+      }
+    }
+  });
+
   test('indexes configured DDL for schema completion and strict diagnostics', async () => {
     const schemaDirectory = path.join(temporaryDirectory, 'schemas');
     await fs.mkdir(schemaDirectory, { recursive: true });
