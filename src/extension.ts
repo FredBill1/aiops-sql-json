@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 
 import { getExtensionConfiguration } from './config';
 import { DiagnosticController } from './diagnostics';
+import { SqlDocumentFormattingProvider } from './formattingProvider';
 import { SqlBracketDecorationController } from './bracketDecorations';
 import { SqlEditingCommands } from './editingCommands';
 import { SqlEditingContextService } from './editingContext';
@@ -92,6 +93,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.languages.registerDefinitionProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
       new SqlDefinitionProvider(jsonServices, schemas),
+    ),
+    vscode.languages.registerDocumentFormattingEditProvider(
+      [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
+      new SqlDocumentFormattingProvider(jsonServices),
     ),
   );
 }

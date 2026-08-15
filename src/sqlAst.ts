@@ -96,12 +96,30 @@ export function parseSqlAst(
   dialect: SqlDialect,
   placeholders: readonly RegExp[] = [],
 ): ParsedSqlAst | undefined {
+  return parseSqlAstInternal(text, dialect, placeholders, false);
+}
+
+/** Formatting accepts opaque command nodes so their lossless token stream can still be laid out. */
+export function parseSqlAstForFormatting(
+  text: string,
+  dialect: SqlDialect,
+  placeholders: readonly RegExp[] = [],
+): ParsedSqlAst | undefined {
+  return parseSqlAstInternal(text, dialect, placeholders, true);
+}
+
+function parseSqlAstInternal(
+  text: string,
+  dialect: SqlDialect,
+  placeholders: readonly RegExp[],
+  allowCommands: boolean,
+): ParsedSqlAst | undefined {
   const masked = maskPlaceholders(text, placeholders).text;
   if (/\bCREATE\s+[\p{L}_$]*\s*$/iu.test(masked)) return undefined;
   for (const parserDialect of DIALECT_CANDIDATES[dialect]) {
     try {
       const statements = parse(maskSqlingoParserGaps(masked, parserDialect), { dialect: parserDialect });
-      if (statements.some((statement) => statement instanceof CommandExpr)) continue;
+      if (!allowCommands && statements.some((statement) => statement instanceof CommandExpr)) continue;
       return {
         statements: statements.flatMap((statement) => (
           statement ? [decorateNameSpans(normalizeExpression(statement), masked)] : []

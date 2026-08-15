@@ -28,6 +28,7 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('udfs', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('dialect', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('autoClosingBrackets', undefined, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('editor').update('formatOnSave', undefined, vscode.ConfigurationTarget.Global);
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   });
 
@@ -54,6 +55,12 @@ suite('AIOps SQL JSON extension', () => {
     const completionOnly = extension.packageJSON.contributes.configuration.properties[
       'aiopsSqlJson.schemaValidation.completionOnly'
     ] as { default?: boolean; scope?: string };
+    const formatWidth = extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.format.maxLineWidth'
+    ] as { default?: number; minimum?: number };
+    const formatDepth = extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.format.maxInlineExpressionDepth'
+    ] as { default?: number; minimum?: number };
     const rebuildCommand = (extension.packageJSON.contributes.commands as Array<{
       command: string;
       enablement?: string;
@@ -63,6 +70,10 @@ suite('AIOps SQL JSON extension', () => {
     assert.deepEqual(schemaFiles.default, ['${workspaceFolder}/schema/*.sql']);
     assert.equal(completionOnly.default, false);
     assert.equal(completionOnly.scope, 'resource');
+    assert.equal(formatWidth.default, 120);
+    assert.equal(formatWidth.minimum, 20);
+    assert.equal(formatDepth.default, 4);
+    assert.equal(formatDepth.minimum, 1);
     assert.equal(rebuildCommand?.enablement, 'config.aiopsSqlJson.schemaValidation.enabled');
 
     const document = await openFile('valid.sql.json', `{
@@ -79,6 +90,58 @@ suite('AIOps SQL JSON extension', () => {
       document.uri,
     );
     assert.ok(tokens && tokens.data.length > 0, 'Embedded SQL should produce semantic tokens.');
+  });
+
+  test('formats regular SQL through the VS Code document-formatting provider', async () => {
+    const document = await openFile(
+      'format-provider.sql',
+      'select userId,sum(amount) total from sales where enabled=true and dt=$date',
+    );
+    await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
+
+    const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    assert.equal(document.getText(), [
+      'SELECT',
+      '  userId,',
+      '  SUM(amount) total',
+      'FROM sales',
+      'WHERE',
+      '  enabled = true AND dt = $date',
+    ].join(eol));
+  });
+
+  test('formats SQL JSON atomically and preserves non-SQL multiline string content', async () => {
+    const untouched = '"first line\n       second line"';
+    const document = await openFile(
+      'format-provider.sql.json',
+      `{\n"description":${untouched},\n"nested":{"trainSql":"select a,b from t"}\n}`,
+    );
+    await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
+
+    assert.ok(document.getText().includes(`"description": ${untouched}`));
+    assert.ok(document.getText().includes('"trainSql": "\n  SELECT\n    a,\n    b\n  FROM t"'));
+  });
+
+  test('participates in the VS Code format-on-save pipeline', async () => {
+    await vscode.workspace.getConfiguration('editor').update(
+      'formatOnSave',
+      true,
+      vscode.ConfigurationTarget.Global,
+    );
+    const document = await openFile('format-on-save.sql', 'select a,b from source_table');
+    const edit = new vscode.WorkspaceEdit();
+    edit.insert(document.uri, document.positionAt(document.getText().length), ' where enabled=true');
+    assert.equal(await vscode.workspace.applyEdit(edit), true);
+    assert.equal(await document.save(), true);
+
+    assert.ok(document.getText().startsWith('SELECT'));
+    assert.ok(document.getText().includes('FROM source_table'));
+    assert.ok(document.getText().includes('WHERE'));
+    await vscode.workspace.getConfiguration('editor').update(
+      'formatOnSave',
+      undefined,
+      vscode.ConfigurationTarget.Global,
+    );
   });
 
   test('allows multiline non-SQL strings by default and can restore the restricted behavior', async () => {
@@ -375,13 +438,24 @@ suite('AIOps SQL JSON extension', () => {
       false,
       vscode.ConfigurationTarget.Global,
     );
-    const disabledDiagnostics = await waitForDiagnostics(document.uri, (items) => items.length === 0);
-    assert.equal(disabledDiagnostics.length, 0);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
-      'plainSql.enabled',
-      undefined,
-      vscode.ConfigurationTarget.Global,
-    );
+    try {
+      const disabledDiagnostics = await waitForDiagnostics(document.uri, (items) => items.length === 0);
+      assert.equal(disabledDiagnostics.length, 0);
+      const disabledFormattingDocument = await openFile('disabled-formatting.sql', 'select a,b from source_table');
+      const edits = await vscode.commands.executeCommand<vscode.TextEdit[] | undefined>(
+        'vscode.executeFormatDocumentProvider',
+        disabledFormattingDocument.uri,
+        { tabSize: 2, insertSpaces: true },
+      );
+      assert.equal(edits?.length ?? 0, 0);
+      assert.equal(disabledFormattingDocument.getText(), 'select a,b from source_table');
+    } finally {
+      await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+        'plainSql.enabled',
+        undefined,
+        vscode.ConfigurationTarget.Global,
+      );
+    }
   });
 
   test('completes dialect keywords, functions, and fields seen in the current file', async () => {
@@ -1598,6 +1672,21 @@ SELECT id, amount FROM local_orders;`,
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
     await vscode.window.showTextDocument(document);
     return document;
+  }
+
+  async function applyDocumentFormatting(
+    document: vscode.TextDocument,
+    options: vscode.FormattingOptions,
+  ): Promise<void> {
+    const edits = await vscode.commands.executeCommand<vscode.TextEdit[]>(
+      'vscode.executeFormatDocumentProvider',
+      document.uri,
+      options,
+    );
+    assert.ok(edits.length > 0, 'The extension should return a document-formatting edit.');
+    const workspaceEdit = new vscode.WorkspaceEdit();
+    workspaceEdit.set(document.uri, edits);
+    assert.equal(await vscode.workspace.applyEdit(workspaceEdit), true);
   }
 
   async function executeDefinitions(

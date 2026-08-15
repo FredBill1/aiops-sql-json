@@ -2,7 +2,7 @@
   "name": "aiops-sql-json",
   "displayName": "AIOps SQL JSON",
   "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "icon": "images/icon.png",
   "license": "MIT",
   "engines": {
@@ -206,6 +206,127 @@
           "default": true,
           "scope": "resource",
           "markdownDescription": "Whether placeholder patterns may appear in strings, unquoted property keys, and bare JSON tokens throughout `.sql.json` files. When disabled, placeholders are masked only while validating recognized SQL strings and regular `.sql` files."
+        },
+        "aiopsSqlJson.format.maxLineWidth": {
+          "type": "integer",
+          "minimum": 20,
+          "default": 120,
+          "scope": "resource",
+          "markdownDescription": "Maximum visual line width for formatted SQL. In SQL JSON documents the embedded SQL base indentation and closing JSON punctuation count toward the limit. A single indivisible token may exceed it."
+        },
+        "aiopsSqlJson.format.maxInlineExpressionDepth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 4,
+          "scope": "resource",
+          "markdownDescription": "Maximum number of nested non-leaf SQL AST expressions that may remain on one line."
+        },
+        "aiopsSqlJson.format.structuralParenthesisPosition": {
+          "type": "string",
+          "enum": [
+            "sameLine",
+            "newLine"
+          ],
+          "default": "sameLine",
+          "scope": "resource",
+          "markdownDescription": "Placement of opening parentheses for CTEs, subqueries, `CREATE TABLE` schemas, and `INSERT` target column lists. These structures are always expanded."
+        },
+        "aiopsSqlJson.format.statementListLayout": {
+          "type": "string",
+          "enum": [
+            "onePerLine",
+            "fit"
+          ],
+          "default": "onePerLine",
+          "scope": "resource",
+          "markdownDescription": "Whether statement-level lists such as SELECT projections, CTEs, GROUP/ORDER BY expressions, table columns, and INSERT target columns use one item per line or fit within the configured limits."
+        },
+        "aiopsSqlJson.format.sqlJson.baseIndent": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "enum": [
+                "auto"
+              ]
+            }
+          ],
+          "default": 1,
+          "scope": "resource",
+          "markdownDescription": "Base indentation of embedded SQL. A number is measured in `editor.tabSize` levels; `auto` indents one level deeper than the containing JSON property."
+        },
+        "aiopsSqlJson.format.keywordCase": {
+          "type": "string",
+          "enum": [
+            "preserve",
+            "upper",
+            "lower"
+          ],
+          "default": "upper",
+          "scope": "resource",
+          "markdownDescription": "Casing of unquoted SQL keywords during formatting."
+        },
+        "aiopsSqlJson.format.functionCase": {
+          "type": "string",
+          "enum": [
+            "preserve",
+            "upper",
+            "lower"
+          ],
+          "default": "upper",
+          "scope": "resource",
+          "markdownDescription": "Casing of unquoted SQL function names during formatting."
+        },
+        "aiopsSqlJson.format.dataTypeCase": {
+          "type": "string",
+          "enum": [
+            "preserve",
+            "upper",
+            "lower"
+          ],
+          "default": "upper",
+          "scope": "resource",
+          "markdownDescription": "Casing of unquoted SQL data type names during formatting."
+        },
+        "aiopsSqlJson.format.commaPosition": {
+          "type": "string",
+          "enum": [
+            "trailing",
+            "leading"
+          ],
+          "default": "trailing",
+          "scope": "resource",
+          "markdownDescription": "Comma placement in expanded SQL lists."
+        },
+        "aiopsSqlJson.format.logicalOperatorPosition": {
+          "type": "string",
+          "enum": [
+            "before",
+            "after"
+          ],
+          "default": "before",
+          "scope": "resource",
+          "markdownDescription": "Placement of AND, OR, and XOR when a logical expression is split across lines."
+        },
+        "aiopsSqlJson.format.semicolonPosition": {
+          "type": "string",
+          "enum": [
+            "sameLine",
+            "newLine"
+          ],
+          "default": "sameLine",
+          "scope": "resource",
+          "markdownDescription": "Placement of SQL statement terminators."
+        },
+        "aiopsSqlJson.format.blankLinesBetweenStatements": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1,
+          "scope": "resource",
+          "markdownDescription": "Number of blank lines between formatted SQL statements."
         }
       }
     }

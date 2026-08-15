@@ -18,6 +18,8 @@ A VS Code extension for AIOps Spark job configurations. It lets strings in `*.sq
 - Optionally builds an offline Schema from workspace DDL and strictly checks table, column, function, projection-count, and safely inferable type references.
 - Provides AST-based SQL Hover and Go to Definition for local query symbols, plus cross-file DDL navigation when the offline Schema is enabled.
 - Warns when unindented continuation lines concatenate SQL words or when `--` comments cross physical lines.
+- Formats regular SQL and complete SQL JSON documents with dialect-aware, token-preserving layout rules.
+- Formats JSON structure while preserving non-SQL multiline string contents exactly, and places every recognized SQL block on the line after its opening double quote.
 
 ## Installation
 
@@ -73,6 +75,18 @@ For the same reason, an SQL `--` comment does not end at the visible line bounda
 | `aiopsSqlJson.udfs` | `[]` | Simple or qualified UDF names offered by completion and accepted by Schema validation. |
 | `aiopsSqlJson.placeholderPatterns` | `["\\$\\{[^}]+\\}", "\\$\\w+"]` | Regular expression sources for template placeholders that should be masked with equal-length text before parsing. |
 | `aiopsSqlJson.placeholders.allowEverywhere` | `true` | Accepts matching placeholders in strings, unquoted property keys, and bare JSON tokens throughout SQL JSON documents. |
+| `aiopsSqlJson.format.maxLineWidth` | `120` | Maximum visual SQL line width; embedded SQL indentation and closing JSON punctuation count toward it. |
+| `aiopsSqlJson.format.maxInlineExpressionDepth` | `4` | Maximum nested non-leaf AST expression depth allowed on one line. |
+| `aiopsSqlJson.format.structuralParenthesisPosition` | `"sameLine"` | Places opening parentheses for CTEs, subqueries, CREATE TABLE schemas, and INSERT target columns on the same or next line. |
+| `aiopsSqlJson.format.statementListLayout` | `"onePerLine"` | Uses one item per line or width-aware fitting for statement-level lists. |
+| `aiopsSqlJson.format.sqlJson.baseIndent` | `1` | Embedded SQL base indentation in `editor.tabSize` levels, or `"auto"` for one level deeper than the JSON property. |
+| `aiopsSqlJson.format.keywordCase` | `"upper"` | Preserves, uppercases, or lowercases unquoted SQL keywords. |
+| `aiopsSqlJson.format.functionCase` | `"upper"` | Preserves, uppercases, or lowercases unquoted SQL function names. |
+| `aiopsSqlJson.format.dataTypeCase` | `"upper"` | Preserves, uppercases, or lowercases unquoted SQL data types. |
+| `aiopsSqlJson.format.commaPosition` | `"trailing"` | Uses trailing or leading commas in expanded lists. |
+| `aiopsSqlJson.format.logicalOperatorPosition` | `"before"` | Places split logical operators before or after the line break. |
+| `aiopsSqlJson.format.semicolonPosition` | `"sameLine"` | Keeps semicolons on the statement line or puts them on a new line. |
+| `aiopsSqlJson.format.blankLinesBetweenStatements` | `1` | Blank lines inserted between statements. |
 
 Example workspace settings:
 
@@ -91,7 +105,12 @@ Example workspace settings:
     "\\$\\{[^}]+\\}",
     "#\\{[^}]+\\}",
     "\\{\\{[\\s\\S]+?\\}\\}"
-  ]
+  ],
+  "aiopsSqlJson.format.maxLineWidth": 120,
+  "aiopsSqlJson.format.maxInlineExpressionDepth": 4,
+  "aiopsSqlJson.format.structuralParenthesisPosition": "sameLine",
+  "aiopsSqlJson.format.statementListLayout": "onePerLine",
+  "aiopsSqlJson.format.sqlJson.baseIndent": 1
 }
 ```
 
@@ -149,6 +168,26 @@ When `editor.bracketPairColorization.enabled` is enabled, recognized SQL bracket
 
 SQL highlighting, diagnostics, matching-bracket decoration, navigation, and comments still use regions computed dynamically from `aiopsSqlJson.keyPatterns`, so changing the setting takes effect without reloading VS Code. Pair editing is intentionally file-wide and independent of those regions. VS Code does not expose a way to assign a native embedded-language ID to dynamically computed ranges; native bracket guide lines and automatic integration with unrelated SQL extensions therefore remain unavailable inside `.sql.json` strings.
 
+## Formatting SQL and SQL JSON
+
+Use **Format Document** or enable `editor.formatOnSave` for `sql` and `sql-json` documents. Formatting is document-wide and atomic; selection and on-type formatting are not provided. If JSON or any recognized SQL property cannot be parsed and verified, the extension leaves the complete document unchanged and reports the first failure.
+
+The SQL formatter reads the configured dialect AST for structure but emits the original token stream. Identifiers, literals, comments, operators, and configured placeholders are therefore preserved; only whitespace and explicitly configured keyword/function/type casing may change. CTEs, subqueries, CREATE TABLE schemas, and INSERT target-column lists are always expanded. General expressions remain inline only when both the line-width and AST-depth limits allow it.
+
+SQL JSON formatting also normalizes object and array indentation. All non-SQL JSON strings are protected as original source fragments, so existing multiline contents and escapes remain unchanged. Recognized SQL values are rendered as follows:
+
+```json
+{
+  "trainSql": "
+  SELECT
+    user_id,
+    SUM(amount) AS total
+  FROM source_table"
+}
+```
+
+The default fixed SQL base indent is one `editor.tabSize` level regardless of JSON depth. Set `aiopsSqlJson.format.sqlJson.baseIndent` to `"auto"` to indent one level deeper than the containing property. Placeholder matches are masked before parsing and restored byte-for-byte after layout, so custom placeholder syntax is never passed directly to the formatter.
+
 ## JSON Schema
 
 The extension supports `$schema` declarations in files and existing `json.schemas` settings:
@@ -166,7 +205,7 @@ The extension supports `$schema` declarations in files and existing `json.schema
 
 Inline schemas, local and relative schemas, HTTP(S) schemas, and schemas contributed by other extensions through `jsonValidation` are supported. Remote downloads respect `json.schemaDownload.enable` and are disabled in untrusted workspaces.
 
-JSON Schema completion and hover information are suppressed inside recognized SQL strings. The extension does not format `.sql.json` files, preventing formatting from damaging the platform-specific multiline-string representation.
+JSON Schema completion and hover information are suppressed inside recognized SQL strings. SQL JSON formatting uses the same platform projection and protected-string reconstruction as validation, so platform-specific multiline strings remain supported.
 
 ## Development and verification
 

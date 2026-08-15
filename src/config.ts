@@ -6,6 +6,29 @@ import { isSqlDialect, type SqlDialect } from './sql';
 
 export const DEFAULT_SCHEMA_FILE_GLOBS = ['${workspaceFolder}/schema/*.sql'];
 
+export type FormatCase = 'preserve' | 'upper' | 'lower';
+export type StructuralParenthesisPosition = 'sameLine' | 'newLine';
+export type StatementListLayout = 'onePerLine' | 'fit';
+export type CommaPosition = 'trailing' | 'leading';
+export type LogicalOperatorPosition = 'before' | 'after';
+export type SemicolonPosition = 'sameLine' | 'newLine';
+export type SqlJsonBaseIndent = number | 'auto';
+
+export interface SqlFormatConfiguration {
+  maxLineWidth: number;
+  maxInlineExpressionDepth: number;
+  structuralParenthesisPosition: StructuralParenthesisPosition;
+  statementListLayout: StatementListLayout;
+  sqlJsonBaseIndent: SqlJsonBaseIndent;
+  keywordCase: FormatCase;
+  functionCase: FormatCase;
+  dataTypeCase: FormatCase;
+  commaPosition: CommaPosition;
+  logicalOperatorPosition: LogicalOperatorPosition;
+  semicolonPosition: SemicolonPosition;
+  blankLinesBetweenStatements: number;
+}
+
 export interface ExtensionConfiguration {
   keyPatternSources: string[];
   keyPatterns: RegExp[];
@@ -20,6 +43,7 @@ export interface ExtensionConfiguration {
   placeholderPatterns: RegExp[];
   placeholderIssues: string[];
   allowPlaceholdersEverywhere: boolean;
+  format: SqlFormatConfiguration;
 }
 
 export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfiguration {
@@ -44,6 +68,48 @@ export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfig
     placeholderPatterns: placeholders.patterns,
     placeholderIssues: placeholders.issues,
     allowPlaceholdersEverywhere: configuration.get<boolean>('placeholders.allowEverywhere', true),
+    format: {
+      maxLineWidth: integerAtLeast(configuration.get<unknown>('format.maxLineWidth'), 120, 20),
+      maxInlineExpressionDepth: integerAtLeast(
+        configuration.get<unknown>('format.maxInlineExpressionDepth'),
+        4,
+        1,
+      ),
+      structuralParenthesisPosition: enumValue(
+        configuration.get<unknown>('format.structuralParenthesisPosition'),
+        ['sameLine', 'newLine'] as const,
+        'sameLine',
+      ),
+      statementListLayout: enumValue(
+        configuration.get<unknown>('format.statementListLayout'),
+        ['onePerLine', 'fit'] as const,
+        'onePerLine',
+      ),
+      sqlJsonBaseIndent: sqlJsonBaseIndent(configuration.get<unknown>('format.sqlJson.baseIndent')),
+      keywordCase: formatCase(configuration.get<unknown>('format.keywordCase'), 'upper'),
+      functionCase: formatCase(configuration.get<unknown>('format.functionCase'), 'upper'),
+      dataTypeCase: formatCase(configuration.get<unknown>('format.dataTypeCase'), 'upper'),
+      commaPosition: enumValue(
+        configuration.get<unknown>('format.commaPosition'),
+        ['trailing', 'leading'] as const,
+        'trailing',
+      ),
+      logicalOperatorPosition: enumValue(
+        configuration.get<unknown>('format.logicalOperatorPosition'),
+        ['before', 'after'] as const,
+        'before',
+      ),
+      semicolonPosition: enumValue(
+        configuration.get<unknown>('format.semicolonPosition'),
+        ['sameLine', 'newLine'] as const,
+        'sameLine',
+      ),
+      blankLinesBetweenStatements: integerAtLeast(
+        configuration.get<unknown>('format.blankLinesBetweenStatements'),
+        1,
+        0,
+      ),
+    },
   };
 }
 
@@ -59,7 +125,29 @@ export function configurationSignature(configuration: ExtensionConfiguration): s
     udfs: configuration.udfs,
     placeholders: configuration.placeholderSources,
     placeholdersEverywhere: configuration.allowPlaceholdersEverywhere,
+    format: configuration.format,
   });
+}
+
+function formatCase(value: unknown, fallback: FormatCase): FormatCase {
+  return enumValue(value, ['preserve', 'upper', 'lower'] as const, fallback);
+}
+
+function enumValue<const T extends string>(value: unknown, values: readonly T[], fallback: T): T {
+  return typeof value === 'string' && (values as readonly string[]).includes(value)
+    ? value as T
+    : fallback;
+}
+
+function integerAtLeast(value: unknown, fallback: number, minimum: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= minimum ? value : fallback;
+}
+
+function sqlJsonBaseIndent(value: unknown): SqlJsonBaseIndent {
+  if (value === 'auto') {
+    return value;
+  }
+  return integerAtLeast(value, 1, 1);
 }
 
 function isString(value: unknown): value is string {

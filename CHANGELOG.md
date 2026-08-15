@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.0.9
+
+- Added atomic document formatting for regular SQL and SQL JSON, with dialect-aware token preservation, configurable line width, AST inline depth, structural parentheses, statement lists, casing, commas, logical operators, semicolons, and statement spacing.
+- Added SQL JSON structure formatting with fixed or JSON-depth-aware embedded SQL indentation, next-line SQL opening layout, exact preservation of non-SQL multiline strings, and protected placeholder round trips.
+- Added format-time AST and significant-token equivalence checks so a failure in any JSON or SQL region leaves the whole document unchanged.
+
 ## 0.0.8
 
 - Fixed unsaved SQL and SQL JSON documents failing to load DDL Schema files through `${workspaceFolder}` or relative globs; untitled documents now use the first workspace folder, including its resource-scoped settings.
