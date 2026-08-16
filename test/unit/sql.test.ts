@@ -37,6 +37,24 @@ describe('SQL analysis', () => {
     expect(issues.some((issue) => issue.message.includes('relation after FROM'))).toBe(true);
   });
 
+  it.each(SQL_DIALECTS)('reports incomplete CASE expressions once for %s SQL', (dialect) => {
+    for (const sql of ['select case', 'select case when']) {
+      const issues = analyzeSql(sql, dialect, []).issues;
+      expect(issues, sql).toHaveLength(1);
+    }
+  });
+
+  it.each(SQL_DIALECTS)('accepts searched, simple, and nested CASE expressions for %s SQL', (dialect) => {
+    const statements = [
+      'SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END;',
+      'SELECT CASE value WHEN 1 THEN 1 ELSE 0 END FROM source_table;',
+      'SELECT CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 2 END ELSE 0 END;',
+    ];
+    for (const sql of statements) {
+      expect(analyzeSql(sql, dialect, []).issues, sql).toEqual([]);
+    }
+  });
+
   it('does not confuse valid boolean and quoted-identifier syntax with structural gaps', () => {
     const sql = 'SELECT * FROM `where` WHERE value BETWEEN 1 AND 2 AND enabled = true';
     expect(analyzeSql(sql, 'spark', []).issues).toEqual([]);

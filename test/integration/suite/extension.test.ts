@@ -27,6 +27,7 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaFiles', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('udfs', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update('dialect', undefined, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update('format.caseLayout', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('autoClosingBrackets', undefined, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('formatOnSave', undefined, vscode.ConfigurationTarget.Global);
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
@@ -61,6 +62,9 @@ suite('AIOps SQL JSON extension', () => {
     const formatDepth = extension.packageJSON.contributes.configuration.properties[
       'aiopsSqlJson.format.maxInlineExpressionDepth'
     ] as { default?: number; minimum?: number };
+    const caseLayout = extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.format.caseLayout'
+    ] as { default?: string; enum?: string[]; scope?: string };
     const rebuildCommand = (extension.packageJSON.contributes.commands as Array<{
       command: string;
       enablement?: string;
@@ -74,6 +78,9 @@ suite('AIOps SQL JSON extension', () => {
     assert.equal(formatWidth.minimum, 20);
     assert.equal(formatDepth.default, 4);
     assert.equal(formatDepth.minimum, 1);
+    assert.equal(caseLayout.default, 'auto');
+    assert.deepEqual(caseLayout.enum, ['auto', 'expanded']);
+    assert.equal(caseLayout.scope, 'resource');
     assert.equal(rebuildCommand?.enablement, 'config.aiopsSqlJson.schemaValidation.enabled');
 
     const document = await openFile('valid.sql.json', `{
@@ -108,6 +115,49 @@ suite('AIOps SQL JSON extension', () => {
       'WHERE',
       '  enabled = true AND dt = $date',
     ].join(eol));
+  });
+
+  test('reports incomplete CASE expressions in regular SQL documents', async () => {
+    for (const [name, sql] of [
+      ['incomplete-case.sql', 'select case'],
+      ['incomplete-case-when.sql', 'select case when'],
+    ] as const) {
+      const document = await openFile(name, sql);
+      const diagnostics = await waitForDiagnostics(
+        document.uri,
+        (items) => items.some((diagnostic) => diagnostic.source === 'spark SQL'),
+      );
+      assert.equal(diagnostics.filter((diagnostic) => diagnostic.source === 'spark SQL').length, 1);
+    }
+  });
+
+  test('honors the always-expanded CASE layout through the formatting provider', async () => {
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'format.caseLayout',
+      'expanded',
+      vscode.ConfigurationTarget.Global,
+    );
+    try {
+      const document = await openFile(
+        'expanded-case-format.sql',
+        'select case when flag=1 then a else b end as result',
+      );
+      await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
+      const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+      assert.equal(document.getText(), [
+        'SELECT',
+        '  CASE',
+        '    WHEN flag = 1 THEN a',
+        '    ELSE b',
+        '  END AS result',
+      ].join(eol));
+    } finally {
+      await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+        'format.caseLayout',
+        undefined,
+        vscode.ConfigurationTarget.Global,
+      );
+    }
   });
 
   test('formats SQL JSON atomically and preserves non-SQL multiline string content', async () => {

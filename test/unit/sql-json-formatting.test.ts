@@ -13,6 +13,7 @@ import { formatSqlJson } from '../../src/sqlJsonFormatting';
 const format: SqlFormatConfiguration = {
   maxLineWidth: 120,
   maxInlineExpressionDepth: 4,
+  caseLayout: 'auto',
   structuralParenthesisPosition: 'sameLine',
   statementListLayout: 'onePerLine',
   sqlJsonBaseIndent: 1,
@@ -65,6 +66,18 @@ describe('SQL JSON formatting', () => {
     );
 
     expect(result).toContain('"querySql": "\n      SELECT');
+  });
+
+  it('counts embedded SQL indentation when deciding whether to expand a CASE expression', () => {
+    const source = '{"trainSql":"select case when alpha=1 then one when beta=2 then two else fallback end as result"}';
+    const result = formatSqlJson(
+      project(source),
+      { ...configuration, format: { ...format, maxLineWidth: 70 } },
+      { tabSize: 2, insertSpaces: true, eol: '\n' },
+    );
+
+    expect(result).toContain('    CASE\n      WHEN alpha = 1 THEN one');
+    expect(result).toContain('\n    END AS result"');
   });
 
   it('preserves bare JSON placeholders while formatting the surrounding object', () => {

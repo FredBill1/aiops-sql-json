@@ -45,6 +45,11 @@ export interface SqlAnalysis {
   tokens: SqlToken[];
 }
 
+interface StructuralSqlIssue extends SqlIssue {
+  contextStart?: number;
+  contextEnd?: number;
+}
+
 export interface ParserLike {
   parse(input: string): ParserRuleContext;
   validate(input: string): ParseError[];
@@ -98,9 +103,9 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
   const parserIssues = errors.length > 0 && !hasUnmaskedTemplate && sqlingoCanParse(text, dialect, placeholders)
     ? []
     : errors.map((error) => parseErrorToIssue(text, error));
-  const structuralIssues = findStructuralIssues(antlrTokens).filter((issue) => (
-    !parserIssues.some((parserIssue) => rangesOverlap(issue, parserIssue))
-  ));
+  const structuralIssues = findStructuralIssues(antlrTokens)
+    .filter((issue) => !parserIssues.some((parserIssue) => parserIssueCoversStructuralIssue(parserIssue, issue)))
+    .map(stripStructuralContext);
   const issues = deduplicateIssues([...parserIssues, ...structuralIssues]);
   const tokens = antlrTokens.flatMap((token, index) => {
     if (token.start < 0 || token.stop < token.start) {
@@ -190,9 +195,9 @@ export function offsetToCaret(text: string, offset: number): CaretPosition {
   return { lineNumber, column };
 }
 
-function findStructuralIssues(tokens: readonly Token[]): SqlIssue[] {
+function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
   const significant = tokens.filter((token) => token.channel === 0 && token.start >= 0 && token.stop >= token.start);
-  const issues: SqlIssue[] = [];
+  const issues: StructuralSqlIssue[] = [];
   const seen = new Set<string>();
   const relationBoundaries = new Set([
     'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
@@ -233,6 +238,164 @@ function findStructuralIssues(tokens: readonly Token[]): SqlIssue[] {
       appendStructuralIssue(issues, seen, token, `Boolean operator ${current} is missing an operand.`);
     }
   }
+  return [...issues, ...findCaseStructuralIssues(significant)];
+}
+
+interface CaseDiagnosticState {
+  caseToken: Token;
+  stage: 'before-when' | 'when-condition' | 'then-result' | 'else-result';
+  content: boolean;
+  pendingToken: Token;
+  firstProblem?: { token: Token; message: string };
+}
+
+function findCaseStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
+  const issues: StructuralSqlIssue[] = [];
+  const stack: CaseDiagnosticState[] = [];
+  const documentEnd = tokens.at(-1)?.stop !== undefined ? tokens.at(-1)!.stop + 1 : 0;
+
+  const rememberProblem = (state: CaseDiagnosticState, token: Token, message: string): void => {
+    state.firstProblem ??= { token, message };
+  };
+
+  const finishCase = (state: CaseDiagnosticState, end: number, closed: boolean): void => {
+    if (!state.firstProblem) {
+      switch (state.stage) {
+        case 'before-when':
+          rememberProblem(state, state.caseToken, 'Expected at least one WHEN branch in CASE expression.');
+          break;
+        case 'when-condition':
+          rememberProblem(
+            state,
+            state.pendingToken,
+            state.content
+              ? 'Expected THEN after the CASE WHEN condition.'
+              : 'Expected an expression after CASE WHEN.',
+          );
+          break;
+        case 'then-result':
+          if (!state.content) {
+            rememberProblem(state, state.pendingToken, 'Expected an expression after CASE THEN.');
+          } else if (!closed) {
+            rememberProblem(state, state.caseToken, 'Expected END to close the CASE expression.');
+          }
+          break;
+        case 'else-result':
+          if (!state.content) {
+            rememberProblem(state, state.pendingToken, 'Expected an expression after CASE ELSE.');
+          } else if (!closed) {
+            rememberProblem(state, state.caseToken, 'Expected END to close the CASE expression.');
+          }
+          break;
+      }
+    }
+    const problem = state.firstProblem;
+    if (problem) {
+      issues.push({
+        start: problem.token.start,
+        end: problem.token.stop + 1,
+        message: problem.message,
+        contextStart: state.caseToken.start,
+        contextEnd: end,
+      });
+    }
+  };
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    const current = structuralTokenName(token);
+    const previous = tokens[index - 1] ? structuralTokenName(tokens[index - 1]!) : undefined;
+    if (current === 'CASE' && previous !== 'END') {
+      const parent = stack.at(-1);
+      if (parent) parent.content = true;
+      stack.push({
+        caseToken: token,
+        stage: 'before-when',
+        content: false,
+        pendingToken: token,
+      });
+      continue;
+    }
+
+    const state = stack.at(-1);
+    if (!state) continue;
+
+    if (current === 'END') {
+      stack.pop();
+      finishCase(state, token.stop + 1, true);
+      const parent = stack.at(-1);
+      if (parent) parent.content = true;
+      continue;
+    }
+
+    if (current === 'WHEN') {
+      if (state.stage === 'before-when') {
+        state.stage = 'when-condition';
+        state.content = false;
+        state.pendingToken = token;
+      } else if (state.stage === 'then-result') {
+        if (!state.content) {
+          rememberProblem(state, state.pendingToken, 'Expected an expression after CASE THEN.');
+        }
+        state.stage = 'when-condition';
+        state.content = false;
+        state.pendingToken = token;
+      } else if (state.stage === 'when-condition') {
+        rememberProblem(
+          state,
+          state.pendingToken,
+          state.content
+            ? 'Expected THEN after the CASE WHEN condition.'
+            : 'Expected an expression after CASE WHEN.',
+        );
+        state.content = false;
+        state.pendingToken = token;
+      } else {
+        rememberProblem(state, token, 'WHEN cannot appear after ELSE in a CASE expression.');
+      }
+      continue;
+    }
+
+    if (current === 'THEN' && state.stage === 'when-condition') {
+      if (!state.content) {
+        rememberProblem(state, state.pendingToken, 'Expected an expression after CASE WHEN.');
+      }
+      state.stage = 'then-result';
+      state.content = false;
+      state.pendingToken = token;
+      continue;
+    }
+
+    if (current === 'ELSE') {
+      if (state.stage === 'then-result') {
+        if (!state.content) {
+          rememberProblem(state, state.pendingToken, 'Expected an expression after CASE THEN.');
+        }
+      } else if (state.stage === 'before-when') {
+        rememberProblem(state, token, 'Expected at least one WHEN branch before CASE ELSE.');
+      } else if (state.stage === 'when-condition') {
+        rememberProblem(
+          state,
+          state.pendingToken,
+          state.content
+            ? 'Expected THEN after the CASE WHEN condition.'
+            : 'Expected an expression after CASE WHEN.',
+        );
+      } else {
+        rememberProblem(state, token, 'CASE expression contains more than one ELSE branch.');
+      }
+      state.stage = 'else-result';
+      state.content = false;
+      state.pendingToken = token;
+      continue;
+    }
+
+    state.content = true;
+  }
+
+  while (stack.length > 0) {
+    finishCase(stack.pop()!, documentEnd, false);
+  }
   return issues;
 }
 
@@ -245,7 +408,7 @@ function structuralTokenName(token: Token): string {
 }
 
 function appendStructuralIssue(
-  issues: SqlIssue[],
+  issues: StructuralSqlIssue[],
   seen: Set<string>,
   token: Token,
   message: string,
@@ -261,6 +424,18 @@ function appendStructuralIssue(
 
 function rangesOverlap(left: SqlIssue, right: SqlIssue): boolean {
   return left.start < right.end && right.start < left.end;
+}
+
+function parserIssueCoversStructuralIssue(parserIssue: SqlIssue, structuralIssue: StructuralSqlIssue): boolean {
+  if (rangesOverlap(parserIssue, structuralIssue)) return true;
+  return structuralIssue.contextStart !== undefined
+    && structuralIssue.contextEnd !== undefined
+    && parserIssue.start >= structuralIssue.contextStart
+    && parserIssue.start <= structuralIssue.contextEnd;
+}
+
+function stripStructuralContext(issue: StructuralSqlIssue): SqlIssue {
+  return { start: issue.start, end: issue.end, message: issue.message };
 }
 
 export function lineColumnToOffset(text: string, oneBasedLine: number, oneBasedColumn: number): number {

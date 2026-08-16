@@ -55,6 +55,19 @@ interface ParenthesisContext {
   clauseListBefore: boolean;
 }
 
+interface CasePair {
+  open: number;
+  close: number;
+  relativeExpressionDepth: number;
+  hasLineComment: boolean;
+}
+
+interface CaseContext {
+  pair: CasePair;
+  indentBefore: number;
+  expanded: boolean;
+}
+
 const DATA_TYPES = new Set([
   'ARRAY', 'BIGINT', 'BINARY', 'BOOLEAN', 'BYTE', 'CHAR', 'DATE', 'DATETIME', 'DECIMAL', 'DOUBLE',
   'FLOAT', 'INT', 'INTEGER', 'INTERVAL', 'JSON', 'MAP', 'NUMERIC', 'REAL', 'ROW', 'SMALLINT',
@@ -100,7 +113,8 @@ export function formatSql(
   }
   annotateExpressionDepth(tokens, parsed.statements);
   const pairs = pairParentheses(tokens, configuration, editor);
-  const builder = new SqlLayoutBuilder(configuration, editor, tokens, pairs);
+  const cases = pairCases(tokens);
+  const builder = new SqlLayoutBuilder(configuration, editor, tokens, pairs, cases);
   const lines = builder.format();
   const output = lines.map((line) => line.text).join(editor.eol);
   verifyTokenEquivalence(text, output, dialect, placeholders, configuration);
@@ -325,11 +339,50 @@ function identifyStructuralParentheses(
   return structural;
 }
 
+function pairCases(tokens: readonly FormattingToken[]): Map<number, CasePair> {
+  const result = new Map<number, CasePair>();
+  const stack: number[] = [];
+  const rawPairs: Array<{ open: number; close: number }> = [];
+  let previousUpper: string | undefined;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.protected) {
+      previousUpper = undefined;
+      continue;
+    }
+    if (token.kind === 'comment') continue;
+    if (token.upper === 'CASE' && previousUpper !== 'END') {
+      stack.push(index);
+    } else if (token.upper === 'END' && stack.length > 0) {
+      rawPairs.push({ open: stack.pop()!, close: index });
+    }
+    previousUpper = token.upper;
+  }
+  if (stack.length > 0) throw new SqlFormattingError('Unclosed CASE expression.');
+
+  for (const raw of rawPairs) {
+    const caseTokens = tokens.slice(raw.open, raw.close + 1);
+    const baseDepth = tokens[raw.open]?.expressionDepth ?? 0;
+    const maxDepth = Math.max(...caseTokens.map((token) => token.expressionDepth), baseDepth);
+    const pair: CasePair = {
+      ...raw,
+      relativeExpressionDepth: Math.max(0, maxDepth - baseDepth),
+      hasLineComment: caseTokens.some((token) => (
+        token.kind === 'comment' && token.raw.trimStart().startsWith('--')
+      )),
+    };
+    result.set(raw.open, pair);
+    result.set(raw.close, pair);
+  }
+  return result;
+}
+
 class SqlLayoutBuilder {
   private readonly lines: FormattedSqlLine[] = [];
   private current = '';
   private indent = 0;
   private contexts: ParenthesisContext[] = [];
+  private caseContexts: CaseContext[] = [];
   private clauseList = false;
 
   constructor(
@@ -337,6 +390,7 @@ class SqlLayoutBuilder {
     private readonly editor: EditorFormattingOptions,
     private readonly tokens: readonly FormattingToken[],
     private readonly pairs: ReadonlyMap<number, ParenthesisPair>,
+    private readonly cases: ReadonlyMap<number, CasePair>,
   ) {}
 
   format(): FormattedSqlLine[] {
@@ -348,7 +402,16 @@ class SqlLayoutBuilder {
         index += phrase.length - 1;
         continue;
       }
-      if (token.raw === '(' && !token.protected) {
+      const casePair = this.cases.get(index);
+      if (token.upper === 'CASE' && !token.protected && casePair?.open === index) {
+        this.openCase(index, token, casePair);
+      } else if (token.upper === 'WHEN' && !token.protected && this.caseContexts.length > 0) {
+        this.caseBranch(token);
+      } else if (token.upper === 'ELSE' && !token.protected && this.caseContexts.length > 0) {
+        this.caseBranch(token);
+      } else if (token.upper === 'END' && !token.protected && casePair?.close === index) {
+        this.closeCase(index, token, casePair);
+      } else if (token.raw === '(' && !token.protected) {
         this.openParenthesis(index, token);
       } else if (token.raw === ')' && !token.protected) {
         this.closeParenthesis(index, token);
@@ -450,6 +513,59 @@ class SqlLayoutBuilder {
     for (const token of tokens) this.appendRaw(displayToken(token, this.tokens, this.configuration), true, token);
   }
 
+  private openCase(index: number, token: FormattingToken, pair: CasePair): void {
+    const context: CaseContext = {
+      pair,
+      indentBefore: this.indent,
+      expanded: this.shouldExpandCase(pair),
+    };
+    this.appendRaw(
+      displayToken(token, this.tokens, this.configuration),
+      needsSpaceBefore(this.tokens, index, this.current),
+      token,
+    );
+    this.caseContexts.push(context);
+  }
+
+  private caseBranch(token: FormattingToken): void {
+    const context = this.caseContexts.at(-1);
+    if (!context?.expanded) {
+      this.appendRaw(displayToken(token, this.tokens, this.configuration), true, token);
+      return;
+    }
+    if (this.current.trim().length > 0) this.finishLine(false);
+    this.indent = context.indentBefore + 1;
+    this.appendRaw(displayToken(token, this.tokens, this.configuration), false, token);
+  }
+
+  private closeCase(index: number, token: FormattingToken, pair: CasePair): void {
+    const context = this.caseContexts.pop();
+    if (!context || context.pair !== pair) throw new SqlFormattingError('Mismatched CASE expression terminator.');
+    if (!context.expanded) {
+      this.appendToken(token, index);
+      return;
+    }
+    if (this.current.trim().length > 0) this.finishLine(false);
+    this.indent = context.indentBefore;
+    this.appendRaw(displayToken(token, this.tokens, this.configuration), false, token);
+  }
+
+  private shouldExpandCase(pair: CasePair): boolean {
+    if (this.configuration.caseLayout === 'expanded' || pair.hasLineComment) return true;
+    if (pair.relativeExpressionDepth > this.configuration.maxInlineExpressionDepth) return true;
+
+    let candidate = this.current;
+    for (let index = pair.open; index <= pair.close; index += 1) {
+      const token = this.tokens[index]!;
+      const spacer = needsSpaceBefore(this.tokens, index, candidate) && candidate.length > 0 ? ' ' : '';
+      candidate += `${spacer}${displayToken(token, this.tokens, this.configuration)}`;
+    }
+    const available = this.configuration.maxLineWidth
+      - (this.editor.initialIndentColumns ?? 0)
+      - this.indent * this.editor.tabSize;
+    return visualWidth(candidate, this.editor.tabSize) > Math.max(available, 1);
+  }
+
   private openParenthesis(index: number, token: FormattingToken): void {
     const pair = this.pairs.get(index);
     if (!pair) throw new SqlFormattingError('Missing opening-parenthesis pair.');
@@ -530,7 +646,8 @@ class SqlLayoutBuilder {
   private appendToken(token: FormattingToken, index: number): void {
     const display = displayToken(token, this.tokens, this.configuration);
     const space = needsSpaceBefore(this.tokens, index, this.current);
-    const exceedsDepth = token.expressionDepth > this.configuration.maxInlineExpressionDepth
+    const exceedsDepth = !this.caseContexts.some((context) => context.expanded)
+      && token.expressionDepth > this.configuration.maxInlineExpressionDepth
       && (token.kind === 'operator' || isLogical(token));
     if (exceedsDepth && this.current.trim().length > 0) this.finishLine(false);
     this.appendRaw(display, space, token);
@@ -561,12 +678,16 @@ class SqlLayoutBuilder {
     const available = this.configuration.maxLineWidth
       - (this.editor.initialIndentColumns ?? 0)
       - this.indent * this.editor.tabSize;
-    if (token.expressionDepth > this.configuration.maxInlineExpressionDepth) return true;
+    if (!this.caseContexts.some((context) => context.expanded)
+      && token.expressionDepth > this.configuration.maxInlineExpressionDepth) return true;
     let continuation = ` ${displayToken(token, this.tokens, this.configuration)}`;
     for (let index = tokenIndex + 1; index < this.tokens.length; index += 1) {
       const candidate = this.tokens[index]!;
       if (candidate.raw === ';' || candidate.raw === ',' || candidate.raw === ')') break;
-      if (['GROUP', 'ORDER', 'HAVING', 'QUALIFY', 'LIMIT', 'UNION', 'INTERSECT', 'EXCEPT'].includes(candidate.upper)) break;
+      if ([
+        'WHEN', 'THEN', 'ELSE', 'END', 'GROUP', 'ORDER', 'HAVING', 'QUALIFY', 'LIMIT',
+        'UNION', 'INTERSECT', 'EXCEPT',
+      ].includes(candidate.upper)) break;
       continuation += `${needsSpaceBefore(this.tokens, index, continuation) ? ' ' : ''}${candidate.raw}`;
       if (visualWidth(this.current + continuation, this.editor.tabSize) > available) return true;
     }

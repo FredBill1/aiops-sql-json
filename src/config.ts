@@ -7,6 +7,7 @@ import { isSqlDialect, type SqlDialect } from './sql';
 export const DEFAULT_SCHEMA_FILE_GLOBS = ['${workspaceFolder}/schema/*.sql'];
 
 export type FormatCase = 'preserve' | 'upper' | 'lower';
+export type CaseLayout = 'auto' | 'expanded';
 export type StructuralParenthesisPosition = 'sameLine' | 'newLine';
 export type StatementListLayout = 'onePerLine' | 'fit';
 export type CommaPosition = 'trailing' | 'leading';
@@ -17,6 +18,7 @@ export type SqlJsonBaseIndent = number | 'auto';
 export interface SqlFormatConfiguration {
   maxLineWidth: number;
   maxInlineExpressionDepth: number;
+  caseLayout: CaseLayout;
   structuralParenthesisPosition: StructuralParenthesisPosition;
   statementListLayout: StatementListLayout;
   sqlJsonBaseIndent: SqlJsonBaseIndent;
@@ -74,6 +76,11 @@ export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfig
         configuration.get<unknown>('format.maxInlineExpressionDepth'),
         4,
         1,
+      ),
+      caseLayout: enumValue(
+        configuration.get<unknown>('format.caseLayout'),
+        ['auto', 'expanded'] as const,
+        'auto',
       ),
       structuralParenthesisPosition: enumValue(
         configuration.get<unknown>('format.structuralParenthesisPosition'),

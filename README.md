@@ -77,6 +77,7 @@ For the same reason, an SQL `--` comment does not end at the visible line bounda
 | `aiopsSqlJson.placeholders.allowEverywhere` | `true` | Accepts matching placeholders in strings, unquoted property keys, and bare JSON tokens throughout SQL JSON documents. |
 | `aiopsSqlJson.format.maxLineWidth` | `120` | Maximum visual SQL line width; embedded SQL indentation and closing JSON punctuation count toward it. |
 | `aiopsSqlJson.format.maxInlineExpressionDepth` | `4` | Maximum nested non-leaf AST expression depth allowed on one line. |
+| `aiopsSqlJson.format.caseLayout` | `"auto"` | Expands CASE branches only when width/depth limits are exceeded, or always when set to `"expanded"`. |
 | `aiopsSqlJson.format.structuralParenthesisPosition` | `"sameLine"` | Places opening parentheses for CTEs, subqueries, CREATE TABLE schemas, and INSERT target columns on the same or next line. |
 | `aiopsSqlJson.format.statementListLayout` | `"onePerLine"` | Uses one item per line or width-aware fitting for statement-level lists. |
 | `aiopsSqlJson.format.sqlJson.baseIndent` | `1` | Embedded SQL base indentation in `editor.tabSize` levels, or `"auto"` for one level deeper than the JSON property. |
@@ -108,6 +109,7 @@ Example workspace settings:
   ],
   "aiopsSqlJson.format.maxLineWidth": 120,
   "aiopsSqlJson.format.maxInlineExpressionDepth": 4,
+  "aiopsSqlJson.format.caseLayout": "auto",
   "aiopsSqlJson.format.structuralParenthesisPosition": "sameLine",
   "aiopsSqlJson.format.statementListLayout": "onePerLine",
   "aiopsSqlJson.format.sqlJson.baseIndent": 1
@@ -172,7 +174,7 @@ SQL highlighting, diagnostics, matching-bracket decoration, navigation, and comm
 
 Use **Format Document** or enable `editor.formatOnSave` for `sql` and `sql-json` documents. Formatting is document-wide and atomic; selection and on-type formatting are not provided. If JSON or any recognized SQL property cannot be parsed and verified, the extension leaves the complete document unchanged and reports the first failure.
 
-The SQL formatter reads the configured dialect AST for structure but emits the original token stream. Identifiers, literals, comments, operators, and configured placeholders are therefore preserved; only whitespace and explicitly configured keyword/function/type casing may change. CTEs, subqueries, CREATE TABLE schemas, and INSERT target-column lists are always expanded. General expressions remain inline only when both the line-width and AST-depth limits allow it.
+The SQL formatter reads the configured dialect AST for structure but emits the original token stream. Identifiers, literals, comments, operators, and configured placeholders are therefore preserved; only whitespace and explicitly configured keyword/function/type casing may change. CTEs, subqueries, CREATE TABLE schemas, and INSERT target-column lists are always expanded. General expressions remain inline only when both the line-width and AST-depth limits allow it. `CASE` expressions use the same limits as a complete unit: when one is expanded, each `WHEN` and `ELSE` starts on an indented line and `END` aligns with `CASE`. Set `aiopsSqlJson.format.caseLayout` to `"expanded"` to use that layout for every `CASE` expression.
 
 SQL JSON formatting also normalizes object and array indentation. All non-SQL JSON strings are protected as original source fragments, so existing multiline contents and escapes remain unchanged. Recognized SQL values are rendered as follows:
 

@@ -221,6 +221,20 @@
           "scope": "resource",
           "markdownDescription": "Maximum number of nested non-leaf SQL AST expressions that may remain on one line."
         },
+        "aiopsSqlJson.format.caseLayout": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "expanded"
+          ],
+          "enumDescriptions": [
+            "Keep a CASE expression inline when it fits the configured line-width and AST-depth limits; otherwise expand its branches.",
+            "Always put CASE branches on separate indented lines."
+          ],
+          "default": "auto",
+          "scope": "resource",
+          "markdownDescription": "Layout of `CASE` expressions. `auto` expands only when the complete expression exceeds the configured line-width or AST-depth limit; `expanded` always places each `WHEN` and `ELSE` branch on its own line."
+        },
         "aiopsSqlJson.format.structuralParenthesisPosition": {
           "type": "string",
           "enum": [
