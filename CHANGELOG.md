@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.10
+
 - Fixed incomplete `CASE` expressions, including trailing `CASE` and `CASE WHEN`, being accepted without a syntax diagnostic in dialects whose primary parser did not report them.
 - Added width- and AST-depth-aware structural `CASE` formatting plus the `aiopsSqlJson.format.caseLayout` setting for always-expanded branches.
 
