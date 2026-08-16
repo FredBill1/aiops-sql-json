@@ -355,6 +355,8 @@
     "compile:test": "tsc -p tsconfig.test.json",
     "pretest:integration": "npm run build && npm run compile:test",
     "test:integration": "node out-test/integration/runTest.js",
+    "pretest:integration:stress": "npm run build && npm run compile:test",
+    "test:integration:stress": "node out-test/integration/runTest.js --repeat 3",
     "test": "npm run check && npm run test:unit && npm run test:integration",
     "vscode:prepublish": "npm run build",
     "package": "npm run test && vsce package --out aiops-sql-json.vsix"

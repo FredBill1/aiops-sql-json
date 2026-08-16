@@ -5,31 +5,35 @@ import * as path from 'node:path';
 
 import * as vscode from 'vscode';
 
+import {
+  completionLabel,
+  IntegrationTestFixture,
+  type ManagedConfiguration,
+} from './testHarness';
+
 suite('AIOps SQL JSON extension', () => {
   let temporaryDirectory: string;
   let extension: vscode.Extension<unknown>;
+  let fixture: IntegrationTestFixture;
 
   suiteSetup(async () => {
     temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'aiops-sql-json-'));
     const discoveredExtension = vscode.extensions.getExtension('fredbill1.aiops-sql-json');
     assert.ok(discoveredExtension, 'Extension must be discoverable in the extension host.');
     extension = discoveredExtension;
+    console.log(`Integration test host: VS Code ${vscode.version}`);
+  });
+
+  setup(async () => {
+    fixture = new IntegrationTestFixture(managedConfigurations());
+    await fixture.captureConfiguration();
+  });
+
+  teardown(async () => {
+    await fixture.dispose();
   });
 
   suiteTeardown(async () => {
-    await vscode.workspace.getConfiguration('json').update('schemas', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('plainSql.enabled', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('multilineStrings.allowAll', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('placeholders.allowEverywhere', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('keyPatterns', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaValidation.enabled', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaValidation.completionOnly', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('schemaFiles', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('udfs', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('dialect', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('aiopsSqlJson').update('format.caseLayout', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('editor').update('autoClosingBrackets', undefined, vscode.ConfigurationTarget.Global);
-    await vscode.workspace.getConfiguration('editor').update('formatOnSave', undefined, vscode.ConfigurationTarget.Global);
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   });
 
@@ -307,24 +311,24 @@ suite('AIOps SQL JSON extension', () => {
     const editor = activeEditorFor(document);
 
     setCaret(editor, document.getText().indexOf('SELECT ') + 'SELECT '.length);
-    await vscode.commands.executeCommand('type', { text: '(' });
+    await fixture.typeText(editor, '(');
     assert.equal(document.getText(), '{"query":"SELECT ()","name":"plain","otherSql":"FROM "}');
 
-    await vscode.commands.executeCommand('deleteLeft');
+    await fixture.executeEditorCommand(editor, 'deleteLeft');
     assert.equal(document.getText(), '{"query":"SELECT ","name":"plain","otherSql":"FROM "}');
 
-    await vscode.commands.executeCommand('type', { text: '(' });
-    await vscode.commands.executeCommand('type', { text: ')' });
+    await fixture.typeText(editor, '(');
+    await fixture.typeText(editor, ')');
     assert.equal(document.getText(), '{"query":"SELECT ()","name":"plain","otherSql":"FROM "}');
     assert.equal(document.offsetAt(editor.selection.active), document.getText().indexOf('SELECT ()') + 'SELECT ()'.length);
 
     setCaret(editor, document.getText().indexOf('plain') + 'plain'.length);
-    await vscode.commands.executeCommand('type', { text: '(' });
+    await fixture.typeText(editor, '(');
     assert.equal(document.getText(), '{"query":"SELECT ()","name":"plain()","otherSql":"FROM "}');
 
     const otherCaret = document.getText().indexOf('FROM ') + 'FROM '.length;
     setCaret(editor, otherCaret);
-    await vscode.commands.executeCommand('type', { text: '{' });
+    await fixture.typeText(editor, '{');
     assert.ok(document.getText().includes('FROM {}'));
   });
 
@@ -336,13 +340,13 @@ suite('AIOps SQL JSON extension', () => {
       document.positionAt(valueStart),
       document.positionAt(valueStart + 'value'.length),
     );
-    await vscode.commands.executeCommand('type', { text: "'" });
+    await fixture.typeText(editor, "'");
     assert.equal(document.getText(), '{"trainSql":"SELECT \'value\' "}');
     assert.equal(document.getText(editor.selection), 'value');
 
     setCaret(editor, document.getText().indexOf(' "}') + 1);
-    await vscode.commands.executeCommand('type', { text: '\\' });
-    await vscode.commands.executeCommand('type', { text: '"' });
+    await fixture.typeText(editor, '\\');
+    await fixture.typeText(editor, '"');
     assert.equal(document.getText(), String.raw`{"trainSql":"SELECT 'value' \""}`);
   });
 
@@ -355,7 +359,7 @@ suite('AIOps SQL JSON extension', () => {
       vscode.ConfigurationTarget.Global,
     );
     setCaret(editor, document.getText().indexOf('SELECT ') + 'SELECT '.length);
-    await vscode.commands.executeCommand('type', { text: '[' });
+    await fixture.typeText(editor, '[');
     assert.ok(document.getText().includes('SELECT []'));
 
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
@@ -364,11 +368,11 @@ suite('AIOps SQL JSON extension', () => {
       vscode.ConfigurationTarget.Global,
     );
     setCaret(editor, document.getText().indexOf('SELECT []') + 'SELECT []'.length);
-    await vscode.commands.executeCommand('type', { text: '{' });
+    await fixture.typeText(editor, '{');
     assert.ok(document.getText().includes('SELECT []{}'));
 
     setCaret(editor, document.getText().indexOf('FROM ') + 'FROM '.length);
-    await vscode.commands.executeCommand('type', { text: '{' });
+    await fixture.typeText(editor, '{');
     assert.ok(document.getText().includes('FROM {}'));
   });
 
@@ -376,7 +380,7 @@ suite('AIOps SQL JSON extension', () => {
     const sqlJsonDocument = await openFile('unicode-input.sql.json', '{"Sql":"select \'你好\'"}');
     const sqlJsonEditor = activeEditorFor(sqlJsonDocument);
     setCaret(sqlJsonEditor, sqlJsonDocument.getText().indexOf('你好') + '你好'.length);
-    await vscode.commands.executeCommand('type', { text: '，' });
+    await fixture.typeText(sqlJsonEditor, '，');
     assert.equal(sqlJsonDocument.getText(), '{"Sql":"select \'你好，\'"}');
 
     const markdownDocument = await openFile(
@@ -386,7 +390,7 @@ suite('AIOps SQL JSON extension', () => {
     await vscode.languages.setTextDocumentLanguage(markdownDocument, 'markdown');
     const markdownEditor = activeEditorFor(markdownDocument);
     setCaret(markdownEditor, markdownDocument.getText().indexOf('你好') + '你好'.length);
-    await vscode.commands.executeCommand('type', { text: '，' });
+    await fixture.typeText(markdownEditor, '，');
     assert.equal(markdownDocument.getText(), '你好，\n\n{"trainSql":"select \'hello world\'"}');
   });
 
@@ -399,7 +403,7 @@ suite('AIOps SQL JSON extension', () => {
     const document = await openFile('disabled-pairs.sql.json', '{"trainSql":"SELECT "}');
     const editor = activeEditorFor(document);
     setCaret(editor, document.getText().indexOf('SELECT ') + 'SELECT '.length);
-    await vscode.commands.executeCommand('type', { text: '(' });
+    await fixture.typeText(editor, '(');
     assert.equal(document.getText(), '{"trainSql":"SELECT ("}');
     await vscode.workspace.getConfiguration('editor').update(
       'autoClosingBrackets',
@@ -413,13 +417,13 @@ suite('AIOps SQL JSON extension', () => {
     const editor = activeEditorFor(document);
     const opening = document.getText().indexOf('(');
     setCaret(editor, opening);
-    await vscode.commands.executeCommand('aiopsSqlJson.jumpToMatchingSqlBracket');
+    await fixture.executeEditorCommand(editor, 'aiopsSqlJson.jumpToMatchingSqlBracket');
     assert.equal(document.offsetAt(editor.selection.active), document.getText().lastIndexOf(')'));
 
     setCaret(editor, document.getText().indexOf('SELECT'));
-    await vscode.commands.executeCommand('aiopsSqlJson.toggleSqlLineComment');
+    await fixture.executeEditorCommand(editor, 'aiopsSqlJson.toggleSqlLineComment');
     assert.equal(document.getText(), '{"trainSql":"/* SELECT (a + (b)) */"}');
-    await vscode.commands.executeCommand('aiopsSqlJson.toggleSqlLineComment');
+    await fixture.executeEditorCommand(editor, 'aiopsSqlJson.toggleSqlLineComment');
     assert.equal(document.getText(), '{"trainSql":"SELECT (a + (b))"}');
   });
 
@@ -444,19 +448,23 @@ suite('AIOps SQL JSON extension', () => {
     assert.ok(diagnostics.some((diagnostic) => diagnostic.message.includes('jobName')));
 
     const completionDocument = await openFile('schema-completion.sql.json', '{"jobName":"","trainSql":"SELECT 1"}');
-    const completionPosition = completionDocument.positionAt(completionDocument.getText().indexOf('"jobName":"') + 11);
-    const completionList = await vscode.commands.executeCommand<vscode.CompletionList>(
-      'vscode.executeCompletionItemProvider',
-      completionDocument.uri,
-      completionPosition,
+    const completionOffset = completionDocument.getText().indexOf('"jobName":"') + 11;
+    const completionItems = await fixture.waitForCompletionItems(
+      completionDocument,
+      completionOffset,
+      (items) => items.some((item) => item.label.toString().includes('daily')),
+      'JSON schema enum value daily',
     );
-    assert.ok(completionList.items.some((item) => item.label.toString().includes('daily')));
+    assert.ok(completionItems.some((item) => item.label.toString().includes('daily')));
 
-    const hoverPosition = completionDocument.positionAt(completionDocument.getText().indexOf('jobName') + 2);
-    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-      'vscode.executeHoverProvider',
-      completionDocument.uri,
-      hoverPosition,
+    const hoverOffset = completionDocument.getText().indexOf('jobName') + 2;
+    const hovers = await fixture.waitForHovers(
+      completionDocument,
+      hoverOffset,
+      (items) => items.some((hover) => hover.contents.some((content) => (
+        typeof content !== 'string' && content.value.includes('Job name')
+      ))),
+      'JSON schema property description',
     );
     assert.ok(hovers.some((hover) => hover.contents.some((content) => (
       typeof content === 'string' ? content : content.value
@@ -513,7 +521,11 @@ suite('AIOps SQL JSON extension', () => {
       'completion-lower.sql',
       'SELECT customer_id FROM orders;\nse',
     );
-    const lowerItems = await completionItemsAtEnd(lowerDocument);
+    const lowerItems = await completionItemsAtEnd(
+      lowerDocument,
+      (items) => items.some((item) => completionLabel(item) === 'select'),
+      'lowercase select',
+    );
     assert.ok(
       lowerItems.some((item) => completionLabel(item) === 'select'),
       `Expected lowercase SELECT completion, got: ${lowerItems.map(completionLabel).slice(0, 40).join(', ')}`,
@@ -523,43 +535,79 @@ suite('AIOps SQL JSON extension', () => {
       'completion-field.sql',
       'SELECT customer_id FROM orders;\nSELECT cu',
     );
-    const fieldItems = await completionItemsAtEnd(fieldDocument);
+    const fieldItems = await completionItemsAtEnd(
+      fieldDocument,
+      (items) => items.some((item) => completionLabel(item) === 'customer_id'),
+      'known field customer_id',
+    );
     assert.ok(fieldItems.some((item) => completionLabel(item) === 'customer_id'));
 
     const upperDocument = await openFile('completion-upper.sql', 'SE');
-    const upperItems = await completionItemsAtEnd(upperDocument);
+    const upperItems = await completionItemsAtEnd(
+      upperDocument,
+      (items) => items.some((item) => completionLabel(item) === 'SELECT'),
+      'uppercase SELECT',
+    );
     assert.ok(upperItems.some((item) => completionLabel(item) === 'SELECT'));
 
     const functionDocument = await openFile('completion-function.sql', 'SELECT su');
-    const functionItems = await completionItemsAtEnd(functionDocument);
+    const functionItems = await completionItemsAtEnd(
+      functionDocument,
+      (items) => items.some((item) => completionLabel(item) === 'sum'),
+      'sum function',
+    );
     const sum = functionItems.find((item) => completionLabel(item) === 'sum');
     assert.ok(sum);
     assert.equal(sum.kind, vscode.CompletionItemKind.Function);
     assert.ok(sum.insertText instanceof vscode.SnippetString);
 
     const emptyPrefixDocument = await openFile('completion-create-empty.sql', 'create ');
-    const emptyPrefixResult = await completionListAtEnd(emptyPrefixDocument);
+    const emptyPrefixResult = await completionListAtEnd(
+      emptyPrefixDocument,
+      (list) => list.isIncomplete === true && list.items.some((item) => completionLabel(item) === 'table'),
+      'incomplete table list',
+    );
     assert.equal(emptyPrefixResult.isIncomplete, true);
     assert.ok(emptyPrefixResult.items.some((item) => completionLabel(item) === 'table'));
 
     const uppercaseSpaceDocument = await openFile('completion-create-space-upper.sql', 'CREATE ');
-    const uppercaseSpaceItems = await completionItemsAtEnd(uppercaseSpaceDocument);
+    const uppercaseSpaceItems = await completionItemsAtEnd(
+      uppercaseSpaceDocument,
+      (items) => items.some((item) => completionLabel(item) === 'TABLE'),
+      'uppercase TABLE',
+    );
     assert.ok(uppercaseSpaceItems.some((item) => completionLabel(item) === 'TABLE'));
 
     const lowercaseExpressionDocument = await openFile('completion-select-space-lower.sql', 'select ');
-    const lowercaseExpressionItems = await completionItemsAtEnd(lowercaseExpressionDocument);
+    const lowercaseExpressionItems = await completionItemsAtEnd(
+      lowercaseExpressionDocument,
+      (items) => items.some((item) => completionLabel(item) === 'sum'),
+      'lowercase sum function',
+    );
     assert.ok(lowercaseExpressionItems.some((item) => completionLabel(item) === 'sum'));
 
     const resetDocument = await openFile('completion-case-reset.sql', 'select 1; ');
-    const resetItems = await completionItemsAtEnd(resetDocument);
+    const resetItems = await completionItemsAtEnd(
+      resetDocument,
+      (items) => items.some((item) => completionLabel(item) === 'SELECT'),
+      'statement-reset SELECT',
+    );
     assert.ok(resetItems.some((item) => completionLabel(item) === 'SELECT'));
 
     const createLowerDocument = await openFile('completion-create-lower.sql', 'create t');
-    const createLowerItems = await completionItemsAtEnd(createLowerDocument);
+    const createLowerItems = await completionItemsAtEnd(
+      createLowerDocument,
+      (items) => items.some((item) => completionLabel(item) === 'table'),
+      'lowercase table',
+    );
     assert.ok(createLowerItems.some((item) => completionLabel(item) === 'table'));
 
     const createUpperDocument = await openFile('completion-create-upper.sql', 'create T');
-    const createUpperItems = await completionItemsAtEnd(createUpperDocument);
+    const createUpperItems = await completionItemsAtEnd(
+      createUpperDocument,
+      (items) => items.some((item) => completionLabel(item) === 'TABLE'),
+      'uppercase TABLE prefix',
+    );
     assert.ok(createUpperItems.some((item) => completionLabel(item) === 'TABLE'));
   });
 
@@ -569,12 +617,13 @@ suite('AIOps SQL JSON extension', () => {
       '{"trainSql":"SELECT customer_id FROM orders WHERE cu"}',
     );
     const offset = document.getText().indexOf('cu"') + 2;
-    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
-      'vscode.executeCompletionItemProvider',
-      document.uri,
-      document.positionAt(offset),
+    const items = await fixture.waitForCompletionItems(
+      document,
+      offset,
+      (candidates) => candidates.some((item) => completionLabel(item) === 'customer_id'),
+      'customer_id',
     );
-    assert.ok(result.items.some((item) => completionLabel(item) === 'customer_id'));
+    assert.ok(items.some((item) => completionLabel(item) === 'customer_id'));
   });
 
   test('uses the first workspace Schema for unsaved SQL and SQL JSON documents', async () => {
@@ -614,11 +663,10 @@ suite('AIOps SQL JSON extension', () => {
         );
       }
 
-      const sqlDocument = await vscode.workspace.openTextDocument({
+      const sqlDocument = await fixture.openUntitled({
         language: 'sql',
         content: 'SELECT f.fi FROM first_root_table f',
       });
-      await vscode.window.showTextDocument(sqlDocument);
       assert.equal(sqlDocument.isUntitled, true);
       const sqlPartialOffset = sqlDocument.getText().indexOf('f.fi') + 'f.fi'.length;
       const sqlCompletions = await waitForCompletionItems(
@@ -642,10 +690,11 @@ suite('AIOps SQL JSON extension', () => {
       assert.equal(sqlDocument.isUntitled, true);
 
       const sqlFieldOffset = sqlDocument.getText().indexOf('first_id');
-      const sqlHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-        'vscode.executeHoverProvider',
-        sqlDocument.uri,
-        sqlDocument.positionAt(sqlFieldOffset),
+      const sqlHovers = await fixture.waitForHovers(
+        sqlDocument,
+        sqlFieldOffset,
+        (hovers) => hovers.some((hover) => hoverText(hover).toUpperCase().includes('BIGINT')),
+        'BIGINT field information',
       );
       assert.ok(sqlHovers.some((hover) => hoverText(hover).toUpperCase().includes('BIGINT')));
       const sqlDefinitions = await executeDefinitions(sqlDocument, sqlFieldOffset);
@@ -657,11 +706,10 @@ suite('AIOps SQL JSON extension', () => {
       );
       assert.ok(!sqlDiagnostics.some((item) => item.code === 'unknown-table' || item.code === 'unknown-column'));
 
-      const secondRootDocument = await vscode.workspace.openTextDocument({
+      const secondRootDocument = await fixture.openUntitled({
         language: 'sql',
         content: 'SELECT second_id FROM second_root_table',
       });
-      await vscode.window.showTextDocument(secondRootDocument);
       assert.equal(secondRootDocument.isUntitled, true);
       const secondRootDiagnostics = await waitForDiagnostics(
         secondRootDocument.uri,
@@ -669,11 +717,10 @@ suite('AIOps SQL JSON extension', () => {
       );
       assert.ok(secondRootDiagnostics.some((item) => item.code === 'unknown-table'));
 
-      const sqlJsonDocument = await vscode.workspace.openTextDocument({
+      const sqlJsonDocument = await fixture.openUntitled({
         language: 'sql-json',
         content: '{"trainSql":"SELECT f.fi FROM first_root_table f"}',
       });
-      await vscode.window.showTextDocument(sqlJsonDocument);
       assert.equal(sqlJsonDocument.isUntitled, true);
       const sqlJsonPartialOffset = sqlJsonDocument.getText().indexOf('f.fi') + 'f.fi'.length;
       const sqlJsonCompletions = await waitForCompletionItems(
@@ -759,12 +806,13 @@ suite('AIOps SQL JSON extension', () => {
       'SELECT o.i FROM sales.orders o',
     );
     const completionOffset = completionDocument.getText().indexOf('o.i') + 3;
-    const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
-      'vscode.executeCompletionItemProvider',
-      completionDocument.uri,
-      completionDocument.positionAt(completionOffset),
+    const completions = await fixture.waitForCompletionItems(
+      completionDocument,
+      completionOffset,
+      (items) => items.some((item) => completionLabel(item) === 'id'),
+      'schema column id',
     );
-    assert.ok(completions.items.some((item) => completionLabel(item) === 'id'));
+    assert.ok(completions.some((item) => completionLabel(item) === 'id'));
 
     const invalidDocument = await openFile(
       'schema-invalid.sql',
@@ -860,7 +908,7 @@ suite('AIOps SQL JSON extension', () => {
     );
     assert.ok(syntaxDiagnostics.some((item) => item.source === 'spark SQL'));
 
-    const invalidSchemaDocument = await vscode.workspace.openTextDocument(vscode.Uri.file(invalidSchemaPath));
+    const invalidSchemaDocument = await fixture.openUri(vscode.Uri.file(invalidSchemaPath));
     const strictDdlDiagnostics = await waitForDiagnostics(
       invalidSchemaDocument.uri,
       (items) => items.some((item) => item.source === 'SQL schema DDL'),
@@ -896,6 +944,8 @@ suite('AIOps SQL JSON extension', () => {
     const globalItems = await completionItemsAtOffset(
       globalCompletionDocument,
       globalCompletionDocument.getText().indexOf('o.i') + 3,
+      (items) => items.some((item) => completionLabel(item) === 'id'),
+      'global schema column id',
     );
     assert.ok(globalItems.some((item) => completionLabel(item) === 'id'));
 
@@ -906,6 +956,8 @@ suite('AIOps SQL JSON extension', () => {
     const derivedItems = await completionItemsAtOffset(
       derivedCompletionDocument,
       derivedCompletionDocument.getText().indexOf('o.d') + 3,
+      (items) => items.some((item) => completionLabel(item) === 'derived_id'),
+      'derived column derived_id',
     );
     assert.ok(derivedItems.some((item) => completionLabel(item) === 'derived_id'));
 
@@ -916,6 +968,8 @@ suite('AIOps SQL JSON extension', () => {
     const localItems = await completionItemsAtOffset(
       localCompletionDocument,
       localCompletionDocument.getText().indexOf('l.l') + 3,
+      (items) => items.some((item) => completionLabel(item) === 'local_id'),
+      'local DDL column local_id',
     );
     assert.ok(localItems.some((item) => completionLabel(item) === 'local_id'));
 
@@ -1037,29 +1091,57 @@ CREATE VIEW sales.order_ids AS SELECT OrderId FROM sales.orders;`,
       'completion-schema-fallback.sql',
       'SELECT FileOnlySymbol FROM missing_history;\nSELECT ',
     );
-    const noSourceItems = await completionItemsAtEnd(noSourceDocument);
+    const noSourceItems = await completionItemsAtEnd(
+      noSourceDocument,
+      (items) => ['OrderId', 'CustomerName', 'FileOnlySymbol'].every(
+        (label) => items.some((item) => completionLabel(item) === label),
+      ),
+      'schema and current-file fallback fields',
+    );
     assert.ok(noSourceItems.some((item) => completionLabel(item) === 'OrderId'));
     assert.ok(noSourceItems.some((item) => completionLabel(item) === 'CustomerName'));
     assert.ok(noSourceItems.some((item) => completionLabel(item) === 'FileOnlySymbol'));
 
     const unknownDocument = await openFile('completion-unknown-source.sql', 'SELECT  FROM missing_source');
-    const unknownItems = await completionItemsAtOffset(unknownDocument, 'SELECT '.length);
+    const unknownItems = await completionItemsAtOffset(
+      unknownDocument,
+      'SELECT '.length,
+      (items) => items.some((item) => completionLabel(item) === 'CustomerName'),
+      'fallback CustomerName for unknown source',
+    );
     assert.ok(unknownItems.some((item) => completionLabel(item) === 'CustomerName'));
 
     const mixedDocument = await openFile(
       'completion-mixed-sources.sql',
       'SELECT  FROM sales.orders o JOIN missing_source m ON true',
     );
-    const mixedItems = await completionItemsAtOffset(mixedDocument, 'SELECT '.length);
+    const mixedItems = await completionItemsAtOffset(
+      mixedDocument,
+      'SELECT '.length,
+      (items) => items.some((item) => completionLabel(item) === 'CustomerName'),
+      'fallback CustomerName for mixed sources',
+    );
     assert.ok(mixedItems.some((item) => completionLabel(item) === 'CustomerName'));
 
     const ambiguousDocument = await openFile('completion-ambiguous-source.sql', 'SELECT  FROM orders');
-    const ambiguousItems = await completionItemsAtOffset(ambiguousDocument, 'SELECT '.length);
+    const ambiguousItems = await completionItemsAtOffset(
+      ambiguousDocument,
+      'SELECT '.length,
+      (items) => ['ArchiveCode', 'CustomerName'].every(
+        (label) => items.some((item) => completionLabel(item) === label),
+      ),
+      'ambiguous-source fallback fields',
+    );
     assert.ok(ambiguousItems.some((item) => completionLabel(item) === 'ArchiveCode'));
     assert.ok(ambiguousItems.some((item) => completionLabel(item) === 'CustomerName'));
 
     const resolvedDocument = await openFile('completion-resolved-source.sql', 'SELECT  FROM sales.orders o');
-    const resolvedItems = await completionItemsAtOffset(resolvedDocument, 'SELECT '.length);
+    const resolvedItems = await completionItemsAtOffset(
+      resolvedDocument,
+      'SELECT '.length,
+      (items) => items.some((item) => completionLabel(item) === 'OrderId'),
+      'resolved-source OrderId',
+    );
     assert.ok(resolvedItems.some((item) => completionLabel(item) === 'OrderId'));
     assert.ok(!resolvedItems.some((item) => completionLabel(item) === 'CustomerName'));
 
@@ -1076,7 +1158,14 @@ CREATE VIEW sales.order_ids AS SELECT OrderId FROM sales.orders;`,
       '{"firstSql":"SELECT JsonOnly FROM missing","secondSql":"SELECT "}',
     );
     const jsonOffset = jsonDocument.getText().lastIndexOf('SELECT ') + 'SELECT '.length;
-    const jsonItems = await completionItemsAtOffset(jsonDocument, jsonOffset);
+    const jsonItems = await completionItemsAtOffset(
+      jsonDocument,
+      jsonOffset,
+      (items) => ['JsonOnly', 'CustomerName'].every(
+        (label) => items.some((item) => completionLabel(item) === label),
+      ),
+      'SQL JSON fallback fields',
+    );
     assert.ok(jsonItems.some((item) => completionLabel(item) === 'JsonOnly'));
     assert.ok(jsonItems.some((item) => completionLabel(item) === 'CustomerName'));
 
@@ -1084,7 +1173,11 @@ CREATE VIEW sales.order_ids AS SELECT OrderId FROM sales.orders;`,
       'completion-local-fallback.sql',
       'CREATE TABLE local_active (LocalActive INTEGER); SELECT ',
     );
-    const localItems = await completionItemsAtEnd(localDocument);
+    const localItems = await completionItemsAtEnd(
+      localDocument,
+      (items) => items.some((item) => completionLabel(item) === 'LocalActive'),
+      'local active table field',
+    );
     const localField = localItems.find((item) => completionLabel(item) === 'LocalActive');
     assert.ok(localField);
     assert.ok(String(localField.detail).includes('local_active.LocalActive'));
@@ -1118,7 +1211,11 @@ CREATE VIEW sales.order_ids AS SELECT OrderId FROM sales.orders;`,
       ['JOIN', joinDocument],
       ['prefix', prefixDocument],
     ] as const) {
-      const items = await completionItemsAtEnd(document);
+      const items = await completionItemsAtEnd(
+        document,
+        (candidates) => candidates.some((item) => completionLabel(item) === 'sales.orders'),
+        `sales.orders relation in ${contextName}`,
+      );
       assert.ok(
         items.some((item) => completionLabel(item) === 'sales.orders'),
         `Expected a table in Spark ${contextName} completion.`,
@@ -1203,12 +1300,13 @@ SELECT id, amount FROM local_orders;`,
       'CREATE TABLE local_orders (id BIGINT, amount STRING); SELECT o.i FROM local_orders o;',
     );
     const completionOffset = completionDocument.getText().indexOf('o.i') + 3;
-    const completion = await vscode.commands.executeCommand<vscode.CompletionList>(
-      'vscode.executeCompletionItemProvider',
-      completionDocument.uri,
-      completionDocument.positionAt(completionOffset),
+    const completion = await fixture.waitForCompletionItems(
+      completionDocument,
+      completionOffset,
+      (items) => items.some((item) => completionLabel(item) === 'id'),
+      'local DDL column id',
     );
-    assert.ok(completion.items.some((item) => completionLabel(item) === 'id'));
+    assert.ok(completion.some((item) => completionLabel(item) === 'id'));
 
     const droppedDocument = await openFile(
       'local-ddl-dropped.sql',
@@ -1428,10 +1526,11 @@ SELECT id, amount FROM local_orders;`,
       'WITH c AS (SELECT 1 AS local_id) SELECT c.local_id FROM c',
     );
     const usageOffset = document.getText().lastIndexOf('local_id');
-    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-      'vscode.executeHoverProvider',
-      document.uri,
-      document.positionAt(usageOffset),
+    const hovers = await fixture.waitForHovers(
+      document,
+      usageOffset,
+      (items) => items.some((hover) => hoverText(hover).includes('local_id')),
+      'local_id AST information',
     );
     assert.ok(hovers.some((hover) => hoverText(hover).includes('local_id')));
     assert.ok(hovers.some((hover) => hoverText(hover).includes('number')));
@@ -1448,12 +1547,19 @@ SELECT id, amount FROM local_orders;`,
       false,
       vscode.ConfigurationTarget.Global,
     );
-    const disabledHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-      'vscode.executeHoverProvider',
-      document.uri,
-      document.positionAt(usageOffset),
+    await waitForDiagnostics(document.uri);
+    const disabledHovers = await fixture.waitForHovers(
+      document,
+      usageOffset,
+      (items) => items.length === 0,
+      'plain SQL provider disablement',
     );
-    const disabledDefinitions = await executeDefinitions(document, usageOffset);
+    const disabledDefinitions = await fixture.waitForDefinitions(
+      document,
+      usageOffset,
+      (items) => items.length === 0,
+      'plain SQL provider disablement',
+    );
     assert.equal(disabledHovers.length, 0);
     assert.equal(disabledDefinitions.length, 0);
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
@@ -1479,10 +1585,11 @@ SELECT id, amount FROM local_orders;`,
       '{"trainSql":"WITH c AS (SELECT 1 AS local_id)\\nSELECT c.local_id FROM c","jobName":"daily"}',
     );
     const usageOffset = document.getText().lastIndexOf('local_id');
-    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-      'vscode.executeHoverProvider',
-      document.uri,
-      document.positionAt(usageOffset),
+    const hovers = await fixture.waitForHovers(
+      document,
+      usageOffset,
+      (items) => items.some((hover) => hoverText(hover).includes('local_id')),
+      'mapped local_id AST information',
     );
     assert.ok(hovers.some((hover) => hoverText(hover).includes('local_id')));
     const definitions = await executeDefinitions(document, usageOffset);
@@ -1526,17 +1633,19 @@ SELECT id, amount FROM local_orders;`,
       'SELECT o.id, o.payload.name FROM sales.orders o',
     );
     const fieldOffset = document.getText().indexOf('name');
-    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-      'vscode.executeHoverProvider',
-      document.uri,
-      document.positionAt(fieldOffset),
+    const hovers = await fixture.waitForHovers(
+      document,
+      fieldOffset,
+      (items) => items.some((hover) => hoverText(hover).includes('name'))
+        && items.some((hover) => /(STRING|TEXT)/u.test(hoverText(hover).toUpperCase())),
+      'external DDL field name and type',
     );
     assert.ok(hovers.some((hover) => hoverText(hover).includes('name')));
     assert.ok(hovers.some((hover) => /(STRING|TEXT)/u.test(hoverText(hover).toUpperCase())));
     const definitions = await executeDefinitions(document, fieldOffset);
     assert.equal(definitions.length, 1);
     assert.equal(definitionUri(definitions[0]!).fsPath.toLocaleLowerCase(), schemaPath.toLocaleLowerCase());
-    const schemaDocument = await vscode.workspace.openTextDocument(vscode.Uri.file(schemaPath));
+    const schemaDocument = await fixture.openUri(vscode.Uri.file(schemaPath));
     assert.equal(schemaDocument.getText(definitionSelection(definitions[0]!)), 'name');
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
       'schemaValidation.completionOnly',
@@ -1578,7 +1687,8 @@ SELECT id, amount FROM local_orders;`,
 
     const prefix = '-- DDL moved after rebuild\n\n';
     const schemaDocument = vscode.workspace.textDocuments.find((candidate) => candidate.uri.fsPath === schemaPath)
-      ?? await vscode.workspace.openTextDocument(vscode.Uri.file(schemaPath));
+      ?? await fixture.openUri(vscode.Uri.file(schemaPath));
+    fixture.trackDocument(schemaDocument);
     const edit = new vscode.WorkspaceEdit();
     edit.replace(
       schemaDocument.uri,
@@ -1588,7 +1698,13 @@ SELECT id, amount FROM local_orders;`,
     assert.equal(await vscode.workspace.applyEdit(edit), true);
     assert.equal(await schemaDocument.save(), true);
     await vscode.commands.executeCommand('aiopsSqlJson.rebuildSchemaIndex');
-    const after = await executeDefinitions(document, offset);
+    const after = await executeDefinitions(
+      document,
+      offset,
+      (definitions) => definitions.length === 1
+        && definitionSelection(definitions[0]!).start.line === beforeStart.line + 2,
+      'definition at rebuilt DDL offset',
+    );
     assert.equal(after.length, 1);
     const afterStart = definitionSelection(after[0]!).start;
     assert.equal(afterStart.line, beforeStart.line + 2);
@@ -1720,8 +1836,16 @@ SELECT id, amount FROM local_orders;`,
     const filePath = path.join(temporaryDirectory, fileName);
     await fs.writeFile(filePath, content, 'utf8');
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-    await vscode.window.showTextDocument(document);
+    fixture.trackDocument(document);
+    await fixture.showDocument(document);
     return document;
+  }
+
+  async function waitForDiagnostics(
+    uri: vscode.Uri,
+    predicate: (diagnostics: readonly vscode.Diagnostic[]) => boolean = () => true,
+  ): Promise<readonly vscode.Diagnostic[]> {
+    return fixture.waitForDiagnostics(uri, predicate);
   }
 
   async function applyDocumentFormatting(
@@ -1742,12 +1866,17 @@ SELECT id, amount FROM local_orders;`,
   async function executeDefinitions(
     document: vscode.TextDocument,
     offset: number,
+    predicate: (definitions: readonly (vscode.Location | vscode.LocationLink)[]) => boolean = (
+      definitions,
+    ) => definitions.length > 0,
+    expectation?: string,
   ): Promise<Array<vscode.Location | vscode.LocationLink>> {
-    return vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
-      'vscode.executeDefinitionProvider',
-      document.uri,
-      document.positionAt(offset),
-    );
+    return [...await fixture.waitForDefinitions(
+      document,
+      offset,
+      predicate,
+      expectation,
+    )];
   }
 
   function definitionUri(definition: vscode.Location | vscode.LocationLink): vscode.Uri {
@@ -1764,20 +1893,31 @@ SELECT id, amount FROM local_orders;`,
     return hover.contents.map((content) => typeof content === 'string' ? content : content.value).join('\n');
   }
 
-  async function completionItemsAtEnd(document: vscode.TextDocument): Promise<readonly vscode.CompletionItem[]> {
-    return (await completionListAtEnd(document)).items;
+  async function completionItemsAtEnd(
+    document: vscode.TextDocument,
+    predicate: (items: readonly vscode.CompletionItem[]) => boolean = (items) => items.length > 0,
+    expectation?: string,
+  ): Promise<readonly vscode.CompletionItem[]> {
+    return fixture.waitForCompletionItems(
+      document,
+      document.getText().length,
+      predicate,
+      expectation,
+    );
   }
 
   async function completionItemsAtOffset(
     document: vscode.TextDocument,
     offset: number,
+    predicate: (items: readonly vscode.CompletionItem[]) => boolean = (items) => items.length > 0,
+    expectation?: string,
   ): Promise<readonly vscode.CompletionItem[]> {
-    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
-      'vscode.executeCompletionItemProvider',
-      document.uri,
-      document.positionAt(offset),
+    return fixture.waitForCompletionItems(
+      document,
+      offset,
+      predicate,
+      expectation,
     );
-    return result.items;
   }
 
   async function waitForCompletionItems(
@@ -1785,29 +1925,22 @@ SELECT id, amount FROM local_orders;`,
     offset: number,
     predicate: (items: readonly vscode.CompletionItem[]) => boolean,
   ): Promise<readonly vscode.CompletionItem[]> {
-    const timeoutAt = Date.now() + 15_000;
-    let items: readonly vscode.CompletionItem[] = [];
-    while (Date.now() < timeoutAt) {
-      items = await completionItemsAtOffset(document, offset);
-      if (predicate(items)) return items;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return items;
+    return fixture.waitForCompletionItems(document, offset, predicate);
   }
 
-  async function completionListAtEnd(document: vscode.TextDocument): Promise<vscode.CompletionList> {
-    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
-      'vscode.executeCompletionItemProvider',
-      document.uri,
-      document.positionAt(document.getText().length),
+  async function completionListAtEnd(
+    document: vscode.TextDocument,
+    predicate: (list: vscode.CompletionList) => boolean = (list) => list.items.length > 0,
+    expectation?: string,
+  ): Promise<vscode.CompletionList> {
+    return fixture.waitForCompletionList(
+      document,
+      document.getText().length,
+      predicate,
+      expectation,
     );
-    return result;
   }
 });
-
-function completionLabel(item: vscode.CompletionItem): string {
-  return typeof item.label === 'string' ? item.label : item.label.label;
-}
 
 function schemaIndexDialectCases() {
   return [
@@ -1881,18 +2014,37 @@ function setCaret(editor: vscode.TextEditor, offset: number): void {
   editor.selection = new vscode.Selection(position, position);
 }
 
-async function waitForDiagnostics(
-  uri: vscode.Uri,
-  predicate: (diagnostics: readonly vscode.Diagnostic[]) => boolean = () => true,
-): Promise<readonly vscode.Diagnostic[]> {
-  const earliestCheck = Date.now() + 350;
-  const timeoutAt = Date.now() + 15_000;
-  while (Date.now() < timeoutAt) {
-    const diagnostics = vscode.languages.getDiagnostics(uri);
-    if (Date.now() >= earliestCheck && predicate(diagnostics)) {
-      return diagnostics;
+
+function managedConfigurations(): ManagedConfiguration[] {
+  const globalSettings = [
+    ['json', 'schemas'],
+    ['aiopsSqlJson', 'plainSql.enabled'],
+    ['aiopsSqlJson', 'multilineStrings.allowAll'],
+    ['aiopsSqlJson', 'placeholders.allowEverywhere'],
+    ['aiopsSqlJson', 'keyPatterns'],
+    ['aiopsSqlJson', 'schemaValidation.enabled'],
+    ['aiopsSqlJson', 'schemaValidation.completionOnly'],
+    ['aiopsSqlJson', 'schemaFiles'],
+    ['aiopsSqlJson', 'udfs'],
+    ['aiopsSqlJson', 'dialect'],
+    ['aiopsSqlJson', 'format.caseLayout'],
+    ['editor', 'autoClosingBrackets'],
+    ['editor', 'formatOnSave'],
+  ] as const;
+  const managed: ManagedConfiguration[] = globalSettings.map(([section, key]) => ({
+    section,
+    key,
+    target: vscode.ConfigurationTarget.Global,
+  }));
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    for (const key of ['schemaFiles', 'schemaValidation.enabled'] as const) {
+      managed.push({
+        section: 'aiopsSqlJson',
+        key,
+        target: vscode.ConfigurationTarget.WorkspaceFolder,
+        resource: folder.uri,
+      });
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  return vscode.languages.getDiagnostics(uri);
+  return managed;
 }
