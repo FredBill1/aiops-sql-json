@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.12
 
 - Fixed schema inference for Spark SQL CTAS statements with parenthesized queries such as `CREATE TABLE t AS (SELECT ...)`.
 - Unified semantic analysis for parenthesized `SELECT`, `UNION`, and `VALUES` query roots.
