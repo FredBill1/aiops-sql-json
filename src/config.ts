@@ -7,9 +7,8 @@ import { isSqlDialect, type SqlDialect } from './sql';
 export const DEFAULT_SCHEMA_FILE_GLOBS = ['${workspaceFolder}/schema/*.sql'];
 
 export type FormatCase = 'preserve' | 'upper' | 'lower';
-export type CaseLayout = 'auto' | 'expanded';
+export type LayoutMode = 'compact' | 'expanded';
 export type StructuralParenthesisPosition = 'sameLine' | 'newLine';
-export type StatementListLayout = 'onePerLine' | 'fit';
 export type CommaPosition = 'trailing' | 'leading';
 export type LogicalOperatorPosition = 'before' | 'after';
 export type SemicolonPosition = 'sameLine' | 'newLine';
@@ -18,9 +17,9 @@ export type SqlJsonBaseIndent = number | 'auto';
 export interface SqlFormatConfiguration {
   maxLineWidth: number;
   maxInlineExpressionDepth: number;
-  caseLayout: CaseLayout;
+  maxInlineItems: number;
+  layoutMode: LayoutMode;
   structuralParenthesisPosition: StructuralParenthesisPosition;
-  statementListLayout: StatementListLayout;
   sqlJsonBaseIndent: SqlJsonBaseIndent;
   keywordCase: FormatCase;
   functionCase: FormatCase;
@@ -77,20 +76,16 @@ export function getExtensionConfiguration(resource: vscode.Uri): ExtensionConfig
         4,
         1,
       ),
-      caseLayout: enumValue(
-        configuration.get<unknown>('format.caseLayout'),
-        ['auto', 'expanded'] as const,
-        'auto',
+      maxInlineItems: integerAtLeast(configuration.get<unknown>('format.maxInlineItems'), 4, 1),
+      layoutMode: enumValue(
+        configuration.get<unknown>('format.layoutMode'),
+        ['compact', 'expanded'] as const,
+        'compact',
       ),
       structuralParenthesisPosition: enumValue(
         configuration.get<unknown>('format.structuralParenthesisPosition'),
         ['sameLine', 'newLine'] as const,
         'sameLine',
-      ),
-      statementListLayout: enumValue(
-        configuration.get<unknown>('format.statementListLayout'),
-        ['onePerLine', 'fit'] as const,
-        'onePerLine',
       ),
       sqlJsonBaseIndent: sqlJsonBaseIndent(configuration.get<unknown>('format.sqlJson.baseIndent')),
       keywordCase: formatCase(configuration.get<unknown>('format.keywordCase'), 'upper'),

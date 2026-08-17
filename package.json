@@ -221,19 +221,26 @@
           "scope": "resource",
           "markdownDescription": "Maximum number of nested non-leaf SQL AST expressions that may remain on one line."
         },
-        "aiopsSqlJson.format.caseLayout": {
+        "aiopsSqlJson.format.maxInlineItems": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 4,
+          "scope": "resource",
+          "markdownDescription": "Maximum number of high-level or structural list items, CASE branches, or logical leaf predicates that may remain inline in `compact` layout mode. Exceeding the limit expands that semantic group without chunking items across lines. Local function arguments, `IN` lists, arrays, and row constructors are not item-limited."
+        },
+        "aiopsSqlJson.format.layoutMode": {
           "type": "string",
           "enum": [
-            "auto",
+            "compact",
             "expanded"
           ],
           "enumDescriptions": [
-            "Keep a CASE expression inline when it fits the configured line-width and AST-depth limits; otherwise expand its branches.",
-            "Always put CASE branches on separate indented lines."
+            "Keep complete clauses and high-level structures inline when they fit, then break them at semantic boundaries.",
+            "Always expand statement-level lists, CASE branches, and logical predicates."
           ],
-          "default": "auto",
+          "default": "compact",
           "scope": "resource",
-          "markdownDescription": "Layout of `CASE` expressions. `auto` expands only when the complete expression exceeds the configured line-width or AST-depth limit; `expanded` always places each `WHEN` and `ELSE` branch on its own line."
+          "markdownDescription": "Layout strategy for breakable SQL structures. `compact` keeps complete clauses and expressions inline when possible; `expanded` always places high-level and structural list items, CASE branches, and logical predicates on separate lines. Local function arguments and parentheses remain width/depth-aware in both modes."
         },
         "aiopsSqlJson.format.structuralParenthesisPosition": {
           "type": "string",
@@ -243,17 +250,7 @@
           ],
           "default": "sameLine",
           "scope": "resource",
-          "markdownDescription": "Placement of opening parentheses for CTEs, subqueries, `CREATE TABLE` schemas, and `INSERT` target column lists. These structures are always expanded."
-        },
-        "aiopsSqlJson.format.statementListLayout": {
-          "type": "string",
-          "enum": [
-            "onePerLine",
-            "fit"
-          ],
-          "default": "onePerLine",
-          "scope": "resource",
-          "markdownDescription": "Whether statement-level lists such as SELECT projections, CTEs, GROUP/ORDER BY expressions, table columns, and INSERT target columns use one item per line or fit within the configured limits."
+          "markdownDescription": "Controls only the opening-parenthesis position for CTEs, subqueries, `CREATE TABLE` schemas, and `INSERT` target column lists. `sameLine` keeps the opening parenthesis attached to its syntactic introducer even when the contents expand; `newLine` places it on a new line at the introducer's indentation. Content layout is decided independently."
         },
         "aiopsSqlJson.format.sqlJson.baseIndent": {
           "oneOf": [

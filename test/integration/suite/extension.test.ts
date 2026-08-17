@@ -66,8 +66,11 @@ suite('AIOps SQL JSON extension', () => {
     const formatDepth = extension.packageJSON.contributes.configuration.properties[
       'aiopsSqlJson.format.maxInlineExpressionDepth'
     ] as { default?: number; minimum?: number };
-    const caseLayout = extension.packageJSON.contributes.configuration.properties[
-      'aiopsSqlJson.format.caseLayout'
+    const formatItems = extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.format.maxInlineItems'
+    ] as { default?: number; minimum?: number; scope?: string };
+    const layoutMode = extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.format.layoutMode'
     ] as { default?: string; enum?: string[]; scope?: string };
     const rebuildCommand = (extension.packageJSON.contributes.commands as Array<{
       command: string;
@@ -82,9 +85,18 @@ suite('AIOps SQL JSON extension', () => {
     assert.equal(formatWidth.minimum, 20);
     assert.equal(formatDepth.default, 4);
     assert.equal(formatDepth.minimum, 1);
-    assert.equal(caseLayout.default, 'auto');
-    assert.deepEqual(caseLayout.enum, ['auto', 'expanded']);
-    assert.equal(caseLayout.scope, 'resource');
+    assert.equal(formatItems.default, 4);
+    assert.equal(formatItems.minimum, 1);
+    assert.equal(formatItems.scope, 'resource');
+    assert.equal(layoutMode.default, 'compact');
+    assert.deepEqual(layoutMode.enum, ['compact', 'expanded']);
+    assert.equal(layoutMode.scope, 'resource');
+    assert.equal(extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.format.caseLayout'
+    ], undefined);
+    assert.equal(extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.format.statementListLayout'
+    ], undefined);
     assert.equal(rebuildCommand?.enablement, 'config.aiopsSqlJson.schemaValidation.enabled');
 
     const document = await openFile('valid.sql.json', `{
@@ -112,12 +124,9 @@ suite('AIOps SQL JSON extension', () => {
 
     const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
     assert.equal(document.getText(), [
-      'SELECT',
-      '  userId,',
-      '  SUM(amount) total',
+      'SELECT userId, SUM(amount) total',
       'FROM sales',
-      'WHERE',
-      '  enabled = true AND dt = $date',
+      'WHERE enabled = true AND dt = $date',
     ].join(eol));
   });
 
@@ -135,9 +144,9 @@ suite('AIOps SQL JSON extension', () => {
     }
   });
 
-  test('honors the always-expanded CASE layout through the formatting provider', async () => {
+  test('honors the expanded layout mode through the formatting provider', async () => {
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
-      'format.caseLayout',
+      'format.layoutMode',
       'expanded',
       vscode.ConfigurationTarget.Global,
     );
@@ -157,7 +166,33 @@ suite('AIOps SQL JSON extension', () => {
       ].join(eol));
     } finally {
       await vscode.workspace.getConfiguration('aiopsSqlJson').update(
-        'format.caseLayout',
+        'format.layoutMode',
+        undefined,
+        vscode.ConfigurationTarget.Global,
+      );
+    }
+  });
+
+  test('honors the high-level inline item limit through the formatting provider', async () => {
+    await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+      'format.maxInlineItems',
+      2,
+      vscode.ConfigurationTarget.Global,
+    );
+    try {
+      const document = await openFile('max-inline-items-format.sql', 'select a,b,c from source_table');
+      await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
+      const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+      assert.equal(document.getText(), [
+        'SELECT',
+        '  a,',
+        '  b,',
+        '  c',
+        'FROM source_table',
+      ].join(eol));
+    } finally {
+      await vscode.workspace.getConfiguration('aiopsSqlJson').update(
+        'format.maxInlineItems',
         undefined,
         vscode.ConfigurationTarget.Global,
       );
@@ -173,7 +208,7 @@ suite('AIOps SQL JSON extension', () => {
     await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
 
     assert.ok(document.getText().includes(`"description": ${untouched}`));
-    assert.ok(document.getText().includes('"trainSql": "\n  SELECT\n    a,\n    b\n  FROM t"'));
+    assert.ok(document.getText().includes('"trainSql": "\n  SELECT a, b\n  FROM t"'));
   });
 
   test('participates in the VS Code format-on-save pipeline', async () => {
@@ -2027,7 +2062,8 @@ function managedConfigurations(): ManagedConfiguration[] {
     ['aiopsSqlJson', 'schemaFiles'],
     ['aiopsSqlJson', 'udfs'],
     ['aiopsSqlJson', 'dialect'],
-    ['aiopsSqlJson', 'format.caseLayout'],
+    ['aiopsSqlJson', 'format.maxInlineItems'],
+    ['aiopsSqlJson', 'format.layoutMode'],
     ['editor', 'autoClosingBrackets'],
     ['editor', 'formatOnSave'],
   ] as const;

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Decoupled structural wrapper placement from comma-list expansion: query wrappers no longer force nested SELECT items apart, CREATE/INSERT lists use semantic item fitting, and `structuralParenthesisPosition` is honored independently from `layoutMode`.
+- Added `aiopsSqlJson.format.maxInlineItems` with a default of four, expanding over-limit high-level and structural lists, CASE branches, and logical predicate groups at semantic boundaries.
+- Replaced the CASE-only and statement-list layout settings with `aiopsSqlJson.format.layoutMode`, supporting compact semantic fitting and consistently expanded high-level SQL layouts.
+- Fixed overlong logical expressions splitting comparison predicates at arbitrary tokens; AND/OR chains now break by parsed precedence and preserve complete predicates whenever possible.
+- Formatted Spark/Hive CREATE TABLE storage, options, partitioning, bucketing, location, and table-comment suffixes as distinct top-level clauses.
+
 ## 0.0.10
 
 - Fixed incomplete `CASE` expressions, including trailing `CASE` and `CASE WHEN`, being accepted without a syntax diagnostic in dialects whose primary parser did not report them.

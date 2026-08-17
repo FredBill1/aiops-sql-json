@@ -13,9 +13,9 @@ import { formatSqlJson } from '../../src/sqlJsonFormatting';
 const format: SqlFormatConfiguration = {
   maxLineWidth: 120,
   maxInlineExpressionDepth: 4,
-  caseLayout: 'auto',
+  maxInlineItems: 4,
+  layoutMode: 'compact',
   structuralParenthesisPosition: 'sameLine',
-  statementListLayout: 'onePerLine',
   sqlJsonBaseIndent: 1,
   keywordCase: 'upper',
   functionCase: 'upper',
@@ -51,8 +51,7 @@ describe('SQL JSON formatting', () => {
     const result = formatSqlJson(project(source), configuration, { tabSize: 2, insertSpaces: true, eol: '\n' });
 
     expect(result).toContain(`"description": ${untouched}`);
-    expect(result).toContain('"trainSql": "\n  SELECT');
-    expect(result).toContain('\n    userId,');
+    expect(result).toContain('"trainSql": "\n  SELECT userId, SUM(amount) total');
     expect(result).toContain('\n  FROM sales');
     expect(result).toContain('$date"');
   });
@@ -66,6 +65,42 @@ describe('SQL JSON formatting', () => {
     );
 
     expect(result).toContain('"querySql": "\n      SELECT');
+  });
+
+  it('applies the inline item limit with the SQL JSON base indentation', () => {
+    const source = '{"querySql":"select 1,2,3,4,5 from source_table"}';
+    const result = formatSqlJson(
+      project(source),
+      { ...configuration, format: { ...format, maxLineWidth: 300 } },
+      { tabSize: 2, insertSpaces: true, eol: '\n' },
+    );
+
+    expect(result).toContain([
+      '"querySql": "',
+      '  SELECT',
+      '    1,',
+      '    2,',
+      '    3,',
+      '    4,',
+      '    5',
+      '  FROM source_table"',
+    ].join('\n'));
+  });
+
+  it('keeps a query-wrapper opener attached after applying SQL JSON indentation', () => {
+    const source = '{"querySql":"select a,b,c,d from (select 1 as a,2 as b,3 as c,4 as d) base"}';
+    const result = formatSqlJson(
+      project(source),
+      { ...configuration, format: { ...format, maxLineWidth: 300 } },
+      { tabSize: 2, insertSpaces: true, eol: '\n' },
+    );
+
+    expect(result).toContain([
+      '  SELECT a, b, c, d',
+      '  FROM (',
+      '    SELECT 1 AS a, 2 AS b, 3 AS c, 4 AS d',
+      '  ) base"',
+    ].join('\n'));
   });
 
   it('counts embedded SQL indentation when deciding whether to expand a CASE expression', () => {
