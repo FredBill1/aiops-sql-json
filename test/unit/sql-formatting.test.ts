@@ -493,6 +493,56 @@ describe('SQL formatting', () => {
     ].join('\n'));
   });
 
+  it.each(SQL_DIALECTS)('counts parenthesized logical subtrees toward maxInlineItems for %s', (dialect) => {
+    const source = 'select 1 where 1=1 and (1=1 or 1=1 and 1=1 and 1=1) and 1=1;';
+    const formatConfiguration = { ...configuration, maxLineWidth: 300 };
+    const result = formatSql(source, dialect, placeholders, formatConfiguration, editor).text;
+
+    expect(result).toBe([
+      'SELECT 1',
+      'WHERE',
+      '  1 = 1',
+      '  AND (1 = 1 OR 1 = 1 AND 1 = 1 AND 1 = 1)',
+      '  AND 1 = 1;',
+    ].join('\n'));
+    expect(formatSql(result, dialect, placeholders, formatConfiguration, editor).text).toBe(result);
+  });
+
+  it('recursively reapplies maxInlineItems inside parenthesized logical subtrees', () => {
+    const source = 'select 1 where a=1 and (b=2 or c=3 and d=4 and e=5 and f=6) and g=7;';
+    const formatConfiguration = { ...configuration, maxLineWidth: 300 };
+    const result = formatSql(source, 'spark', placeholders, formatConfiguration, editor).text;
+
+    expect(result).toBe([
+      'SELECT 1',
+      'WHERE',
+      '  a = 1',
+      '  AND (',
+      '    b = 2',
+      '    OR c = 3 AND d = 4 AND e = 5 AND f = 6',
+      '  )',
+      '  AND g = 7;',
+    ].join('\n'));
+    expect(formatSql(result, 'spark', placeholders, formatConfiguration, editor).text).toBe(result);
+  });
+
+  it('keeps semantic expression containers opaque to the high-level logical item limit', () => {
+    const source = 'select value from t where predicate_fn(a=1 and b=2 and c=3 and d=4 and e=5)';
+    const result = formatSql(
+      source,
+      'spark',
+      placeholders,
+      { ...configuration, maxLineWidth: 300 },
+      editor,
+    ).text;
+
+    expect(result).toBe([
+      'SELECT value',
+      'FROM t',
+      'WHERE PREDICATE_FN(a = 1 AND b = 2 AND c = 3 AND d = 4 AND e = 5)',
+    ].join('\n'));
+  });
+
   it('counts BETWEEN as one predicate and honors logical operator placement', () => {
     const four = formatSql(
       'select value from t where score BETWEEN 1 and 2 and a=1 and b=2 and c=3',

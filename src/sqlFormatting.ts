@@ -699,26 +699,19 @@ function collectLogicalGroups(
   tokens: readonly FormattingToken[],
   roots: LogicalGroup[],
 ): void {
-  const logical = isLogicalNode(node);
-  if (logical && !parentLogical) {
-    const group = makeLogicalGroup(node, tokens);
-    if (group) roots.push(group);
-  }
-  for (const value of Object.values(node.args)) {
-    if (isSqlAstNode(value)) {
-      collectLogicalGroups(value, logical, tokens, roots);
-    } else if (Array.isArray(value)) {
-      for (const child of value) {
-        if (isSqlAstNode(child)) collectLogicalGroups(child, logical, tokens, roots);
-      }
-    }
+  const group = makeLogicalGroup(node, tokens);
+  const logical = group !== undefined;
+  if (group && !parentLogical) roots.push(group);
+  for (const child of sqlAstNodeChildren(node)) {
+    collectLogicalGroups(child, logical, tokens, roots);
   }
 }
 
 function makeLogicalGroup(node: SqlAstNode, tokens: readonly FormattingToken[]): LogicalGroup | undefined {
-  if (!isLogicalNode(node)) return undefined;
-  const kind = node.kind.toUpperCase() as LogicalGroup['kind'];
-  const operands = flattenLogicalOperands(node, kind);
+  const logicalNode = logicalNodeWithinPredicateWrappers(node, tokens);
+  if (!logicalNode) return undefined;
+  const kind = logicalNode.kind.toUpperCase() as LogicalGroup['kind'];
+  const operands = flattenLogicalOperands(logicalNode, kind);
   const operatorIndices: number[] = [];
   for (let index = 0; index < operands.length - 1; index += 1) {
     const left = operands[index]!;
@@ -728,27 +721,84 @@ function makeLogicalGroup(node: SqlAstNode, tokens: readonly FormattingToken[]):
     ));
     if (operatorIndex >= 0) operatorIndices.push(operatorIndex);
   }
-  if (operatorIndices.length === 0) return undefined;
+  if (operatorIndices.length !== operands.length - 1) return undefined;
   const children = operands.flatMap((operand) => {
     const child = makeLogicalGroup(operand, tokens);
     return child ? [child] : [];
   });
   return {
     kind,
-    start: Math.min(...operands.map((operand) => operand.start)),
-    end: Math.max(...operands.map((operand) => operand.end)),
-    leafCount: operands.reduce((count, operand) => count + countLogicalLeaves(operand), 0),
+    start: node.start,
+    end: node.end,
+    leafCount: operands.reduce((count, operand) => count + countLogicalLeaves(operand, tokens), 0),
     operatorIndices,
     children,
   };
 }
 
-function countLogicalLeaves(node: SqlAstNode): number {
-  if (!isLogicalNode(node)) return 1;
-  const left = node.args.this;
-  const right = node.args.expression;
+function countLogicalLeaves(node: SqlAstNode, tokens: readonly FormattingToken[]): number {
+  const logicalNode = logicalNodeWithinPredicateWrappers(node, tokens);
+  if (!logicalNode) return 1;
+  const left = logicalNode.args.this;
+  const right = logicalNode.args.expression;
   if (!isSqlAstNode(left) || !isSqlAstNode(right)) return 1;
-  return countLogicalLeaves(left) + countLogicalLeaves(right);
+  return countLogicalLeaves(left, tokens) + countLogicalLeaves(right, tokens);
+}
+
+/**
+ * Parentheses and unary predicate wrappers such as NOT are layout boundaries, not logical-leaf boundaries.
+ * Resolve only wrappers whose visible tokens are already accepted as predicate wrappers; semantic containers
+ * such as functions, CASE, casts, aliases, and subqueries remain opaque to the high-level logical item limit.
+ */
+function logicalNodeWithinPredicateWrappers(
+  node: SqlAstNode,
+  tokens: readonly FormattingToken[],
+): SqlAstNode | undefined {
+  let current = node;
+  const seen = new Set<SqlAstNode>();
+  while (!isLogicalNode(current)) {
+    if (seen.has(current)) return undefined;
+    seen.add(current);
+    const children = sqlAstNodeChildren(current);
+    if (children.length !== 1) return undefined;
+    const child = children[0]!;
+    if (!isTransparentPredicateWrapper(current, child, tokens)) return undefined;
+    current = child;
+  }
+  return current;
+}
+
+function sqlAstNodeChildren(node: SqlAstNode): SqlAstNode[] {
+  return Object.values(node.args).flatMap(sqlAstNodesInValue);
+}
+
+function sqlAstNodesInValue(value: SqlAstValue): SqlAstNode[] {
+  if (isSqlAstNode(value)) return [value];
+  if (Array.isArray(value)) return value.flatMap(sqlAstNodesInValue);
+  return [];
+}
+
+function isTransparentPredicateWrapper(
+  wrapper: SqlAstNode,
+  child: SqlAstNode,
+  tokens: readonly FormattingToken[],
+): boolean {
+  if (wrapper.start > child.start || wrapper.end < child.end) return false;
+  for (const token of tokens) {
+    if (token.end <= wrapper.start || token.start >= wrapper.end) continue;
+    if (token.start < wrapper.start || token.end > wrapper.end) return false;
+    if (token.start >= child.start && token.end <= child.end) continue;
+    if (token.end <= child.start) {
+      if (!isPredicateWrapperPrefix(token)) return false;
+      continue;
+    }
+    if (token.start >= child.end) {
+      if (!isPredicateWrapperSuffix(token)) return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 function flattenLogicalOperands(node: SqlAstNode, kind: LogicalGroup['kind']): SqlAstNode[] {

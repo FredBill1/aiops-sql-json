@@ -5,6 +5,7 @@
 - Fixed schema inference for Spark SQL CTAS statements with parenthesized queries such as `CREATE TABLE t AS (SELECT ...)`.
 - Unified semantic analysis for parenthesized `SELECT`, `UNION`, and `VALUES` query roots.
 - Added regression tests for parenthesized and nested query expressions.
+- Fixed `aiopsSqlJson.format.maxInlineItems` for nested `AND`/`OR` expressions: logical predicates inside parentheses are now counted toward the enclosing item limit, and nested groups are recursively expanded when they exceed the configured limit.
 
 ## 0.0.11
 
