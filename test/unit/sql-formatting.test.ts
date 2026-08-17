@@ -716,6 +716,35 @@ describe('SQL formatting', () => {
     expect(result.text).toContain('FROM source_table');
   });
 
+  it('keeps function parentheses local in unwrapped CREATE TABLE AS SELECT', () => {
+    const source = [
+      'create table tmp_table as',
+      'select abs(1) as a',
+    ].join('\n');
+
+    const formatted = formatSql(
+      source,
+      'spark',
+      placeholders,
+      configuration,
+      editor,
+    ).text;
+
+    expect(formatted).toBe([
+      'CREATE TABLE tmp_table AS',
+      'SELECT ABS(1) AS a',
+    ].join('\n'));
+    expect(formatted).not.toContain('ABS (');
+
+    expect(formatSql(
+      formatted,
+      'spark',
+      placeholders,
+      configuration,
+      editor,
+    ).text).toBe(formatted);
+  });
+
   it('supports leading list commas and configurable multi-statement terminators', () => {
     const leading = formatSql(
       'select a,b from source_table',

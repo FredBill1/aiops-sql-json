@@ -18,6 +18,11 @@ describe('SQL analysis', () => {
     expect(analysis.tokens.some((token) => token.type === 'comment')).toBe(true);
   });
 
+  it('accepts Spark CTAS with hash functions', () => {
+    const sql = "CREATE TABLE tmp_table AS SELECT 1 AS a, '2' AS b, hash(3) AS c, xxhash64(4) AS d";
+    expect(analyzeSql(sql, 'spark', []).issues).toEqual([]);
+  });
+
   it('supports configurable placeholder masking', () => {
     const placeholders = compilePlaceholderPatterns(['\\$\\{[^}]+\\}']).patterns;
     const strict = analyzeSql('SELECT * FROM ${table};', 'spark', []);

@@ -31,6 +31,9 @@ describe('SQL catalogs', () => {
 
   it('contains representative dialect-specific functions', () => {
     expect(getSqlCatalog('spark').functions).toContain('ARRAYS_ZIP');
+    expect(getSqlCatalog('spark').functions).toEqual(expect.arrayContaining([
+      'CRC32', 'HASH', 'MD5', 'SHA', 'SHA1', 'SHA2', 'XXHASH64',
+    ]));
     expect(getSqlCatalog('flink').functions).toContain('CURRENT_WATERMARK');
     expect(getSqlCatalog('mysql').functions).toContain('JSON_TABLE');
     expect(getSqlCatalog('postgresql').functions).toContain('TO_REGCLASS');
@@ -73,6 +76,23 @@ describe('DDL schema extraction', () => {
       'view:sales.order_ids',
     ]);
     expect(snapshot.tables[1]?.columns.map((column) => column.name)).toEqual(['id']);
+  });
+
+  it('infers CTAS columns for the global schema index', () => {
+    const parsed = parseDdlSchema(
+      "CREATE TABLE tmp_table AS SELECT 1 AS a, '2' AS b, hash(3) AS c, xxhash64(4) AS d;",
+      'spark',
+      'ctas.sql',
+    );
+    const snapshot = createSchemaSnapshot([parsed]);
+
+    expect(snapshot.issues).toEqual([]);
+    expect(snapshot.tables).toHaveLength(1);
+    expect(snapshot.tables[0]?.kind).toBe('table');
+    expect(snapshot.tables[0]?.columns.map((column) => column.name)).toEqual(['a', 'b', 'c', 'd']);
+    expect(snapshot.tables[0]?.columns.map((column) => column.typeFamily)).toEqual([
+      'number', 'string', 'number', 'number',
+    ]);
   });
 
   it('reports unresolved and duplicate schema views', () => {
@@ -307,6 +327,27 @@ SELECT id FROM local_orders;`;
     expect(issues.some((issue) => issue.code === 'unknown-column')).toBe(false);
     expect(analyzeSqlSemantics(
       'CREATE VIEW bad_view AS SELECT missing FROM sales.orders;',
+      'spark',
+      [],
+      schema,
+      [],
+    ).some((issue) => issue.code === 'unknown-column')).toBe(true);
+  });
+
+  it('creates inferred local CTAS tables and validates their queries', () => {
+    const sql = `CREATE TABLE local_orders AS
+SELECT id, hash(amount) AS amount_hash, xxhash64(customer_id) AS customer_hash
+FROM sales.orders;
+SELECT id, amount_hash, customer_hash FROM local_orders;`;
+
+    expect(analyzeSqlSemantics(sql, 'spark', [], schema, [])).toEqual([]);
+    const snapshot = getSqlSchemaAtOffset(sql, sql.lastIndexOf('SELECT'), 'spark', [], schema);
+    const table = snapshot.tables.find((candidate) => candidate.name === 'local_orders');
+    expect(table?.kind).toBe('table');
+    expect(table?.columns.map((column) => column.name)).toEqual(['id', 'amount_hash', 'customer_hash']);
+
+    expect(analyzeSqlSemantics(
+      'CREATE TABLE bad_ctas AS SELECT missing FROM sales.orders;',
       'spark',
       [],
       schema,

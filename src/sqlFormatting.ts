@@ -377,7 +377,11 @@ function classifyStructuralParentheses(
     const table = create >= 0 ? words.indexOf('TABLE', create + 1) : -1;
     if (table >= 0) {
       const suffix = statement.findIndex((_, index) => index > table && isCreateTableSuffixStart(statement, index));
-      const boundary = suffix >= 0 ? suffix : statement.length;
+      const queryStart = statement.findIndex((_, index) => (
+        index > table && isCreateTableQueryStart(statement, index)
+      ));
+      const boundaryCandidates = [suffix, queryStart].filter((value) => value >= 0);
+      const boundary = boundaryCandidates.length > 0 ? Math.min(...boundaryCandidates) : statement.length;
       const open = statement.findIndex((token, index) => index > table && index < boundary && token.raw === '(');
       if (open >= 0 && structural.get(start + open) !== 'query') {
         structural.set(start + open, 'structuralList');
@@ -430,13 +434,18 @@ function identifyDdlClauseStarts(
           continue;
         }
         if (depth > 0) continue;
-        if (token.upper === 'AS' && ['SELECT', 'WITH'].includes(tokens[index + 1]?.upper ?? '')) break;
+        if (isCreateTableQueryStart(tokens, index)) break;
         if (isCreateTableSuffixStart(tokens, index)) starts.add(index);
       }
     }
     statementStart = statementEnd + 1;
   }
   return starts;
+}
+
+function isCreateTableQueryStart(tokens: readonly FormattingToken[], index: number): boolean {
+  return tokens[index]?.upper === 'AS'
+    && ['SELECT', 'WITH'].includes(tokens[index + 1]?.upper ?? '');
 }
 
 function isCreateTableSuffixStart(tokens: readonly FormattingToken[], index: number): boolean {

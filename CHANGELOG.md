@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added inferred Spark CTAS schemas and validation for their source queries
+- Added the common `crc32`, `hash`, `md5`, `sha`, `sha1`, `sha2`, and `xxhash64` built-ins.
 - Decoupled structural wrapper placement from comma-list expansion: query wrappers no longer force nested SELECT items apart, CREATE/INSERT lists use semantic item fitting, and `structuralParenthesisPosition` is honored independently from `layoutMode`.
 - Added `aiopsSqlJson.format.maxInlineItems` with a default of four, expanding over-limit high-level and structural lists, CASE branches, and logical predicate groups at semantic boundaries.
 - Replaced the CASE-only and statement-list layout settings with `aiopsSqlJson.format.layoutMode`, supporting compact semantic fitting and consistently expanded high-level SQL layouts.

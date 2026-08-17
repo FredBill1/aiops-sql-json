@@ -105,10 +105,11 @@ export interface SchemaSnapshot {
   issues: readonly SchemaIssue[];
 }
 
-export interface SchemaViewDefinition {
+export interface SchemaQueryDefinition {
   name: string;
   normalizedName: string;
   normalizedLeafName: string;
+  kind: 'table' | 'view';
   query: string;
   explicitColumns: readonly string[];
   explicitColumnDefinitions?: readonly SqlSymbolDefinition[];
@@ -121,7 +122,7 @@ export interface SchemaViewDefinition {
 
 export interface ParsedDdlSchema {
   tables: SchemaTable[];
-  views: SchemaViewDefinition[];
+  queryDefinitions: SchemaQueryDefinition[];
   issues: SchemaIssue[];
 }
 
@@ -205,7 +206,7 @@ export function parseDdlSchema(
   if (syntax.issues.length > 0) {
     return {
       tables: [],
-      views: [],
+      queryDefinitions: [],
       issues: syntax.issues.map((issue) => ({
         source,
         start: issue.start,
@@ -218,7 +219,7 @@ export function parseDdlSchema(
 
   // DT is the final syntax gate only. A syntactically valid statement that the
   // normalized AST cannot represent is intentionally skipped conservatively.
-  return { tables: [], views: [], issues: [] };
+  return { tables: [], queryDefinitions: [], issues: [] };
 }
 
 function parseAstDdlSchema(
@@ -228,7 +229,7 @@ function parseAstDdlSchema(
   creates: readonly SqlAstNode[],
 ): ParsedDdlSchema {
   const tables: SchemaTable[] = [];
-  const views: SchemaViewDefinition[] = [];
+  const queryDefinitions: SchemaQueryDefinition[] = [];
   const issues: SchemaIssue[] = [];
   const statements = splitSqlStatements(text, dialect, []);
   for (const create of creates) {
@@ -286,37 +287,29 @@ function parseAstDdlSchema(
         });
         continue;
       }
-      if (columns.length === 0) {
-        issues.push({
+      if (columns.length > 0) {
+        tables.push({
+          name,
+          normalizedName,
+          normalizedLeafName,
+          kind: 'table',
+          temporary: /\bTEMP(?:ORARY)?\b/iu.test(text.slice(Math.max(0, create.start - 32), tableNode.start)),
+          columns,
           source,
           start: tableNode.start,
           end: tableNode.end,
-          message: `Table ${name} has no explicit column definitions and cannot be used as an offline schema.`,
-          code: 'schema-table-without-columns',
+          definitions: [symbolDefinition(
+            'table',
+            name,
+            source,
+            tableNode.start,
+            tableNode.end,
+            astNameSpan(tableNode),
+            name,
+          )],
         });
         continue;
       }
-      tables.push({
-        name,
-        normalizedName,
-        normalizedLeafName,
-        kind: 'table',
-        temporary: /\bTEMP(?:ORARY)?\b/iu.test(text.slice(Math.max(0, create.start - 32), tableNode.start)),
-        columns,
-        source,
-        start: tableNode.start,
-        end: tableNode.end,
-        definitions: [symbolDefinition(
-          'table',
-          name,
-          source,
-          tableNode.start,
-          tableNode.end,
-          astNameSpan(tableNode),
-          name,
-        )],
-      });
-      continue;
     }
 
     const queryNode = astChild(create, 'expression');
@@ -325,8 +318,8 @@ function parseAstDdlSchema(
         source,
         start: tableNode.start,
         end: tableNode.end,
-        message: `View ${name} has no query whose output columns can be inferred.`,
-        code: 'schema-view-without-query',
+        message: `${kind === 'table' ? 'Table' : 'View'} ${name} has no columns or query whose output columns can be inferred.`,
+        code: `schema-${kind}-without-query`,
       });
       continue;
     }
@@ -343,19 +336,20 @@ function parseAstDdlSchema(
         source,
         start: tableNode.start,
         end: tableNode.end,
-        message: `View ${name} has no query whose output columns can be inferred.`,
-        code: 'schema-view-without-query',
+        message: `${kind === 'table' ? 'Table' : 'View'} ${name} has no query whose output columns can be inferred.`,
+        code: `schema-${kind}-without-query`,
       });
       continue;
     }
-    const explicitColumnNodes = schema
+    const explicitColumnNodes = kind === 'view' && schema
       ? astChildren(schema, 'expressions').filter((node) => node.role === 'identifier')
       : [];
     const explicitColumns = explicitColumnNodes.map((node) => node.name);
-    views.push({
+    queryDefinitions.push({
       name,
       normalizedName,
       normalizedLeafName,
+      kind,
       query: text.slice(queryStart, queryEnd),
       explicitColumns,
       explicitColumnDefinitions: explicitColumnNodes.map((node) => symbolDefinition(
@@ -368,7 +362,7 @@ function parseAstDdlSchema(
       queryStart,
     });
   }
-  return { tables, views, issues };
+  return { tables, queryDefinitions, issues };
 }
 
 function collectAstNodes(node: SqlAstNode, predicate: (candidate: SqlAstNode) => boolean): SqlAstNode[] {
@@ -395,20 +389,20 @@ export function createSchemaSnapshot(
 ): SchemaSnapshot {
   const issues = parsed.flatMap((item) => item.issues);
   const allTables = parsed.flatMap((item) => item.tables);
-  const allViews = parsed.flatMap((item) => item.views);
-  const grouped = new Map<string, Array<SchemaTable | SchemaViewDefinition>>();
-  for (const object of [...allTables, ...allViews]) {
+  const allQueryDefinitions = parsed.flatMap((item) => item.queryDefinitions);
+  const grouped = new Map<string, Array<SchemaTable | SchemaQueryDefinition>>();
+  for (const object of [...allTables, ...allQueryDefinitions]) {
     const group = grouped.get(object.normalizedName) ?? [];
     group.push(object);
     grouped.set(object.normalizedName, group);
   }
   const tables: SchemaTable[] = [];
-  const views: SchemaViewDefinition[] = [];
+  const queryDefinitions: SchemaQueryDefinition[] = [];
   for (const group of grouped.values()) {
     if (group.length === 1) {
       const object = group[0]!;
-      if (isSchemaViewDefinition(object)) {
-        views.push(object);
+      if (isSchemaQueryDefinition(object)) {
+        queryDefinitions.push(object);
       } else {
         tables.push(object);
       }
@@ -420,66 +414,76 @@ export function createSchemaSnapshot(
         start: object.start,
         end: object.end,
         message: `Duplicate schema definition for object ${object.name}.`,
-        code: group.every((candidate) => !isSchemaViewDefinition(candidate))
+        code: group.every((candidate) => candidate.kind === 'table')
           ? 'duplicate-schema-table'
           : 'duplicate-schema-object',
       });
     }
   }
 
-  let pending = [...views];
+  let pending = [...queryDefinitions];
   while (pending.length > 0) {
-    const remaining: SchemaViewDefinition[] = [];
+    const remaining: SchemaQueryDefinition[] = [];
     let resolvedAny = false;
-    for (const view of pending) {
+    for (const definition of pending) {
       const snapshot: SchemaSnapshot = { tables, issues: [] };
-      const model = buildSqlModel(view.query, view.dialect, snapshot, [], udfs, true);
-      let columns = deriveQueryColumns(view.query, view.dialect, snapshot, []);
-      if (view.explicitColumns.length > 0 && columns.length === view.explicitColumns.length) {
-        columns = view.explicitColumns.map((name, index) => {
+      const model = buildSqlModel(definition.query, definition.dialect, snapshot, [], udfs, true);
+      let columns = deriveQueryColumns(definition.query, definition.dialect, snapshot, []);
+      if (definition.explicitColumns.length > 0 && columns.length === definition.explicitColumns.length) {
+        columns = definition.explicitColumns.map((name, index) => {
           const inferred = columns[index];
           return renameVirtualColumn(
             name,
             inferred,
-            view.dialect,
-            view.explicitColumnDefinitions?.[index]
-              ? [view.explicitColumnDefinitions[index]!]
+            definition.dialect,
+            definition.explicitColumnDefinitions?.[index]
+              ? [definition.explicitColumnDefinitions[index]!]
               : undefined,
           );
         });
       } else {
-        columns = columns.map((column) => rebaseColumnDefinitions(column, view.queryStart, view.source));
+        columns = columns.map((column) => rebaseColumnDefinitions(
+          column,
+          definition.queryStart,
+          definition.source,
+        ));
       }
       const validColumns = columns.length > 0 && columns.every((column) => isUsableOutputColumn(column.name));
       if (model.issues.length === 0 && validColumns
-        && (view.explicitColumns.length === 0 || view.explicitColumns.length === columns.length)) {
+        && (definition.explicitColumns.length === 0 || definition.explicitColumns.length === columns.length)) {
         tables.push({
-          name: view.name,
-          normalizedName: view.normalizedName,
-          normalizedLeafName: view.normalizedLeafName,
-          kind: 'view',
+          name: definition.name,
+          normalizedName: definition.normalizedName,
+          normalizedLeafName: definition.normalizedLeafName,
+          kind: definition.kind,
           columns,
-          source: view.source,
-          start: view.start,
-          end: view.end,
+          source: definition.source,
+          start: definition.start,
+          end: definition.end,
           definitions: [symbolDefinition(
-            'view', view.name, view.source, view.start, view.end,
-            { start: view.start, end: view.end }, view.name,
+            definition.kind,
+            definition.name,
+            definition.source,
+            definition.start,
+            definition.end,
+            { start: definition.start, end: definition.end },
+            definition.name,
           )],
         });
         resolvedAny = true;
       } else {
-        remaining.push(view);
+        remaining.push(definition);
       }
     }
     if (!resolvedAny) {
-      for (const view of remaining) {
+      for (const definition of remaining) {
+        const label = definition.kind === 'table' ? 'Table' : 'View';
         issues.push({
-          source: view.source,
-          start: view.start,
-          end: view.end,
-          message: `View ${view.name} has unresolved dependencies or output columns that cannot be inferred.`,
-          code: 'schema-view-unresolved',
+          source: definition.source,
+          start: definition.start,
+          end: definition.end,
+          message: `${label} ${definition.name} has unresolved dependencies or output columns that cannot be inferred.`,
+          code: `schema-${definition.kind}-unresolved`,
         });
       }
       break;
@@ -864,66 +868,60 @@ function applyLocalDdl(
     const parsed = parseAstDdlSchema(text, dialect, '', [astStatement]);
     if (kind === 'table') {
       const parsedTable = parsed.tables[0];
-      if (!parsedTable) {
-        const issue = parsed.issues[0];
-        return reportIssues ? [ddlIssue(
-          statement,
-          issue?.start ?? objectNode.start,
-          issue?.end ?? objectNode.end,
-          issue?.message ?? `Table ${name} has no explicit column definitions; CTAS does not create a local schema object.`,
-          issue?.code === 'duplicate-schema-column' ? issue.code : 'local-table-without-columns',
-        )] : [];
+      if (parsedTable) {
+        prepareReplacement(state, existing.table, localMatch, orReplace, temporary);
+        state.local.set(normalizedName, {
+          ...parsedTable,
+          temporary,
+          source: 'local',
+          start: statement.start + parsedTable.start,
+          end: statement.start + parsedTable.end,
+          columns: parsedTable.columns.map((column) => rebaseColumnDefinitions(
+            column,
+            statement.start,
+            CURRENT_SQL_DOCUMENT_SOURCE,
+          )),
+          definitions: rebaseDefinitions(
+            parsedTable.definitions,
+            statement.start,
+            CURRENT_SQL_DOCUMENT_SOURCE,
+          ),
+        });
+        return [];
       }
-      prepareReplacement(state, existing.table, localMatch, orReplace, temporary);
-      state.local.set(normalizedName, {
-        ...parsedTable,
-        temporary,
-        source: 'local',
-        start: statement.start + parsedTable.start,
-        end: statement.start + parsedTable.end,
-        columns: parsedTable.columns.map((column) => rebaseColumnDefinitions(
-          column,
-          statement.start,
-          CURRENT_SQL_DOCUMENT_SOURCE,
-        )),
-        definitions: rebaseDefinitions(
-          parsedTable.definitions,
-          statement.start,
-          CURRENT_SQL_DOCUMENT_SOURCE,
-        ),
-      });
-      return [];
     }
 
-    const view = parsed.views[0];
-    if (!view) {
+    const definition = parsed.queryDefinitions.find((candidate) => candidate.kind === kind);
+    const label = kind === 'table' ? 'Table' : 'View';
+    if (!definition) {
+      const issue = parsed.issues[0];
       return reportIssues ? [ddlIssue(
         statement,
-        objectNode.start,
-        objectNode.end,
-        `View ${name} has no query whose output columns can be inferred.`,
-        'local-view-without-query',
+        issue?.start ?? objectNode.start,
+        issue?.end ?? objectNode.end,
+        issue?.message ?? `${label} ${name} has no query whose output columns can be inferred.`,
+        issue?.code === 'duplicate-schema-column' ? issue.code : `local-${kind}-without-query`,
       )] : [];
     }
-    const queryModel = buildSqlModel(view.query, dialect, effective, placeholders, udfs, true);
+    const queryModel = buildSqlModel(definition.query, dialect, effective, placeholders, udfs, true);
     const queryIssues = queryModel.issues.map((issue) => offsetSemanticIssue(
       issue,
-      statement.start + view.queryStart,
+      statement.start + definition.queryStart,
     ));
-    let columns = deriveQueryColumns(view.query, dialect, effective, placeholders);
-    if (view.explicitColumns.length > 0) {
-      if (view.explicitColumns.length !== columns.length) {
+    let columns = deriveQueryColumns(definition.query, dialect, effective, placeholders);
+    if (definition.explicitColumns.length > 0) {
+      if (definition.explicitColumns.length !== columns.length) {
         return reportIssues ? [...queryIssues, ddlIssue(
           statement,
           objectNode.start,
           objectNode.end,
-          `View ${name} declares ${view.explicitColumns.length} column(s), but its query returns ${columns.length}.`,
-          'local-view-column-count',
+          `${label} ${name} declares ${definition.explicitColumns.length} column(s), but its query returns ${columns.length}.`,
+          `local-${kind}-column-count`,
         )] : [];
       }
-      columns = view.explicitColumns.map((name, index) => {
+      columns = definition.explicitColumns.map((name, index) => {
         const inferred = columns[index];
-        const explicitDefinition = view.explicitColumnDefinitions?.[index];
+        const explicitDefinition = definition.explicitColumnDefinitions?.[index];
         return renameVirtualColumn(
           name,
           inferred,
@@ -936,7 +934,7 @@ function applyLocalDdl(
     } else {
       columns = columns.map((column) => rebaseColumnDefinitions(
         column,
-        statement.start + view.queryStart,
+        statement.start + definition.queryStart,
         CURRENT_SQL_DOCUMENT_SOURCE,
       ));
     }
@@ -947,8 +945,8 @@ function applyLocalDdl(
           statement,
           objectNode.start,
           objectNode.end,
-          `View ${name} has output columns that cannot be inferred.`,
-          'local-view-unresolved',
+          `${label} ${name} has output columns that cannot be inferred.`,
+          `local-${kind}-unresolved`,
         )] : []),
       ] : [];
     }
@@ -958,14 +956,14 @@ function applyLocalDdl(
       name,
       normalizedName,
       normalizedLeafName: parts.at(-1) ? normalizeIdentifier(parts.at(-1)!.text, parts.at(-1)!.quoted, dialect) : '',
-      kind: 'view',
+      kind,
       temporary,
       columns,
       source: 'local',
       start: statement.start + objectNode.start,
       end: statement.start + objectNode.end,
       definitions: [symbolDefinition(
-        'view',
+        kind,
         name,
         CURRENT_SQL_DOCUMENT_SOURCE,
         statement.start + objectNode.start,
@@ -2157,6 +2155,12 @@ function inferAstExpressionType(
   if (['count', 'row_number', 'rank', 'dense_rank', 'size', 'cardinality'].includes(normalizedFunction)) {
     return dataTypeFromFamily('number');
   }
+  if (['crc32', 'hash', 'xxhash64'].includes(normalizedFunction)) {
+    return dataTypeFromFamily('number');
+  }
+  if (['md5', 'sha', 'sha1', 'sha2'].includes(normalizedFunction)) {
+    return dataTypeFromFamily('string');
+  }
   if (['sum', 'avg', 'max', 'min'].includes(normalizedFunction) && args[0]) {
     return inferAstExpressionType(args[0], scope, context, environment);
   }
@@ -3196,9 +3200,9 @@ function isSparkDateOrTimestamp(dataType: SqlDataType): boolean {
     && (dataType.family === 'date' || (dataType.family === 'time' && !isSparkTrueTime(dataType)));
 }
 
-function isSchemaViewDefinition(
-  object: SchemaTable | SchemaViewDefinition,
-): object is SchemaViewDefinition {
+function isSchemaQueryDefinition(
+  object: SchemaTable | SchemaQueryDefinition,
+): object is SchemaQueryDefinition {
   return 'query' in object;
 }
 
