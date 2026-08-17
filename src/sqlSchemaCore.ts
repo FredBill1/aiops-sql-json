@@ -562,7 +562,7 @@ export function analyzeSqlSemantics(
         sparkStoreAssignmentPolicy,
       );
     }
-    const kind = sqlStatementKind(statement.text);
+    const kind = sqlStatementKind(statement.text, dialect, placeholders);
     if (kind === 'create' || kind === 'drop') {
       issues.push(...applyLocalDdl(statement, dialect, placeholders, snapshot, state, udfs, true));
     } else if (isDataStatementKind(kind)) {
@@ -594,7 +594,7 @@ export function getSqlSchemaAtOffset(
     if (statement.end > offset || (statement.end === offset && !/;\s*$/u.test(statement.text))) {
       break;
     }
-    const kind = sqlStatementKind(statement.text);
+    const kind = sqlStatementKind(statement.text, dialect, placeholders);
     if (kind === 'create' || kind === 'drop') {
       applyLocalDdl(statement, dialect, placeholders, snapshot, state, udfs, false);
     }
@@ -658,7 +658,7 @@ export function getSqlSymbolAtOffset(
   if (!statement) return undefined;
   const effective = getSqlSchemaAtOffset(text, statement.start, dialect, placeholders, snapshot, udfs);
   const localOffset = Math.max(0, Math.min(statement.text.length, offset - statement.start));
-  const kind = sqlStatementKind(statement.text);
+  const kind = sqlStatementKind(statement.text, dialect, placeholders);
   if (kind === 'create' || kind === 'drop') {
     const declaration = resolveDdlSymbolAtOffset(statement.text, localOffset, dialect, effective);
     return declaration ? offsetSymbolResolution(declaration, statement.start) : undefined;
@@ -785,15 +785,21 @@ function appendStatementRange(
   }
 }
 
-function sqlStatementKind(text: string): SqlStatementKind {
+function sqlStatementKind(
+  text: string,
+  dialect: SqlDialect,
+  placeholders: readonly RegExp[],
+): SqlStatementKind {
   const body = withoutLeadingSqlComments(text);
   if (/^WITH\b/iu.test(body)) return 'select';
   const match = /^(CREATE|DROP|SELECT|INSERT|UPDATE|DELETE|MERGE)\b/iu.exec(body);
   const keyword = match?.[1]?.toLocaleLowerCase();
-  return keyword === 'create' || keyword === 'drop' || keyword === 'select' || keyword === 'insert'
-    || keyword === 'update' || keyword === 'delete' || keyword === 'merge'
-    ? keyword
-    : 'other';
+  if (keyword === 'create' || keyword === 'drop' || keyword === 'select' || keyword === 'insert'
+    || keyword === 'update' || keyword === 'delete' || keyword === 'merge') {
+    return keyword;
+  }
+  const statement = parseSqlAst(text, dialect, placeholders)?.statements[0];
+  return statement && isAstQueryNode(statement) ? 'select' : 'other';
 }
 
 function isDataStatementKind(kind: SqlStatementKind): boolean {
@@ -1213,12 +1219,24 @@ function buildAstSqlModel(
   };
 }
 
+/**
+ * Query shapes that the normalized semantic model can analyze independent of
+ * their surrounding statement context. Keep this predicate in sync with
+ * analyzeAstQuery when adding a new normalized query primary.
+ */
+function isAstQueryNode(node: SqlAstNode): boolean {
+  return node.role === 'select'
+    || node.role === 'set-operation'
+    || node.role === 'subquery'
+    || node.kind === 'values';
+}
+
 function analyzeAstStatement(
   statement: SqlAstNode,
   context: AstModelContext,
   ctes: ReadonlyMap<string, RelationBinding>,
 ): SchemaColumn[] {
-  if (statement.role === 'select' || statement.role === 'set-operation') {
+  if (isAstQueryNode(statement)) {
     return analyzeAstQuery(statement, context, undefined, ctes).columns;
   }
   if (statement.role === 'insert') {
@@ -1241,6 +1259,9 @@ function analyzeAstQuery(
     return inner
       ? analyzeAstQuery(inner, context, parent, inheritedCtes)
       : { columns: [], open: true };
+  }
+  if (query.kind === 'values') {
+    return analyzeAstValuesQuery(query, context, parent, inheritedCtes);
   }
   if (query.role === 'set-operation') {
     const left = astChild(query, 'this');
@@ -1291,9 +1312,7 @@ function analyzeAstQuery(
     });
     return { columns, open: leftResult.open || rightResult.open };
   }
-  if (query.role !== 'select') {
-    return { columns: deriveAstValuesColumns(query, context, parent), open: false };
-  }
+  if (query.role !== 'select') return { columns: [], open: true };
 
   const scope: AstScope = {
     start: astQueryStart(context.text, query.start),
@@ -1813,7 +1832,7 @@ function validateAstExpression(
   environment: AstTypeEnvironment = EMPTY_AST_TYPE_ENVIRONMENT,
 ): void {
   if (overlapsAny({ start: node.start, end: node.end }, context.placeholderRanges)) return;
-  if (node.role === 'select' || node.role === 'set-operation') {
+  if (isAstQueryNode(node)) {
     analyzeAstQuery(node, context, scope, ctes);
     return;
   }
@@ -2613,6 +2632,39 @@ function analyzeAstUpdate(
   }
   const where = astChild(update, 'where');
   if (where && context.validate) validateAstExpression(where, scope, ctes, context);
+}
+
+function analyzeAstValuesQuery(
+  node: SqlAstNode,
+  context: AstModelContext,
+  parent: AstScope | undefined,
+  ctes: ReadonlyMap<string, RelationBinding>,
+): AstQueryResult {
+  const scope: AstScope = {
+    start: node.start,
+    end: Math.max(node.end, node.start + 1),
+    depth: parent ? parent.depth + 1 : 0,
+    relations: [],
+    projectionAliases: new Set(),
+    projectionColumns: new Map(),
+    parent,
+  };
+  context.scopes.push(scope);
+
+  for (const row of astChildren(node, 'expressions')) {
+    for (const value of astChildren(row, 'expressions')) {
+      if (context.validate) {
+        validateAstExpression(value, scope, ctes, context);
+      } else {
+        collectAstReferences(value, context);
+      }
+    }
+  }
+
+  return {
+    columns: deriveAstValuesColumns(node, context, scope),
+    open: false,
+  };
 }
 
 function deriveAstValuesColumns(node: SqlAstNode, context: AstModelContext, scope: AstScope | undefined): SchemaColumn[] {
