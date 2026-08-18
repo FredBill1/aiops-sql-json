@@ -179,6 +179,12 @@ WHERE o.amount > 0`;
     expect(analyzeSqlSemantics(subquery, 'spark', [], schema, [])).toEqual([]);
   });
 
+  it('projects bare wildcards through chained CTEs', () => {
+    const sql = 'with t1 as (select 1 as a), t2 as (select *, 2 as b from t1 group by a), '
+      + 't3 as (select *, 3 as c from t2) select a, b, c from t3;';
+    expect(analyzeSqlSemantics(sql, 'spark', [], { tables: [], issues: [] }, [])).toEqual([]);
+  });
+
   it('suppresses references covered by placeholders', () => {
     expect(analyzeSqlSemantics(
       'SELECT ${field} FROM sales.orders',

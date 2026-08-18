@@ -438,6 +438,48 @@ describe('SQL formatting', () => {
     expect(result.text).toMatch(/alpha = 1 AND\n|alpha = 1 and\n/u);
   });
 
+  it('uses arithmetic operators as a max-line-width fallback', () => {
+    const source = 'select 1 - 1.0 * sum(if(1 > 0 and 1 is not null and 1 is not null, 1, 0)) '
+      + '/ nullif(sum(if(1 > 0 and 1 is not null and 1 is not null, 1, 0)), 0) as test;';
+    const formatConfiguration = {
+      ...configuration,
+      maxLineWidth: 120,
+      maxInlineExpressionDepth: 100,
+      maxInlineItems: 100,
+    };
+    const result = formatSql(source, 'spark', placeholders, formatConfiguration, editor).text;
+
+    expect(result).toContain(['SELECT', '  1', '  - 1.0'].join('\n'));
+    expect(result.split('\n').every((line) => line.length <= 120)).toBe(true);
+    expect(formatSql(result, 'spark', placeholders, formatConfiguration, editor).text).toBe(result);
+  });
+
+  it('keeps arithmetic wrapping independent from expression-depth and item limits', () => {
+    const source = 'select 1 + 1 * 1 / 1 * 1 * 1 - 1 + 1 * 1 / 1 * '
+      + '(1 - 1 + 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1) '
+      + '+ 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 '
+      + '+ 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 '
+      + '+ 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 '
+      + '+ 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 + 1 * 1 / 1 * 1 - 1 '
+      + '+ 1 * 1 / 1 * 1;';
+    const strict = { ...configuration, maxInlineExpressionDepth: 1, maxInlineItems: 1 };
+    const permissive = { ...configuration, maxInlineExpressionDepth: 100, maxInlineItems: 100 };
+    const strictResult = formatSql(source, 'spark', placeholders, strict, editor).text;
+    const permissiveResult = formatSql(source, 'spark', placeholders, permissive, editor).text;
+
+    expect(strictResult).toBe(permissiveResult);
+    expect(strictResult).toContain([
+      'SELECT',
+      '  1',
+      '  + 1 * 1 / 1 * 1 * 1',
+      '  - 1',
+    ].join('\n'));
+    expect(strictResult).toContain('\n  + ');
+    expect(strictResult).toContain('\n  - ');
+    expect(strictResult.split('\n').every((line) => line.length <= 120)).toBe(true);
+    expect(formatSql(strictResult, 'spark', placeholders, strict, editor).text).toBe(strictResult);
+  });
+
   it('breaks a long AND chain only at complete predicate boundaries', () => {
     const source = "select '1' where '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1';";
     const result = formatSql(source, 'spark', placeholders, configuration, editor).text;

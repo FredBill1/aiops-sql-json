@@ -136,7 +136,7 @@ export function formatSql(
   const ddlClauseStarts = identifyDdlClauseStarts(tokens, pairs);
   const logicalBreaks = planLogicalBreaks(tokens, parsed.statements, pairs, configuration, editor);
   expandParenthesesContainingLogicalBreaks(pairs, logicalBreaks);
-  const builder = new SqlLayoutBuilder(
+  const buildLines = (arithmeticBreaks: ReadonlySet<number>): FormattedSqlLine[] => new SqlLayoutBuilder(
     configuration,
     editor,
     tokens,
@@ -144,8 +144,13 @@ export function formatSql(
     cases,
     ddlClauseStarts,
     logicalBreaks,
-  );
-  const lines = builder.format();
+    arithmeticBreaks,
+  ).format();
+  let lines = buildLines(new Set<number>());
+  if (formattedLinesExceedWidth(lines, configuration, editor)) {
+    const arithmeticBreaks = planArithmeticBreaks(tokens, parsed.statements, pairs, configuration, editor);
+    if (arithmeticBreaks.size > 0) lines = buildLines(arithmeticBreaks);
+  }
   const output = lines.map((line) => line.text).join(editor.eol);
   verifyTokenEquivalence(text, output, dialect, placeholders, configuration);
   if (!parseSqlAstForFormatting(output, dialect, placeholders)) {
@@ -294,7 +299,7 @@ function annotateExpressionDepth(tokens: FormattingToken[], statements: readonly
 }
 
 function annotateNodeDepth(node: SqlAstNode, parentDepth: number, tokens: FormattingToken[]): void {
-  const depth = parentDepth + (countsAsExpression(node) ? 1 : 0);
+  const depth = parentDepth + (countsAsExpression(node, tokens) ? 1 : 0);
   for (const token of tokens) {
     if (token.start >= node.start && token.end <= node.end) {
       token.expressionDepth = Math.max(token.expressionDepth, depth);
@@ -313,8 +318,8 @@ function annotateValueDepth(value: SqlAstValue, depth: number, tokens: Formattin
   }
 }
 
-function countsAsExpression(node: SqlAstNode): boolean {
-  if (isLogicalNode(node)) return false;
+function countsAsExpression(node: SqlAstNode, tokens: readonly FormattingToken[]): boolean {
+  if (isLogicalNode(node) || arithmeticNodeParts(node, tokens) || isGroupingExpression(node, tokens)) return false;
   return node.role === 'function' || node.role === 'unnest' || node.role === 'subquery'
     || node.role === 'expression';
 }
@@ -692,6 +697,16 @@ function logicalAvailableWidth(
   editor: EditorFormattingOptions,
 ): number {
   const start = tokens.findIndex((token) => token.start >= group.start && token.end <= group.end);
+  return expressionAvailableWidth(start, tokens, pairs, configuration, editor);
+}
+
+function expressionAvailableWidth(
+  start: number,
+  tokens: readonly FormattingToken[],
+  pairs: ReadonlyMap<number, ParenthesisPair>,
+  configuration: SqlFormatConfiguration,
+  editor: EditorFormattingOptions,
+): number {
   const brokenParenthesisDepth = [...pairs.entries()].filter(([index, pair]) => (
     index === pair.open && pair.multiline && pair.open < start && pair.close > start
   )).length;
@@ -896,6 +911,115 @@ function isLogicalNode(node: SqlAstNode): boolean {
   return ['AND', 'OR', 'XOR'].includes(node.kind.toUpperCase());
 }
 
+interface ArithmeticNodeParts {
+  readonly left: SqlAstNode;
+  readonly right: SqlAstNode;
+  readonly operatorIndex: number;
+  readonly precedence: number;
+}
+
+function arithmeticNodeParts(
+  node: SqlAstNode,
+  tokens: readonly FormattingToken[],
+): ArithmeticNodeParts | undefined {
+  const left = node.args.this;
+  const right = node.args.expression;
+  if (!isSqlAstNode(left) || !isSqlAstNode(right)) return undefined;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.end <= left.end) continue;
+    if (token.start >= right.start) break;
+    if (token.start < left.end || token.end > right.start) continue;
+    const precedence = arithmeticPrecedence(token);
+    if (precedence > 0) return { left, right, operatorIndex: index, precedence };
+  }
+  return undefined;
+}
+
+function arithmeticPrecedence(token: FormattingToken): number {
+  if (token.protected) return 0;
+  if (token.raw === '+' || token.raw === '-') return 1;
+  if (token.raw === '*' || token.raw === '/' || token.raw === '%' || token.upper === 'DIV' || token.upper === 'MOD') {
+    return 2;
+  }
+  return 0;
+}
+
+function isGroupingExpression(node: SqlAstNode, tokens: readonly FormattingToken[]): boolean {
+  const children = sqlAstNodeChildren(node);
+  if (children.length !== 1) return false;
+  const child = children[0]!;
+  let opening = false;
+  let closing = false;
+  for (const token of tokens) {
+    if (token.end <= node.start || token.start >= node.end) continue;
+    if (token.start >= child.start && token.end <= child.end) continue;
+    if (token.raw === '(' && token.end <= child.start) {
+      opening = true;
+      continue;
+    }
+    if (token.raw === ')' && token.start >= child.end) {
+      closing = true;
+      continue;
+    }
+    return false;
+  }
+  return opening && closing;
+}
+
+function planArithmeticBreaks(
+  tokens: readonly FormattingToken[],
+  statements: readonly SqlAstNode[],
+  pairs: ReadonlyMap<number, ParenthesisPair>,
+  configuration: SqlFormatConfiguration,
+  editor: EditorFormattingOptions,
+): Set<number> {
+  const breaks = new Set<number>();
+  for (const statement of statements) {
+    planArithmeticNode(statement, tokens, pairs, configuration, editor, breaks);
+  }
+  return breaks;
+}
+
+function planArithmeticNode(
+  node: SqlAstNode,
+  tokens: readonly FormattingToken[],
+  pairs: ReadonlyMap<number, ParenthesisPair>,
+  configuration: SqlFormatConfiguration,
+  editor: EditorFormattingOptions,
+  breaks: Set<number>,
+): void {
+  const parts = arithmeticNodeParts(node, tokens);
+  if (parts) {
+    const range = tokens.filter((token) => token.start >= node.start && token.end <= node.end);
+    const start = range[0] ? tokens.indexOf(range[0]) : -1;
+    if (start >= 0
+      && estimateDisplayedWidth(range, tokens, configuration, editor.tabSize)
+        > expressionAvailableWidth(start, tokens, pairs, configuration, editor)) {
+      for (const operator of arithmeticChainOperatorIndices(node, parts.precedence, tokens)) {
+        breaks.add(operator);
+      }
+    }
+  }
+  for (const child of sqlAstNodeChildren(node)) {
+    planArithmeticNode(child, tokens, pairs, configuration, editor, breaks);
+  }
+}
+
+function arithmeticChainOperatorIndices(
+  node: SqlAstNode,
+  precedence: number,
+  tokens: readonly FormattingToken[],
+): number[] {
+  const parts = arithmeticNodeParts(node, tokens);
+  if (!parts || parts.precedence !== precedence) return [];
+  return [
+    ...arithmeticChainOperatorIndices(parts.left, precedence, tokens),
+    parts.operatorIndex,
+    ...arithmeticChainOperatorIndices(parts.right, precedence, tokens),
+  ];
+}
+
 function pairCases(tokens: readonly FormattingToken[]): Map<number, CasePair> {
   const result = new Map<number, CasePair>();
   const stack: number[] = [];
@@ -975,6 +1099,7 @@ class SqlLayoutBuilder {
     private readonly cases: ReadonlyMap<number, CasePair>,
     private readonly ddlClauseStarts: ReadonlySet<number>,
     private readonly logicalBreaks: ReadonlySet<number>,
+    private readonly arithmeticBreaks: ReadonlySet<number>,
   ) {}
 
   format(): FormattedSqlLine[] {
@@ -1022,6 +1147,8 @@ class SqlLayoutBuilder {
         this.semicolon(index);
       } else if (isLogical(token) && this.logicalBreaks.has(index)) {
         this.logical(token);
+      } else if (this.arithmeticBreaks.has(index)) {
+        this.arithmetic(token);
       } else if (token.kind === 'comment') {
         this.comment(token, index);
       } else {
@@ -1353,6 +1480,11 @@ class SqlLayoutBuilder {
     }
   }
 
+  private arithmetic(token: FormattingToken): void {
+    if (this.current.trim().length > 0) this.finishLine(false);
+    this.appendRaw(displayToken(token, this.tokens, this.configuration), false);
+  }
+
   private comment(token: FormattingToken, index: number): void {
     const previous = this.tokens[index - 1];
     if (this.current.trim().length > 0 && previous && token.sourceLine !== previous.sourceLine) {
@@ -1587,6 +1719,17 @@ function visualWidth(text: string, tabSize: number): number {
     else column += 1;
   }
   return column;
+}
+
+function formattedLinesExceedWidth(
+  lines: readonly FormattedSqlLine[],
+  configuration: SqlFormatConfiguration,
+  editor: EditorFormattingOptions,
+): boolean {
+  const initialIndent = editor.initialIndentColumns ?? 0;
+  return lines.some((line) => (
+    initialIndent + visualWidth(line.text, editor.tabSize) > configuration.maxLineWidth
+  ));
 }
 
 function indentUnit(editor: EditorFormattingOptions): string {

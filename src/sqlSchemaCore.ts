@@ -1456,12 +1456,18 @@ function astProjectionHasOpenOutput(
     return true;
   }
   const expression = projection.role === 'alias' ? astChild(projection, 'this') ?? projection : projection;
-  if (expression.role !== 'column' || expression.name !== '*') return false;
-  const qualifier = astColumnQualifier(expression);
+  const qualifier = astProjectionWildcardQualifier(expression);
+  if (qualifier === undefined) return false;
   const relations = qualifier
     ? scope.relations.filter((binding) => bindingMatchesQualifier(binding, qualifier, context.dialect))
     : scope.relations;
   return relations.some((binding) => binding.unresolved);
+}
+
+function astProjectionWildcardQualifier(expression: SqlAstNode): string | undefined {
+  if (expression.role === 'star') return '';
+  if (expression.role === 'column' && expression.name === '*') return astColumnQualifier(expression);
+  return undefined;
 }
 
 function astQueryStart(text: string, firstNodeStart: number): number {
@@ -2086,8 +2092,8 @@ function deriveAstProjectionColumns(
   const columns: SchemaColumn[] = [];
   for (const projection of projections) {
     const expression = projection.role === 'alias' ? astChild(projection, 'this') ?? projection : projection;
-    if (expression.role === 'column' && expression.name === '*') {
-      const qualifier = astColumnQualifier(expression);
+    const qualifier = astProjectionWildcardQualifier(expression);
+    if (qualifier !== undefined) {
       const relations = qualifier
         ? scope.relations.filter((binding) => bindingMatchesQualifier(binding, qualifier, context.dialect))
         : scope.relations;
