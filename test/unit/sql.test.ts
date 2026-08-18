@@ -9,6 +9,19 @@ describe('SQL analysis', () => {
     expect(analyzeSql('SELEC 1;', dialect, []).issues.length).toBeGreaterThan(0);
   });
 
+  it.each([
+    'select 1 from select 2',
+    'select 1 with',
+  ])('keeps Spark parser errors even when the AST frontend recovers: %s', (sql) => {
+    expect(analyzeSql(sql, 'spark', []).issues.length).toBeGreaterThan(0);
+  });
+
+  it('requires explicit separators between top-level Spark statements', () => {
+    const issues = analyzeSql('select 1 select 2 select 3', 'spark', []).issues;
+    expect(issues.some((issue) => issue.message === 'Expected a semicolon between SQL statements.')).toBe(true);
+    expect(analyzeSql('select 1; select 2; select 3', 'spark', []).issues).toEqual([]);
+  });
+
   it('classifies common SQL tokens', () => {
     const analysis = analyzeSql("SELECT sum(price), 42, 'x' FROM sales -- note", 'spark', []);
     expect(analysis.tokens.some((token) => token.type === 'keyword')).toBe(true);
@@ -40,6 +53,20 @@ describe('SQL analysis', () => {
     const issues = analyzeSql('select data from where and', 'spark', []).issues;
     expect(issues.length).toBeGreaterThan(0);
     expect(issues.some((issue) => issue.message.includes('relation after FROM'))).toBe(true);
+  });
+
+  it.each([
+    'select 1 with',
+    'select 1 with from source_table',
+    'select 1 group',
+    'select 1 order',
+  ])('rejects structural keywords consumed as incomplete implicit aliases: %s', (sql) => {
+    expect(analyzeSql(sql, 'spark', []).issues.length).toBeGreaterThan(0);
+  });
+
+  it('allows structural words when alias intent is explicit', () => {
+    expect(analyzeSql('select 1 as with', 'spark', []).issues).toEqual([]);
+    expect(analyzeSql('select 1 `with`', 'spark', []).issues).toEqual([]);
   });
 
   it('reports a trailing comma accepted by the permissive AST parser', () => {

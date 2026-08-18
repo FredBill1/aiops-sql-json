@@ -12,7 +12,6 @@ import type { CaretPosition, EntityContext, ParseError, Suggestions } from 'dt-s
 import type { ParserRuleContext, Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
-import { sqlingoCanParse } from './sqlAst';
 
 export const SQL_DIALECTS = [
   'spark',
@@ -50,10 +49,16 @@ interface StructuralSqlIssue extends SqlIssue {
   contextEnd?: number;
 }
 
+interface SqlStatementSlice {
+  readonly startIndex: number;
+  readonly endIndex: number;
+}
+
 export interface ParserLike {
   parse(input: string): ParserRuleContext;
   validate(input: string): ParseError[];
   getAllTokens(input: string): Token[];
+  splitSQLByStatement(input: string): SqlStatementSlice[] | null;
   getSuggestionAtCaretPosition(input: string, caretPosition: CaretPosition): Suggestions | null;
   getAllEntities(input: string, caretPosition?: CaretPosition): EntityContext[] | null;
   createLexer(input: string): { vocabulary: VocabularyLike };
@@ -88,9 +93,13 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
   const masked = maskPlaceholders(text, placeholders).text;
   let errors: ParseError[] = [];
   let antlrTokens: Token[] = [];
+  let statements: SqlStatementSlice[] = [];
   try {
     errors = parser.validate(masked);
     antlrTokens = parser.getAllTokens(masked);
+    if (errors.length === 0) {
+      statements = parser.splitSQLByStatement(masked) ?? [];
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -99,11 +108,10 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
     };
   }
 
-  const hasUnmaskedTemplate = /\$\{|\$[\p{L}_]/u.test(masked);
-  const parserIssues = errors.length > 0 && !hasUnmaskedTemplate && sqlingoCanParse(text, dialect, placeholders)
-    ? []
-    : errors.map((error) => parseErrorToIssue(text, error));
-  const structuralIssues = findStructuralIssues(antlrTokens)
+  // Keep the dialect parser authoritative for syntax. The normalized AST frontend is deliberately
+  // permissive for formatting and semantic recovery, so building an AST is not proof of valid SQL.
+  const parserIssues = errors.map((error) => parseErrorToIssue(text, error));
+  const structuralIssues = findStructuralIssues(antlrTokens, statements)
     .filter((issue) => !parserIssues.some((parserIssue) => parserIssueCoversStructuralIssue(parserIssue, issue)))
     .map(stripStructuralContext);
   const issues = deduplicateIssues([...parserIssues, ...structuralIssues]);
@@ -195,7 +203,10 @@ export function offsetToCaret(text: string, offset: number): CaretPosition {
   return { lineNumber, column };
 }
 
-function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
+function findStructuralIssues(
+  tokens: readonly Token[],
+  statements: readonly SqlStatementSlice[],
+): StructuralSqlIssue[] {
   const significant = tokens.filter((token) => token.channel === 0 && token.start >= 0 && token.stop >= token.start);
   const issues: StructuralSqlIssue[] = [];
   const seen = new Set<string>();
@@ -214,6 +225,15 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
   const listBoundaries = new Set([
     ...relationBoundaries,
     'FROM', 'JOIN', 'ON', 'USING', 'THEN', 'ELSE', 'END', 'WHEN', ']', ',',
+  ]);
+  const structuralIntroducers = new Set([
+    'WITH', 'FROM', 'JOIN', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET',
+    'UNION', 'INTERSECT', 'EXCEPT', 'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE',
+    'SORT', 'ON', 'USING',
+  ]);
+  const structuralAliasBoundaries = new Set([
+    ...structuralIntroducers,
+    ';', ')', ']', ',',
   ]);
 
   for (let index = 0; index < significant.length; index += 1) {
@@ -244,8 +264,49 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
         || previous === 'WHERE' || previous === 'HAVING' || previous === 'ON' || previous === 'QUALIFY')) {
       appendStructuralIssue(issues, seen, token, `Boolean operator ${current} is missing an operand.`);
     }
+    if (structuralIntroducers.has(current) && previous !== 'AS'
+      && (!next || structuralAliasBoundaries.has(next))) {
+      appendStructuralIssue(
+        issues,
+        seen,
+        token,
+        `Expected clause content after ${current}; use AS or quote it if ${current} is intended as an alias.`,
+      );
+    }
   }
-  return [...issues, ...findCaseStructuralIssues(significant)];
+  return [
+    ...issues,
+    ...findStatementSeparatorIssues(significant, statements),
+    ...findCaseStructuralIssues(significant),
+  ];
+}
+
+function findStatementSeparatorIssues(
+  tokens: readonly Token[],
+  statements: readonly SqlStatementSlice[],
+): StructuralSqlIssue[] {
+  const issues: StructuralSqlIssue[] = [];
+  for (let index = 1; index < statements.length; index += 1) {
+    const previous = statements[index - 1]!;
+    const statement = statements[index]!;
+    const hasSeparator = tokens.some((token) => (
+      token.text === ';'
+      && token.start >= previous.endIndex
+      && token.stop < statement.startIndex
+    ));
+    if (hasSeparator) continue;
+
+    const firstToken = tokens.find((token) => (
+      token.start >= statement.startIndex && token.stop <= statement.endIndex
+    ));
+    if (!firstToken) continue;
+    issues.push({
+      start: firstToken.start,
+      end: firstToken.stop + 1,
+      message: 'Expected a semicolon between SQL statements.',
+    });
+  }
+  return issues;
 }
 
 interface CaseDiagnosticState {

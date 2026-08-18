@@ -5,6 +5,7 @@
 - Fixed schema inference for wildcard projections through CTEs, including `SELECT *` combined with additional projected columns.
 - Added structural SQL diagnostics for incomplete select lists such as a trailing comma after the final projection.
 - Improved long arithmetic expression formatting so `maxLineWidth` is enforced at operator boundaries as a last-resort layout fallback, independently of `maxInlineExpressionDepth` and `maxInlineItems`.
+- Fixed SQL syntax validation for malformed queries that could previously pass without diagnostics, including adjacent statements without semicolons, invalid nested `SELECT` placement, and incomplete trailing clauses such as `SELECT 1 WITH`.
 
 ## 0.0.13
 
