@@ -459,6 +459,76 @@ describe('SQL formatting', () => {
     expect(result).not.toMatch(/'1'\n\s*=|=\s*\n\s*'1'/u);
   });
 
+  it('falls back to complete WHERE predicate planning when AST logical coverage is partial', () => {
+    const cases = [
+      [
+        'select 1 where 1 in (1, 2) and cast(3 as int) > 0 and cast(3 as int) > 0 and cast(3 as int) > 0 and cast(3 as int) > 0;',
+        [
+          'SELECT 1',
+          'WHERE',
+          '  1 IN (1, 2)',
+          '  AND CAST(3 AS INT) > 0',
+          '  AND CAST(3 AS INT) > 0',
+          '  AND CAST(3 AS INT) > 0',
+          '  AND CAST(3 AS INT) > 0;',
+        ],
+      ],
+      [
+        'select 1 where 1 in (1, 2) and 1 in (1, 2) and cast(3 as int) > 0 and cast(3 as int) > 0 and cast(3 as int) > 0 and cast(3 as int) > 0;',
+        [
+          'SELECT 1',
+          'WHERE',
+          '  1 IN (1, 2)',
+          '  AND 1 IN (1, 2)',
+          '  AND CAST(3 AS INT) > 0',
+          '  AND CAST(3 AS INT) > 0',
+          '  AND CAST(3 AS INT) > 0',
+          '  AND CAST(3 AS INT) > 0;',
+        ],
+      ],
+      [
+        'select 1 where 1 in (1, 2) and 1 in (1, 2) and 3 > 0 and 3 > 0 and 3 > 0 and 3 > 0;',
+        [
+          'SELECT 1',
+          'WHERE',
+          '  1 IN (1, 2)',
+          '  AND 1 IN (1, 2)',
+          '  AND 3 > 0',
+          '  AND 3 > 0',
+          '  AND 3 > 0',
+          '  AND 3 > 0;',
+        ],
+      ],
+    ] as const;
+
+    for (const [source, expectedLines] of cases) {
+      const itemLimited = formatSql(
+        source,
+        'spark',
+        placeholders,
+        { ...configuration, maxLineWidth: 300 },
+        editor,
+      ).text;
+      expect(itemLimited).toBe(expectedLines.join('\n'));
+      expect(formatSql(
+        itemLimited,
+        'spark',
+        placeholders,
+        { ...configuration, maxLineWidth: 300 },
+        editor,
+      ).text).toBe(itemLimited);
+    }
+
+    const widthLimited = formatSql(
+      cases[1][0],
+      'spark',
+      placeholders,
+      { ...configuration, maxInlineItems: 100, maxLineWidth: 120 },
+      editor,
+    ).text;
+    expect(widthLimited).toBe(cases[1][1].join('\n'));
+  });
+
   it('breaks mixed logical expressions by precedence in compact mode', () => {
     const source = "select '1' where '1' = '1' and '1' = '1' or '1' = '1' and '1' = '1' and '1' = '1' and '1' = '1' or '1' = '1' or '1' = '1' and '1' = '1' and '1' = '1';";
     const result = formatSql(source, 'spark', placeholders, configuration, editor).text;
@@ -944,6 +1014,78 @@ describe('SQL formatting', () => {
     expect(result.text).toContain('PARTITION BY customer ORDER BY created_at');
     expect(result.text).toContain('ELSE CAST(0 AS INT) END AS score -- keep Me');
     expect(result.lines.some((line) => line.semanticBreakAfter)).toBe(true);
+  });
+
+  it('preserves source-line attachment for comments around list and statement breaks', () => {
+    const attached = formatSql(
+      "select 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', -- hello\n1;",
+      'spark',
+      placeholders,
+      configuration,
+      editor,
+    ).text;
+    expect(attached).toBe([
+      'SELECT',
+      "  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', -- hello",
+      '  1;',
+    ].join('\n'));
+
+    const standalone = formatSql(
+      'select a,\n-- standalone\nb from t;',
+      'spark',
+      placeholders,
+      configuration,
+      editor,
+    ).text;
+    expect(standalone).toBe([
+      'SELECT',
+      '  a,',
+      '  -- standalone',
+      '  b',
+      'FROM t;',
+    ].join('\n'));
+
+    const statements = formatSql(
+      'select 1; -- first\nselect 2;',
+      'spark',
+      placeholders,
+      configuration,
+      editor,
+    ).text;
+    expect(statements).toBe([
+      'SELECT 1; -- first',
+      '',
+      'SELECT 2;',
+    ].join('\n'));
+
+    const nextStatementComment = formatSql(
+      'select 1;\n-- next statement\nselect 2;',
+      'spark',
+      placeholders,
+      configuration,
+      editor,
+    ).text;
+    expect(nextStatementComment).toBe([
+      'SELECT 1;',
+      '',
+      '-- next statement',
+      'SELECT 2;',
+    ].join('\n'));
+
+    expect(formatSql(attached, 'spark', placeholders, configuration, editor).text).toBe(attached);
+    expect(formatSql(statements, 'spark', placeholders, configuration, editor).text).toBe(statements);
+  });
+
+  it.each(['', '\n', '\r\n'] as const)('accepts a trailing line comment with %j final EOL', (finalEol) => {
+    const result = formatSql(
+      `select 'xx', 1;  -- hello${finalEol}`,
+      'spark',
+      placeholders,
+      configuration,
+      { ...editor, eol: finalEol === '\r\n' ? '\r\n' : '\n' },
+    ).text;
+
+    expect(result).toBe("SELECT 'xx', 1; -- hello");
   });
 
   it('expands a CASE as one structural unit when it exceeds the line-width or depth limit', () => {

@@ -22,7 +22,7 @@ export class SqlDocumentFormattingProvider implements vscode.DocumentFormattingE
     };
 
     try {
-      const formatted = document.languageId === 'sql-json'
+      const formattedBody = document.languageId === 'sql-json'
         ? formatSqlJson(this.jsonServices.createDocument(document, configuration), configuration, editor)
         : formatSql(
           document.getText(),
@@ -31,6 +31,7 @@ export class SqlDocumentFormattingProvider implements vscode.DocumentFormattingE
           configuration.format,
           editor,
         ).text;
+      const formatted = ensureFinalEol(formattedBody, editor.eol);
       if (token.isCancellationRequested || formatted === document.getText()) return [];
       return [vscode.TextEdit.replace(
         new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)),
@@ -45,4 +46,9 @@ export class SqlDocumentFormattingProvider implements vscode.DocumentFormattingE
       return [];
     }
   }
+}
+
+function ensureFinalEol(text: string, eol: string): string {
+  if (text.length === 0) return text;
+  return `${text.replace(/(?:\r\n|\r|\n)+$/u, '')}${eol}`;
 }

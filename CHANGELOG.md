@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+## 0.0.13
+
+- Fixed logical predicate formatting for mixed `IN`, `CAST`, and comparison expressions.
+- Preserved trailing `--` comments when expanding SQL lists and formatting statement boundaries.
+- Fixed false token-equivalence failures caused by line-comment terminators.
+- Ensured formatted SQL and SQL JSON files end with exactly one document-native newline.
+
 ## 0.0.12
 
 - Fixed schema inference for Spark SQL CTAS statements with parenthesized queries such as `CREATE TABLE t AS (SELECT ...)`.

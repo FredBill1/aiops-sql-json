@@ -38,6 +38,7 @@ interface FormattingToken extends SqlLexToken {
   protected: boolean;
   kind: TokenKind;
   expressionDepth: number;
+  sourceLine: number;
 }
 
 type TokenKind = 'comment' | 'string' | 'number' | 'keyword' | 'dataType' | 'word' | 'operator' | 'punctuation' | 'opaque';
@@ -210,12 +211,28 @@ function createFormattingTokens(
       channel: 0,
     }, placeholderRanges, true));
   }
+  annotateSourceLines(tokens, text);
   for (let index = 1; index < tokens.length; index += 1) {
     if (tokens[index - 1]?.raw === '.' && (tokens[index]?.kind === 'keyword' || tokens[index]?.kind === 'dataType')) {
       tokens[index]!.kind = 'word';
     }
   }
   return tokens;
+}
+
+function annotateSourceLines(tokens: FormattingToken[], text: string): void {
+  let cursor = 0;
+  let line = 0;
+  for (const token of tokens) {
+    line += countLineBreaks(text.slice(cursor, token.start));
+    token.sourceLine = line;
+    line += countLineBreaks(text.slice(token.start, token.end));
+    cursor = token.end;
+  }
+}
+
+function countLineBreaks(text: string): number {
+  return text.match(/\r\n|\r|\n/gu)?.length ?? 0;
 }
 
 function expandProtectedSpans(
@@ -254,6 +271,7 @@ function makeToken(token: SqlLexToken, placeholders: readonly PlaceholderRange[]
     protected: isProtected,
     kind: opaque ? 'opaque' : classifyToken(token, raw, upper),
     expressionDepth: 0,
+    sourceLine: 0,
   };
 }
 
@@ -477,17 +495,18 @@ function planLogicalBreaks(
   const covered = new Set<number>();
   for (const root of roots) {
     const available = logicalAvailableWidth(root, tokens, pairs, configuration, editor);
+    const highLevel = isHighLevelPredicateGroup(root, tokens);
     planLogicalGroup(
       root,
       configuration.layoutMode === 'expanded',
-      isHighLevelPredicateGroup(root, tokens),
+      highLevel,
       available,
       tokens,
       configuration,
       editor.tabSize,
       breaks,
     );
-    collectLogicalOperatorIndices(root, covered);
+    if (highLevel) collectLogicalOperatorIndices(root, covered);
   }
   planFallbackLogicalBreaks(tokens, pairs, covered, configuration, editor, breaks);
   return breaks;
@@ -945,6 +964,8 @@ class SqlLayoutBuilder {
   private clauseList = false;
   private clauseListBroken = false;
   private clauseListIndent = 0;
+  private pendingListBreakIndent: number | undefined;
+  private pendingStatementGap = false;
 
   constructor(
     private readonly configuration: SqlFormatConfiguration,
@@ -959,6 +980,15 @@ class SqlLayoutBuilder {
   format(): FormattedSqlLine[] {
     for (let index = 0; index < this.tokens.length; index += 1) {
       const token = this.tokens[index]!;
+      const previous = this.tokens[index - 1];
+      if (this.pendingListBreakIndent !== undefined
+        && (token.kind !== 'comment' || token.sourceLine !== previous?.sourceLine)) {
+        this.flushPendingListBreak(false);
+      }
+      if (this.pendingStatementGap
+        && (token.kind !== 'comment' || token.sourceLine !== previous?.sourceLine)) {
+        this.flushPendingStatementGap();
+      }
       const ddlClauseStart = this.ddlClauseStarts.has(index);
       if (ddlClauseStart) {
         if (this.current.trim().length > 0) this.finishLine(false);
@@ -987,17 +1017,19 @@ class SqlLayoutBuilder {
       } else if (token.raw === ')' && !token.protected) {
         this.closeParenthesis(index);
       } else if (token.raw === ',' && !token.protected) {
-        this.comma(this.shouldBreakList());
+        this.comma(index, this.shouldBreakList());
       } else if (token.raw === ';' && !token.protected) {
-        this.semicolon(index < this.tokens.length - 1);
+        this.semicolon(index);
       } else if (isLogical(token) && this.logicalBreaks.has(index)) {
         this.logical(token);
       } else if (token.kind === 'comment') {
-        this.comment(token);
+        this.comment(token, index);
       } else {
         this.appendToken(token, index);
       }
     }
+    if (this.pendingListBreakIndent !== undefined) this.flushPendingListBreak(false);
+    if (this.pendingStatementGap) this.flushPendingStatementGap();
     this.finishLine(false);
     while (this.lines.length > 1 && this.lines.at(-1)?.text === '') this.lines.pop();
     return this.lines.length > 0 ? this.lines : [{ text: '', semanticBreakAfter: false }];
@@ -1267,7 +1299,7 @@ class SqlLayoutBuilder {
     this.clauseListIndent = context.clauseListIndentBefore;
   }
 
-  private comma(shouldBreak: boolean): void {
+  private comma(index: number, shouldBreak: boolean): void {
     if (!shouldBreak) {
       this.appendRaw(',', false);
       return;
@@ -1277,7 +1309,13 @@ class SqlLayoutBuilder {
       : this.indent;
     if (this.configuration.commaPosition === 'trailing') {
       this.appendRaw(',', false);
-      this.finishLine(false, nextIndent);
+      const token = this.tokens[index]!;
+      const next = this.tokens[index + 1];
+      if (next?.kind === 'comment' && next.sourceLine === token.sourceLine) {
+        this.pendingListBreakIndent = nextIndent;
+      } else {
+        this.finishLine(false, nextIndent);
+      }
     } else {
       this.finishLine(false, nextIndent);
       this.appendRaw(',', false);
@@ -1285,15 +1323,18 @@ class SqlLayoutBuilder {
     }
   }
 
-  private semicolon(hasMore: boolean): void {
+  private semicolon(index: number): void {
     if (this.configuration.semicolonPosition === 'newLine' && this.current.trim().length > 0) {
       this.finishLine(false, this.baseIndent());
     }
     this.appendRaw(';', false);
-    if (hasMore) {
-      this.finishLine(false, 0);
-      for (let index = 0; index < this.configuration.blankLinesBetweenStatements; index += 1) {
-        this.lines.push({ text: '', semanticBreakAfter: false });
+    if (this.hasFollowingStatement(index)) {
+      const token = this.tokens[index]!;
+      const next = this.tokens[index + 1];
+      if (next?.kind === 'comment' && next.sourceLine === token.sourceLine) {
+        this.pendingStatementGap = true;
+      } else {
+        this.insertStatementGap();
       }
     }
     this.clauseList = false;
@@ -1312,9 +1353,17 @@ class SqlLayoutBuilder {
     }
   }
 
-  private comment(token: FormattingToken): void {
+  private comment(token: FormattingToken, index: number): void {
+    const previous = this.tokens[index - 1];
+    if (this.current.trim().length > 0 && previous && token.sourceLine !== previous.sourceLine) {
+      this.finishLine(false);
+    }
     this.appendRaw(token.raw, this.current.trim().length > 0);
-    if (token.raw.trimStart().startsWith('--')) this.finishLine(true);
+    if (token.raw.trimStart().startsWith('--')) {
+      const nextIndent = this.pendingListBreakIndent;
+      this.pendingListBreakIndent = undefined;
+      this.finishLine(true, nextIndent ?? this.indent);
+    }
   }
 
   private appendToken(token: FormattingToken, index: number): void {
@@ -1326,6 +1375,33 @@ class SqlLayoutBuilder {
   private appendRaw(value: string, spaceBefore: boolean): void {
     const spacer = spaceBefore && this.current.length > 0 && !this.current.endsWith(' ') ? ' ' : '';
     this.current = `${this.current}${spacer}${value}`;
+  }
+
+  private flushPendingListBreak(semanticBreakAfter: boolean): void {
+    const nextIndent = this.pendingListBreakIndent;
+    if (nextIndent === undefined) return;
+    this.pendingListBreakIndent = undefined;
+    this.finishLine(semanticBreakAfter, nextIndent);
+  }
+
+  private hasFollowingStatement(index: number): boolean {
+    for (let cursor = index + 1; cursor < this.tokens.length; cursor += 1) {
+      if (this.tokens[cursor]?.kind !== 'comment') return true;
+    }
+    return false;
+  }
+
+  private flushPendingStatementGap(): void {
+    if (!this.pendingStatementGap) return;
+    this.pendingStatementGap = false;
+    this.insertStatementGap();
+  }
+
+  private insertStatementGap(): void {
+    this.finishLine(false, 0);
+    for (let index = 0; index < this.configuration.blankLinesBetweenStatements; index += 1) {
+      this.lines.push({ text: '', semanticBreakAfter: false });
+    }
   }
 
   private shouldBreakList(): boolean {
@@ -1530,7 +1606,7 @@ function verifyTokenEquivalence(
     const mismatch = Math.max(0, left.findIndex((value, index) => value !== right[index]));
     throw new SqlFormattingError(
       `The formatted SQL changed its significant token sequence near token ${mismatch + 1}: `
-      + `${left[mismatch] ?? '<end>'} -> ${right[mismatch] ?? '<end>'}.`,
+      + `${describeEquivalenceToken(left[mismatch])} -> ${describeEquivalenceToken(right[mismatch])}.`,
     );
   }
 }
@@ -1547,13 +1623,20 @@ function equivalenceTokens(
     const raw = masked.slice(token.start, token.end);
     const upper = raw.toUpperCase();
     const kind = classifyToken(token, raw, upper);
+    const comparableRaw = kind === 'comment' && raw.trimStart().startsWith('--')
+      ? raw.replace(/(?:\r\n|\r|\n)$/u, '')
+      : raw;
     if (kind === 'keyword' && configuration.keywordCase !== 'preserve') return `${token.symbolicName}:${upper}`;
     if (kind === 'dataType' && configuration.dataTypeCase !== 'preserve') return `${token.symbolicName}:${upper}`;
     if (kind === 'word' && lexed[index + 1]?.text === '(' && configuration.functionCase !== 'preserve') {
       return `${token.symbolicName}:${upper}`;
     }
-    return `${token.symbolicName}:${raw}`;
+    return `${token.symbolicName}:${comparableRaw}`;
   });
+}
+
+function describeEquivalenceToken(value: string | undefined): string {
+  return value === undefined ? '<end>' : JSON.stringify(value);
 }
 
 function overlaps(leftStart: number, leftEnd: number, rightStart: number, rightEnd: number): boolean {

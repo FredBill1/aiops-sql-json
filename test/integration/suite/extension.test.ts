@@ -123,11 +123,27 @@ suite('AIOps SQL JSON extension', () => {
     await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
 
     const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
-    assert.equal(document.getText(), [
+    assert.equal(document.getText(), `${[
       'SELECT userId, SUM(amount) total',
       'FROM sales',
       'WHERE enabled = true AND dt = $date',
-    ].join(eol));
+    ].join(eol)}${eol}`);
+  });
+
+  test('preserves a trailing line comment and adds the final document EOL', async () => {
+    const document = await openFile('trailing-comment-format.sql', "select 'xx', 1;  -- hello");
+    await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
+
+    const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    assert.equal(document.getText(), `SELECT 'xx', 1; -- hello${eol}`);
+  });
+
+  test('adds the final document EOL when SQL layout is otherwise unchanged', async () => {
+    const document = await openFile('final-newline-format.sql', 'SELECT 1;');
+    await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
+
+    const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    assert.equal(document.getText(), `SELECT 1;${eol}`);
   });
 
   test('reports incomplete CASE expressions in regular SQL documents', async () => {
@@ -157,13 +173,13 @@ suite('AIOps SQL JSON extension', () => {
       );
       await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
       const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
-      assert.equal(document.getText(), [
+      assert.equal(document.getText(), `${[
         'SELECT',
         '  CASE',
         '    WHEN flag = 1 THEN a',
         '    ELSE b',
         '  END AS result',
-      ].join(eol));
+      ].join(eol)}${eol}`);
     } finally {
       await vscode.workspace.getConfiguration('aiopsSqlJson').update(
         'format.layoutMode',
@@ -183,13 +199,13 @@ suite('AIOps SQL JSON extension', () => {
       const document = await openFile('max-inline-items-format.sql', 'select a,b,c from source_table');
       await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
       const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
-      assert.equal(document.getText(), [
+      assert.equal(document.getText(), `${[
         'SELECT',
         '  a,',
         '  b,',
         '  c',
         'FROM source_table',
-      ].join(eol));
+      ].join(eol)}${eol}`);
     } finally {
       await vscode.workspace.getConfiguration('aiopsSqlJson').update(
         'format.maxInlineItems',
@@ -207,8 +223,10 @@ suite('AIOps SQL JSON extension', () => {
     );
     await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
 
+    const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
     assert.ok(document.getText().includes(`"description": ${untouched}`));
     assert.ok(document.getText().includes('"trainSql": "\n  SELECT a, b\n  FROM t"'));
+    assert.ok(document.getText().endsWith(eol));
   });
 
   test('participates in the VS Code format-on-save pipeline', async () => {
