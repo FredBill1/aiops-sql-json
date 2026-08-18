@@ -20,6 +20,11 @@ export interface FormattedSqlLine {
   semanticBreakAfter: boolean;
 }
 
+interface LayoutLine extends FormattedSqlLine {
+  tokenStart: number;
+  tokenEnd: number;
+}
+
 export interface FormattedSql {
   text: string;
   lines: readonly FormattedSqlLine[];
@@ -136,7 +141,7 @@ export function formatSql(
   const ddlClauseStarts = identifyDdlClauseStarts(tokens, pairs);
   const logicalBreaks = planLogicalBreaks(tokens, parsed.statements, pairs, configuration, editor);
   expandParenthesesContainingLogicalBreaks(pairs, logicalBreaks);
-  const builder = new SqlLayoutBuilder(
+  const buildLines = (arithmeticBreaks: ReadonlySet<number>): LayoutLine[] => new SqlLayoutBuilder(
     configuration,
     editor,
     tokens,
@@ -144,8 +149,26 @@ export function formatSql(
     cases,
     ddlClauseStarts,
     logicalBreaks,
-  );
-  const lines = builder.format();
+    arithmeticBreaks,
+  ).format();
+  const arithmeticBreaks = new Set<number>();
+  let layoutLines = buildLines(arithmeticBreaks);
+  while (formattedLinesExceedWidth(layoutLines, configuration, editor)) {
+    const nextBreaks = findArithmeticFallbackBreaks(
+      layoutLines,
+      tokens,
+      arithmeticBreaks,
+      configuration,
+      editor,
+    );
+    if (nextBreaks.length === 0) break;
+    for (const nextBreak of nextBreaks) arithmeticBreaks.add(nextBreak);
+    layoutLines = buildLines(arithmeticBreaks);
+  }
+  const lines: FormattedSqlLine[] = layoutLines.map(({ text: lineText, semanticBreakAfter }) => ({
+    text: lineText,
+    semanticBreakAfter,
+  }));
   const output = lines.map((line) => line.text).join(editor.eol);
   verifyTokenEquivalence(text, output, dialect, placeholders, configuration);
   if (!parseSqlAstForFormatting(output, dialect, placeholders)) {
@@ -294,7 +317,7 @@ function annotateExpressionDepth(tokens: FormattingToken[], statements: readonly
 }
 
 function annotateNodeDepth(node: SqlAstNode, parentDepth: number, tokens: FormattingToken[]): void {
-  const depth = parentDepth + (countsAsExpression(node) ? 1 : 0);
+  const depth = parentDepth + (countsAsExpression(node, tokens) ? 1 : 0);
   for (const token of tokens) {
     if (token.start >= node.start && token.end <= node.end) {
       token.expressionDepth = Math.max(token.expressionDepth, depth);
@@ -313,8 +336,8 @@ function annotateValueDepth(value: SqlAstValue, depth: number, tokens: Formattin
   }
 }
 
-function countsAsExpression(node: SqlAstNode): boolean {
-  if (isLogicalNode(node)) return false;
+function countsAsExpression(node: SqlAstNode, tokens: readonly FormattingToken[]): boolean {
+  if (isLogicalNode(node) || arithmeticNodeParts(node, tokens) || isGroupingExpression(node, tokens)) return false;
   return node.role === 'function' || node.role === 'unnest' || node.role === 'subquery'
     || node.role === 'expression';
 }
@@ -692,6 +715,16 @@ function logicalAvailableWidth(
   editor: EditorFormattingOptions,
 ): number {
   const start = tokens.findIndex((token) => token.start >= group.start && token.end <= group.end);
+  return expressionAvailableWidth(start, tokens, pairs, configuration, editor);
+}
+
+function expressionAvailableWidth(
+  start: number,
+  tokens: readonly FormattingToken[],
+  pairs: ReadonlyMap<number, ParenthesisPair>,
+  configuration: SqlFormatConfiguration,
+  editor: EditorFormattingOptions,
+): number {
   const brokenParenthesisDepth = [...pairs.entries()].filter(([index, pair]) => (
     index === pair.open && pair.multiline && pair.open < start && pair.close > start
   )).length;
@@ -896,6 +929,154 @@ function isLogicalNode(node: SqlAstNode): boolean {
   return ['AND', 'OR', 'XOR'].includes(node.kind.toUpperCase());
 }
 
+interface ArithmeticNodeParts {
+  readonly left: SqlAstNode;
+  readonly right: SqlAstNode;
+  readonly operatorIndex: number;
+  readonly precedence: number;
+}
+
+function arithmeticNodeParts(
+  node: SqlAstNode,
+  tokens: readonly FormattingToken[],
+): ArithmeticNodeParts | undefined {
+  const left = node.args.this;
+  const right = node.args.expression;
+  if (!isSqlAstNode(left) || !isSqlAstNode(right)) return undefined;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.end <= left.end) continue;
+    if (token.start >= right.start) break;
+    if (token.start < left.end || token.end > right.start) continue;
+    const precedence = arithmeticPrecedence(token);
+    if (precedence > 0) return { left, right, operatorIndex: index, precedence };
+  }
+  return undefined;
+}
+
+function arithmeticPrecedence(token: FormattingToken): number {
+  if (token.protected) return 0;
+  if (token.raw === '+' || token.raw === '-') return 1;
+  if (token.raw === '*' || token.raw === '/' || token.raw === '%' || token.upper === 'DIV' || token.upper === 'MOD') {
+    return 2;
+  }
+  return 0;
+}
+
+function isGroupingExpression(node: SqlAstNode, tokens: readonly FormattingToken[]): boolean {
+  const children = sqlAstNodeChildren(node);
+  if (children.length !== 1) return false;
+  const child = children[0]!;
+  let opening = false;
+  let closing = false;
+  for (const token of tokens) {
+    if (token.end <= node.start || token.start >= node.end) continue;
+    if (token.start >= child.start && token.end <= child.end) continue;
+    if (token.raw === '(' && token.end <= child.start) {
+      opening = true;
+      continue;
+    }
+    if (token.raw === ')' && token.start >= child.end) {
+      closing = true;
+      continue;
+    }
+    return false;
+  }
+  return opening && closing;
+}
+
+interface ArithmeticFallbackCandidate {
+  readonly index: number;
+  readonly precedence: number;
+  readonly depth: number;
+}
+
+function findArithmeticFallbackBreaks(
+  lines: readonly LayoutLine[],
+  tokens: readonly FormattingToken[],
+  existingBreaks: ReadonlySet<number>,
+  configuration: SqlFormatConfiguration,
+  editor: EditorFormattingOptions,
+): number[] {
+  const initialIndent = editor.initialIndentColumns ?? 0;
+  for (const line of lines) {
+    if (line.tokenStart < 0 || line.tokenEnd < line.tokenStart) continue;
+    if (initialIndent + visualWidth(line.text, editor.tabSize) <= configuration.maxLineWidth) continue;
+
+    const candidates = arithmeticFallbackCandidates(
+      tokens,
+      line.tokenStart,
+      line.tokenEnd,
+      existingBreaks,
+    );
+    if (candidates.length === 0) continue;
+
+    // Prefer operators at the shallowest syntactic level, then the lowest
+    // arithmetic precedence. This mirrors the AST shape without depending on
+    // parser source-span precision at function/wrapper boundaries.
+    const depth = Math.min(...candidates.map((candidate) => candidate.depth));
+    const shallow = candidates.filter((candidate) => candidate.depth === depth);
+    const precedence = Math.min(...shallow.map((candidate) => candidate.precedence));
+    const preferred = shallow.filter((candidate) => candidate.precedence === precedence);
+
+    // Match logical-expression planning: once a precedence level has to break,
+    // break every operator at that same level in the current layout segment.
+    // A later layout pass may then discover that the next-higher precedence
+    // level also needs expansion (for example, '/' after all '+'/'-' breaks).
+    return preferred.map((candidate) => candidate.index);
+  }
+  return [];
+}
+
+function arithmeticFallbackCandidates(
+  tokens: readonly FormattingToken[],
+  start: number,
+  end: number,
+  existingBreaks: ReadonlySet<number>,
+): ArithmeticFallbackCandidate[] {
+  const candidates: ArithmeticFallbackCandidate[] = [];
+  let depth = 0;
+  for (let index = 0; index <= end && index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.raw === ')' || token.raw === ']' || token.raw === '}') {
+      depth = Math.max(0, depth - 1);
+    }
+    if (index >= start && !existingBreaks.has(index)) {
+      const precedence = arithmeticPrecedence(token);
+      if (precedence > 0 && isBinaryArithmeticOperator(tokens, index)) {
+        candidates.push({ index, precedence, depth });
+      }
+    }
+    if (token.raw === '(' || token.raw === '[' || token.raw === '{') {
+      depth += 1;
+    }
+  }
+  return candidates;
+}
+
+function isBinaryArithmeticOperator(
+  tokens: readonly FormattingToken[],
+  index: number,
+): boolean {
+  const token = tokens[index];
+  if (!token || arithmeticPrecedence(token) === 0) return false;
+
+  let previousIndex = index - 1;
+  while (previousIndex >= 0 && tokens[previousIndex]?.kind === 'comment') previousIndex -= 1;
+  let nextIndex = index + 1;
+  while (nextIndex < tokens.length && tokens[nextIndex]?.kind === 'comment') nextIndex += 1;
+  const previous = tokens[previousIndex];
+  const next = tokens[nextIndex];
+  if (!previous || !next) return false;
+  if (previous.kind === 'operator' || isLogical(previous)) return false;
+  if (['(', '[', '{', ',', ';', '.'].includes(previous.raw)) return false;
+  if ([
+    'AS', 'BY', 'ELSE', 'HAVING', 'ON', 'QUALIFY', 'RETURNING', 'SELECT',
+    'SET', 'THEN', 'VALUES', 'WHEN', 'WHERE',
+  ].includes(previous.upper)) return false;
+  return true;
+}
+
 function pairCases(tokens: readonly FormattingToken[]): Map<number, CasePair> {
   const result = new Map<number, CasePair>();
   const stack: number[] = [];
@@ -956,8 +1137,11 @@ function countCaseBranches(
 }
 
 class SqlLayoutBuilder {
-  private readonly lines: FormattedSqlLine[] = [];
+  private readonly lines: LayoutLine[] = [];
   private current = '';
+  private currentTokenStart = -1;
+  private currentTokenEnd = -1;
+  private activeTokenIndex = -1;
   private indent = 0;
   private contexts: ParenthesisContext[] = [];
   private caseContexts: CaseContext[] = [];
@@ -975,11 +1159,13 @@ class SqlLayoutBuilder {
     private readonly cases: ReadonlyMap<number, CasePair>,
     private readonly ddlClauseStarts: ReadonlySet<number>,
     private readonly logicalBreaks: ReadonlySet<number>,
+    private readonly arithmeticBreaks: ReadonlySet<number>,
   ) {}
 
-  format(): FormattedSqlLine[] {
+  format(): LayoutLine[] {
     for (let index = 0; index < this.tokens.length; index += 1) {
       const token = this.tokens[index]!;
+      this.activeTokenIndex = index;
       const previous = this.tokens[index - 1];
       if (this.pendingListBreakIndent !== undefined
         && (token.kind !== 'comment' || token.sourceLine !== previous?.sourceLine)) {
@@ -1022,6 +1208,8 @@ class SqlLayoutBuilder {
         this.semicolon(index);
       } else if (isLogical(token) && this.logicalBreaks.has(index)) {
         this.logical(token);
+      } else if (this.arithmeticBreaks.has(index)) {
+        this.arithmetic(token);
       } else if (token.kind === 'comment') {
         this.comment(token, index);
       } else {
@@ -1032,7 +1220,14 @@ class SqlLayoutBuilder {
     if (this.pendingStatementGap) this.flushPendingStatementGap();
     this.finishLine(false);
     while (this.lines.length > 1 && this.lines.at(-1)?.text === '') this.lines.pop();
-    return this.lines.length > 0 ? this.lines : [{ text: '', semanticBreakAfter: false }];
+    return this.lines.length > 0
+      ? this.lines
+      : [{
+          text: '',
+          semanticBreakAfter: false,
+          tokenStart: -1,
+          tokenEnd: -1,
+        }];
   }
 
   private readClausePhrase(index: number): { kind: string; length: number } | undefined {
@@ -1353,6 +1548,11 @@ class SqlLayoutBuilder {
     }
   }
 
+  private arithmetic(token: FormattingToken): void {
+    if (this.current.trim().length > 0) this.finishLine(false);
+    this.appendRaw(displayToken(token, this.tokens, this.configuration), false);
+  }
+
   private comment(token: FormattingToken, index: number): void {
     const previous = this.tokens[index - 1];
     if (this.current.trim().length > 0 && previous && token.sourceLine !== previous.sourceLine) {
@@ -1373,6 +1573,10 @@ class SqlLayoutBuilder {
   }
 
   private appendRaw(value: string, spaceBefore: boolean): void {
+    if (value.length > 0 && this.activeTokenIndex >= 0) {
+      if (this.currentTokenStart < 0) this.currentTokenStart = this.activeTokenIndex;
+      this.currentTokenEnd = Math.max(this.currentTokenEnd, this.activeTokenIndex);
+    }
     const spacer = spaceBefore && this.current.length > 0 && !this.current.endsWith(' ') ? ' ' : '';
     this.current = `${this.current}${spacer}${value}`;
   }
@@ -1400,7 +1604,12 @@ class SqlLayoutBuilder {
   private insertStatementGap(): void {
     this.finishLine(false, 0);
     for (let index = 0; index < this.configuration.blankLinesBetweenStatements; index += 1) {
-      this.lines.push({ text: '', semanticBreakAfter: false });
+      this.lines.push({
+        text: '',
+        semanticBreakAfter: false,
+        tokenStart: -1,
+        tokenEnd: -1,
+      });
     }
   }
 
@@ -1420,8 +1629,12 @@ class SqlLayoutBuilder {
       this.lines.push({
         text: `${indentUnit(this.editor).repeat(this.indent)}${this.current.trimEnd()}`,
         semanticBreakAfter,
+        tokenStart: this.currentTokenStart,
+        tokenEnd: this.currentTokenEnd,
       });
       this.current = '';
+      this.currentTokenStart = -1;
+      this.currentTokenEnd = -1;
     }
     this.indent = nextIndent;
   }
@@ -1587,6 +1800,17 @@ function visualWidth(text: string, tabSize: number): number {
     else column += 1;
   }
   return column;
+}
+
+function formattedLinesExceedWidth(
+  lines: readonly FormattedSqlLine[],
+  configuration: SqlFormatConfiguration,
+  editor: EditorFormattingOptions,
+): boolean {
+  const initialIndent = editor.initialIndentColumns ?? 0;
+  return lines.some((line) => (
+    initialIndent + visualWidth(line.text, editor.tabSize) > configuration.maxLineWidth
+  ));
 }
 
 function indentUnit(editor: EditorFormattingOptions): string {

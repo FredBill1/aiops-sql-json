@@ -211,6 +211,10 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
     'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
     'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', ';', ')',
   ]);
+  const listBoundaries = new Set([
+    ...relationBoundaries,
+    'FROM', 'JOIN', 'ON', 'USING', 'THEN', 'ELSE', 'END', 'WHEN', ']', ',',
+  ]);
 
   for (let index = 0; index < significant.length; index += 1) {
     const token = significant[index]!;
@@ -229,6 +233,9 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
     if ((current === 'WHERE' || current === 'HAVING' || current === 'ON' || current === 'QUALIFY')
       && (!next || expressionBoundaries.has(next))) {
       appendStructuralIssue(issues, seen, nextToken ?? token, `Expected an expression after ${current}.`);
+    }
+    if (current === ',' && (!next || listBoundaries.has(next))) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, 'Expected a list item after comma.');
     }
     if ((current === 'AND' || current === 'OR')
       && (!next || clauseBoundaries.has(next) || previous === undefined

@@ -219,7 +219,7 @@
           "minimum": 1,
           "default": 4,
           "scope": "resource",
-          "markdownDescription": "Maximum number of nested non-leaf SQL AST expressions that may remain on one line."
+          "markdownDescription": "Maximum number of nested non-leaf SQL AST expressions that may remain on one line. Arithmetic operator chains and grouping parentheses are excluded; arithmetic wrapping is used only as a max-line-width fallback."
         },
         "aiopsSqlJson.format.maxInlineItems": {
           "type": "integer",

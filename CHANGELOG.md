@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed schema inference for wildcard projections through CTEs, including `SELECT *` combined with additional projected columns.
+- Added structural SQL diagnostics for incomplete select lists such as a trailing comma after the final projection.
+- Improved long arithmetic expression formatting so `maxLineWidth` is enforced at operator boundaries as a last-resort layout fallback, independently of `maxInlineExpressionDepth` and `maxInlineItems`.
+
 ## 0.0.13
 
 - Fixed logical predicate formatting for mixed `IN`, `CAST`, and comparison expressions.

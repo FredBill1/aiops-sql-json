@@ -42,6 +42,11 @@ describe('SQL analysis', () => {
     expect(issues.some((issue) => issue.message.includes('relation after FROM'))).toBe(true);
   });
 
+  it('reports a trailing comma accepted by the permissive AST parser', () => {
+    const issues = analyzeSql('SELECT 1,', 'spark', []).issues;
+    expect(issues.some((issue) => issue.message === 'Expected a list item after comma.')).toBe(true);
+  });
+
   it.each(SQL_DIALECTS)('reports incomplete CASE expressions once for %s SQL', (dialect) => {
     for (const sql of ['select case', 'select case when']) {
       const issues = analyzeSql(sql, dialect, []).issues;
