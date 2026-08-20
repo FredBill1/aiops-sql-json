@@ -12,6 +12,7 @@ import {
   getSqlScopeInfo,
   type RelationBinding,
   type SchemaSnapshot,
+  type SchemaTable,
 } from './sqlSchemaCore';
 
 interface CompletionContext {
@@ -149,12 +150,15 @@ function appendSchemaItems(
     configuration.udfs,
   );
   if (relationContext) {
+    const qualifier = qualifierBefore(context.sqlText, context.sqlOffset);
     for (const table of effectiveSnapshot.tables) {
-      if (!matchesPrefix(table.name, prefix)) continue;
-      const item = new vscode.CompletionItem(table.name, vscode.CompletionItemKind.Class);
+      const completion = relationCompletion(table, prefix, qualifier);
+      if (!completion) continue;
+      const item = new vscode.CompletionItem(completion.label, vscode.CompletionItemKind.Class);
       item.range = range;
-      item.insertText = table.name;
-      item.detail = table.kind === 'view' ? 'View from SQL schema' : 'Table from SQL schema';
+      item.insertText = completion.insertText;
+      item.filterText = completion.filterText;
+      item.detail = `${table.kind === 'view' ? 'View' : 'Table'} from SQL schema: ${table.name}`;
       item.sortText = `0-${table.name}`;
       items.push(item);
     }
@@ -229,6 +233,73 @@ function appendSchemaItems(
     item.sortText = `0-2-${field}`;
     items.push(item);
   }
+}
+
+function relationCompletion(
+  table: SchemaTable,
+  prefix: string,
+  qualifier: string | undefined,
+): { label: string; insertText: string; filterText: string } | undefined {
+  const parts = splitCompletionQualifiedName(table.name);
+  if (parts.length === 0) return undefined;
+  if (qualifier) {
+    const qualifierParts = splitCompletionQualifiedName(qualifier);
+    if (qualifierParts.length === 0 || qualifierParts.length >= parts.length) return undefined;
+    if (!qualifierParts.every((part, index) => completionIdentifierEquals(part, parts[index] ?? ''))) {
+      return undefined;
+    }
+    const remainder = parts.slice(qualifierParts.length).join('.');
+    return matchesPrefix(remainder, prefix)
+      ? { label: remainder, insertText: remainder, filterText: remainder }
+      : undefined;
+  }
+  const leafName = parts.at(-1) ?? table.name;
+  const fullNameMatch = matchesPrefix(table.name, prefix);
+  const leafNameMatch = matchesPrefix(leafName, prefix);
+  if (!fullNameMatch && !leafNameMatch) return undefined;
+  return {
+    label: table.name,
+    insertText: table.name,
+    filterText: fullNameMatch ? table.name : leafName,
+  };
+}
+
+function splitCompletionQualifiedName(value: string): string[] {
+  const result: string[] = [];
+  let start = 0;
+  let quote = '';
+  for (let index = 0; index <= value.length; index += 1) {
+    const character = value[index] ?? '.';
+    if (quote) {
+      if ((quote === '[' && character === ']') || (quote !== '[' && character === quote)) {
+        quote = '';
+      }
+      continue;
+    }
+    if (character === '`' || character === '"' || character === '[') {
+      quote = character;
+    } else if (character === '.') {
+      const part = value.slice(start, index).trim();
+      if (part) result.push(part);
+      start = index + 1;
+    }
+  }
+  return result;
+}
+
+function completionIdentifierEquals(left: string, right: string): boolean {
+  return unquoteCompletionIdentifier(left).toLocaleLowerCase()
+    === unquoteCompletionIdentifier(right).toLocaleLowerCase();
+}
+
+function unquoteCompletionIdentifier(value: string): string {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith('`') && trimmed.endsWith('`'))
+    || (trimmed.startsWith('"') && trimmed.endsWith('"'))
+    || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
 }
 
 function wordAt(text: string, offset: number): { start: number; end: number } {

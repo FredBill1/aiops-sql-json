@@ -1276,6 +1276,89 @@ CREATE VIEW sales.order_ids AS SELECT OrderId FROM sales.orders;`,
       assert.ok(!items.some((item) => item.kind === vscode.CompletionItemKind.Function));
       assert.ok(!items.some((item) => item.kind === vscode.CompletionItemKind.Field));
     }
+
+    const assertRelationCompletion = async (
+      fileName: string,
+      sql: string,
+      label: string,
+      filterText: string,
+      qualifiedName: string,
+      expectedSql: string,
+    ): Promise<void> => {
+      const document = await openFile(fileName, sql);
+      const items = await completionItemsAtEnd(
+        document,
+        (candidates) => candidates.some((item) => completionLabel(item) === label),
+        `${label} relation for ${sql}`,
+      );
+      const completion = items.find((item) => completionLabel(item) === label);
+      assert.ok(completion);
+      assert.equal(completion.kind, vscode.CompletionItemKind.Class);
+      assert.equal(completion.filterText ?? label, filterText);
+      assert.ok(String(completion.detail).includes(qualifiedName));
+      assert.ok(!items.some((item) => item.kind === vscode.CompletionItemKind.Function));
+      assert.ok(!items.some((item) => item.kind === vscode.CompletionItemKind.Field));
+      const completionRange = completion.range;
+      if (!(completionRange instanceof vscode.Range)) {
+        assert.fail(`Expected a replacement range for ${label}.`);
+      }
+      if (typeof completion.insertText !== 'string') {
+        assert.fail(`Expected plain relation insert text for ${label}.`);
+      }
+      const completedSql = `${sql.slice(0, document.offsetAt(completionRange.start))}${completion.insertText}${
+        sql.slice(document.offsetAt(completionRange.end))
+      }`;
+      assert.equal(completedSql, expectedSql);
+    };
+
+    const localDdl = 'CREATE TABLE db1.tmp1 (a INT); SELECT a FROM ';
+    await assertRelationCompletion(
+      'completion-local-relation-qualified-dot.sql',
+      `${localDdl}db1.`,
+      'tmp1',
+      'tmp1',
+      'db1.tmp1',
+      `${localDdl}db1.tmp1`,
+    );
+    await assertRelationCompletion(
+      'completion-local-relation-qualified-prefix.sql',
+      `${localDdl}db1.t`,
+      'tmp1',
+      'tmp1',
+      'db1.tmp1',
+      `${localDdl}db1.tmp1`,
+    );
+    await assertRelationCompletion(
+      'completion-local-relation-leaf-prefix.sql',
+      `${localDdl}t`,
+      'db1.tmp1',
+      'tmp1',
+      'db1.tmp1',
+      `${localDdl}db1.tmp1`,
+    );
+    await assertRelationCompletion(
+      'completion-schema-relation-qualified-dot.sql',
+      'SELECT * FROM sales.',
+      'orders',
+      'orders',
+      'sales.orders',
+      'SELECT * FROM sales.orders',
+    );
+
+    const duplicateLeafDocument = await openFile('completion-relation-duplicate-leaf.sql', 'SELECT * FROM ord');
+    const duplicateLeafItems = await completionItemsAtEnd(
+      duplicateLeafDocument,
+      (items) => ['sales.orders', 'archive.orders'].every(
+        (label) => items.some((item) => completionLabel(item) === label),
+      ),
+      'qualified duplicate leaf relations',
+    );
+    for (const qualifiedName of ['sales.orders', 'archive.orders']) {
+      const item = duplicateLeafItems.find((candidate) => completionLabel(candidate) === qualifiedName);
+      assert.ok(item);
+      assert.equal(item.insertText, qualifiedName);
+      assert.equal(item.filterText, 'orders');
+    }
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
       'schemaValidation.enabled',
       false,

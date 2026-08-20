@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed Schema-aware relation completion for qualified prefixes such as `FROM db1.` and leaf-name prefixes such as `FROM t`.
+
 ## 0.0.14
 
 - Fixed schema inference for wildcard projections through CTEs, including `SELECT *` combined with additional projected columns.
