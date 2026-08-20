@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.15
+
 - Fixed Schema-aware relation completion for qualified prefixes such as `FROM db1.` and leaf-name prefixes such as `FROM t`.
 
 ## 0.0.14
