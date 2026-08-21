@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.0.16
+
+- Fixed Spark `POSEXPLODE` alias validation and element-type propagation for arrays returned by `split`, `concat`, `transform`, `filter`, and nested combinations of those functions.
+- Added versioned built-in-function catalogs and return contracts for all supported SQL dialects, with conservative argument diagnostics, signature-aware completion, and signature/version details in Hover.
+- Added a manual official-documentation catalog updater while keeping normal builds, checks, and extension runtime offline. Generic SQL now exposes the intersection of the pinned dialect catalogs.
+
 ## 0.0.15
 
 - Fixed Schema-aware relation completion for qualified prefixes such as `FROM db1.` and leaf-name prefixes such as `FROM t`.

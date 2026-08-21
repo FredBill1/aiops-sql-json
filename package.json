@@ -2,7 +2,7 @@
   "name": "aiops-sql-json",
   "displayName": "AIOps SQL JSON",
   "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "icon": "images/icon.png",
   "license": "MIT",
   "engines": {
@@ -344,10 +344,12 @@
   },
   "scripts": {
     "build": "node esbuild.mjs",
+    "catalog:update": "node scripts/update-function-catalogs.mjs",
+    "catalog:verify": "node scripts/verify-function-catalogs.mjs",
     "watch": "node esbuild.mjs --watch",
     "check:types": "tsc --noEmit && tsc -p tsconfig.unit.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "lint": "eslint .",
-    "check": "npm run check:types && npm run lint",
+    "check": "npm run catalog:verify && npm run check:types && npm run lint",
     "test:unit": "vitest run",
     "compile:test": "tsc -p tsconfig.test.json",
     "pretest:integration": "npm run build && npm run compile:test",

@@ -613,6 +613,8 @@ suite('AIOps SQL JSON extension', () => {
     assert.ok(sum);
     assert.equal(sum.kind, vscode.CompletionItemKind.Function);
     assert.ok(sum.insertText instanceof vscode.SnippetString);
+    assert.match(String(sum.detail), /spark 4\.2\.0/iu);
+    assert.match(String(sum.detail), /SUM\(/iu);
 
     const emptyPrefixDocument = await openFile('completion-create-empty.sql', 'create ');
     const emptyPrefixResult = await completionListAtEnd(
@@ -1677,6 +1679,26 @@ SELECT id, amount FROM local_orders;`,
     assert.equal(definitionUri(definitions[0]!).toString(), document.uri.toString());
     assert.equal(document.getText(target), 'local_id');
     assert.equal(document.offsetAt(target.start), document.getText().indexOf('local_id'));
+
+    const functionDocument = await openFile(
+      'local-function-hover.sql',
+      "SELECT split('a,b', ',')",
+    );
+    const functionOffset = functionDocument.getText().indexOf('split');
+    const functionHovers = await fixture.waitForHovers(
+      functionDocument,
+      functionOffset,
+      (items) => items.some((hover) => {
+        const text = hoverText(hover);
+        return text.includes('4.2.0') && text.includes('ARRAY') && text.includes('STRING');
+      }),
+      'built-in signature and catalog version',
+    );
+    assert.ok(functionHovers.some((hover) => hoverText(hover).includes('4.2.0')));
+    assert.ok(functionHovers.some((hover) => {
+      const text = hoverText(hover);
+      return text.includes('ARRAY') && text.includes('STRING');
+    }));
 
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
       'plainSql.enabled',

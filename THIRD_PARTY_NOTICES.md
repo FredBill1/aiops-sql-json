@@ -6,6 +6,7 @@ The bundled extension uses the following MIT-licensed projects:
 - [sqlingo.js](https://github.com/huydo862003/sqlingo.js), Copyright Huy DNA and SQLGlot contributors.
 - [Luxon](https://github.com/moment/luxon), Copyright JS Foundation and other contributors.
 - SQL keyword and built-in-function catalog data adapted from [monaco-sql-languages 1.2.0](https://github.com/DTStack/monaco-sql-languages), Copyright DTStack Corporation.
+- Updated built-in-function names are derived from the official Spark, Hive, Flink, MySQL, PostgreSQL, Trino, and Impala documentation URLs recorded in `catalog/function-catalog.sources.json`.
 - [ANTLR4ng](https://github.com/mike-lischke/antlr4ng) and antlr4-c3.
 - [vscode-json-languageservice](https://github.com/microsoft/vscode-json-languageservice), Copyright Microsoft Corporation.
 - vscode-languageserver-textdocument, vscode-languageserver-types, vscode-uri, and jsonc-parser, Copyright Microsoft Corporation and their respective contributors.

@@ -91,7 +91,9 @@ function renderSqlHover(symbol: SqlSymbolResolution): vscode.MarkdownString {
   if (definition) {
     markdown.appendMarkdown(`\nSource: ${sourceLabel(definition)}`);
   } else if (symbol.functionCategory) {
-    markdown.appendMarkdown(`\nSource: ${symbol.functionCategory === 'udf' ? 'configured UDF' : `${symbol.dialect ?? 'SQL'} built-in catalog`}`);
+    markdown.appendMarkdown(`\nSource: ${symbol.functionCategory === 'udf'
+      ? 'configured UDF'
+      : `${symbol.dialect ?? 'SQL'} ${symbol.functionCatalogVersion ?? ''} built-in catalog`.replace(/\s+/gu, ' ').trim()}`);
   } else {
     markdown.appendMarkdown('\nSource: local SQL scope');
   }
@@ -112,6 +114,14 @@ function symbolSignature(symbol: SqlSymbolResolution): string {
   const type = symbol.dataType ? formatSqlDataType(symbol.dataType, 4, 20) : symbol.type || 'UNKNOWN';
   if (symbol.functionCategory) {
     const category = symbol.functionCategory === 'udf' ? 'configured UDF' : `${symbol.dialect ?? 'SQL'} built-in function`;
+    if (symbol.functionSignatures?.length) {
+      const visible = symbol.functionSignatures.slice(0, 8).map((signature) => (
+        signature.replace(/\s*->\s*.*$/u, ` -> ${type}`)
+      ));
+      const omitted = symbol.functionSignatures.length - visible.length;
+      if (omitted > 0) visible.push(`-- … ${omitted} more overload${omitted === 1 ? '' : 's'}`);
+      return `${category}\n${visible.join('\n')}`;
+    }
     return `${category} ${symbol.name}(...) -> ${type}`;
   }
   return `${symbol.kind} ${symbol.qualifiedName ?? symbol.name}: ${type}`;

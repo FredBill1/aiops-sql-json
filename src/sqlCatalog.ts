@@ -1,9 +1,18 @@
 import type { SqlDialect } from './sql';
 import { getSqlParser } from './sql';
+import { GENERATED_FUNCTION_NAMES } from './generated/sqlFunctionNames';
+import {
+  buildSqlFunctionDefinitions,
+  SQL_FUNCTION_CATALOG_VERSIONS,
+  type SqlFunctionDefinition,
+} from './sqlFunctionSignatures';
 
 export interface SqlCatalog {
+  version: string;
   keywords: readonly string[];
   functions: readonly string[];
+  functionDefinitions: readonly SqlFunctionDefinition[];
+  functionByName: ReadonlyMap<string, SqlFunctionDefinition>;
 }
 
 const FUNCTION_SOURCES: Record<SqlDialect, string> = {
@@ -18,11 +27,43 @@ const FUNCTION_SOURCES: Record<SqlDialect, string> = {
 };
 
 const FUNCTION_SUPPLEMENTS: Partial<Record<SqlDialect, string>> = {
-  spark: 'TRANSFORM FILTER EXISTS FORALL AGGREGATE REDUCE ZIP_WITH MAP_FILTER MAP_ZIP_WITH TRANSFORM_KEYS TRANSFORM_VALUES ARRAY_SORT CRC32 HASH MD5 SHA SHA1 SHA2 XXHASH64',
+  spark: `TRANSFORM FILTER EXISTS FORALL AGGREGATE REDUCE ZIP_WITH MAP_FILTER MAP_ZIP_WITH
+    TRANSFORM_KEYS TRANSFORM_VALUES ARRAY_SORT CRC32 HASH MD5 SHA SHA1 SHA2 XXHASH64
+    APPROX_TOP_K APPROX_TOP_K_ACCUMULATE APPROX_TOP_K_COMBINE BITMAP_AND_AGG
+    KLL_MERGE_AGG_BIGINT KLL_MERGE_AGG_DOUBLE KLL_MERGE_AGG_FLOAT KLL_SKETCH_AGG_BIGINT
+    KLL_SKETCH_AGG_DOUBLE KLL_SKETCH_AGG_FLOAT LISTAGG PERCENTILE_CONT PERCENTILE_DISC
+    STRING_AGG THETA_INTERSECTION_AGG THETA_SKETCH_AGG THETA_UNION_AGG
+    TUPLE_INTERSECTION_AGG_DOUBLE TUPLE_INTERSECTION_AGG_INTEGER TUPLE_SKETCH_AGG_DOUBLE
+    TUPLE_SKETCH_AGG_INTEGER TUPLE_UNION_AGG_DOUBLE TUPLE_UNION_AGG_INTEGER ARRAY_SIZE
+    CARDINALITY CONCAT DAYNAME MAKE_TIME MONTHNAME TIME_BUCKET TIME_DIFF TIME_FROM_MICROS
+    TIME_FROM_MILLIS TIME_FROM_SECONDS TIME_TO_MICROS TIME_TO_MILLIS TIME_TO_SECONDS TIME_TRUNC
+    TO_TIME TRY_MAKE_INTERVAL TRY_MAKE_TIMESTAMP TRY_MAKE_TIMESTAMP_LTZ TRY_MAKE_TIMESTAMP_NTZ
+    TRY_TO_DATE TRY_TO_TIME TRY_MOD UNIFORM COLLATE COLLATION IS_VALID_UTF8 MAKE_VALID_UTF8
+    QUOTE RANDSTR TRY_VALIDATE_UTF8 VALIDATE_UTF8 NULLIFZERO ZEROIFNULL FROM_XML SCHEMA_OF_XML
+    TO_XML XPATH XPATH_BOOLEAN XPATH_DOUBLE XPATH_FLOAT XPATH_INT XPATH_LONG XPATH_NUMBER
+    XPATH_SHORT XPATH_STRING PARSE_URL TRY_PARSE_URL TRY_URL_DECODE URL_DECODE URL_ENCODE
+    CURRENT_PATH SESSION_USER TRY_REFLECT COLLATIONS SQL_KEYWORDS PYTHON_WORKER_LOGS RANGE
+    IS_VALID_VARIANT IS_VARIANT_NULL PARSE_JSON SCHEMA_OF_VARIANT SCHEMA_OF_VARIANT_AGG
+    TO_VARIANT_OBJECT TRY_PARSE_JSON TRY_VARIANT_GET VARIANT_EXPLODE VARIANT_EXPLODE_OUTER
+    VARIANT_GET ST_ASBINARY ST_GEOGFROMWKB ST_GEOMFROMWKB ST_SETSRID ST_SRID`,
   hive: 'ARRAY NAMED_STRUCT STRUCT TRANSFORM FILTER EXISTS FORALL AGGREGATE REDUCE ZIP_WITH MAP_FILTER MAP_ZIP_WITH TRANSFORM_KEYS TRANSFORM_VALUES ARRAY_SORT',
+  trino: `ARRAY_FIRST ARRAY_HISTOGRAM ARRAY_LAST COSINE_DISTANCE ENDS_WITH GEOMETRY_COLLECT_AGG
+    SPATIAL_PARTITIONING SPATIAL_PARTITIONS ST_ASEWKB ST_ASEWKT ST_COLLECT ST_FORCE2D ST_FORCE3D
+    ST_GEOMFROMEWKT ST_GEOMFROMKML ST_LINEMERGE ST_MAKELINE ST_MAKEPOLYGON
+    ST_MINIMUMBOUNDINGCIRCLE ST_MULTI ST_NORMALIZE ST_NUMINTERIORRING ST_ORIENTEDENVELOPE
+    ST_POINTONSURFACE ST_POLYGONIZE ST_REDUCEPRECISION ST_SETSRID ST_SRID ST_TRANSFORM
+    ST_VORONOIPOLYGONS ST_Z THETA_SKETCH_CARDINALITY THETA_SKETCH_UNION TIMEZONE TITLE_CASE`,
+  mysql: `CHAR DATE ETAG JSON_DUALITY_OBJECT ST_ASWKB ST_ASWKT ST_GEOMETRYCOLLECTIONFROMTEXT
+    ST_GEOMCOLLFROMTXT ST_GEOMETRYCOLLECTIONFROMWKB ST_GEOMETRYFROMTEXT ST_GEOMETRYFROMWKB
+    ST_LINESTRINGFROMTEXT ST_LINESTRINGFROMWKB ST_MULTILINESTRINGFROMTEXT
+    ST_MULTILINESTRINGFROMWKB ST_MULTIPOINTFROMTEXT ST_MULTIPOINTFROMWKB
+    ST_MULTIPOLYGONFROMTEXT ST_MULTIPOLYGONFROMWKB ST_NUMINTERIORRINGS ST_POLYGONFROMTEXT
+    ST_POLYGONFROMWKB STRING_TO_VECTOR TIME TIMESTAMP VECTOR_DIM VECTOR_TO_STRING YEAR`,
 };
 
 const cache = new Map<SqlDialect, SqlCatalog>();
+const PRODUCT_DIALECTS = ['spark', 'hive', 'flink', 'mysql', 'postgresql', 'trino', 'impala'] as const;
+const REVIEWED_SOURCE_DIALECTS = new Set<SqlDialect>(['hive', 'flink', 'postgresql', 'impala']);
 
 export function getSqlCatalog(dialect: SqlDialect): SqlCatalog {
   const existing = cache.get(dialect);
@@ -43,13 +84,41 @@ export function getSqlCatalog(dialect: SqlDialect): SqlCatalog {
       keywords.push(value);
     }
   }
-  const functions = splitAndDeduplicate(`${FUNCTION_SOURCES[dialect]} ${FUNCTION_SUPPLEMENTS[dialect] ?? ''}`);
+  const generatedNames = GENERATED_FUNCTION_NAMES[dialect];
+  const functions = dialect === 'generic'
+    ? portableCommonFunctions()
+    : generatedNames
+      ? deduplicate([
+          ...generatedNames,
+          ...splitAndDeduplicate(FUNCTION_SUPPLEMENTS[dialect] ?? ''),
+          ...(REVIEWED_SOURCE_DIALECTS.has(dialect)
+            ? splitAndDeduplicate(FUNCTION_SOURCES[dialect])
+            : []),
+        ])
+      : splitAndDeduplicate(`${FUNCTION_SOURCES[dialect]} ${FUNCTION_SUPPLEMENTS[dialect] ?? ''}`);
+  const functionDefinitions = buildSqlFunctionDefinitions(dialect, functions);
   const catalog = {
+    version: SQL_FUNCTION_CATALOG_VERSIONS[dialect],
     keywords: deduplicate(keywords),
     functions,
+    functionDefinitions,
+    functionByName: new Map(functionDefinitions.flatMap((definition) => [
+      [definition.name.toLocaleLowerCase(), definition] as const,
+      ...definition.aliases.map((alias) => [alias.toLocaleLowerCase(), definition] as const),
+    ])),
   };
   cache.set(dialect, catalog);
   return catalog;
+}
+
+function portableCommonFunctions(): string[] {
+  const catalogs = PRODUCT_DIALECTS.map((dialect) => getSqlCatalog(dialect));
+  const remaining = new Set(catalogs[0]?.functions.map((name) => name.toUpperCase()) ?? []);
+  for (const catalog of catalogs.slice(1)) {
+    const names = new Set(catalog.functions.map((name) => name.toUpperCase()));
+    for (const name of remaining) if (!names.has(name)) remaining.delete(name);
+  }
+  return [...remaining].sort((left, right) => left.localeCompare(right));
 }
 
 function splitAndDeduplicate(source: string): string[] {

@@ -6,6 +6,8 @@ node_modules/**
 out-test/**
 .vscode-test/**
 coverage/**
+catalog/**
+scripts/**
 dist/*.map
 *.vsix
 tsconfig*.json

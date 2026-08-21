@@ -69,6 +69,8 @@ export interface SqlAstNode {
   readonly outputName: string;
   readonly start: number;
   readonly end: number;
+  /** Parser-provided start of this expression before child spans are merged. */
+  readonly ownStart?: number;
   /** Exact source range of the node's own name (for example a function name). */
   readonly nameStart: number;
   readonly nameEnd: number;
@@ -174,6 +176,18 @@ export function isSqlAstNode(value: SqlAstValue | unknown): value is SqlAstNode 
     && !Array.isArray(value) && 'role' in value;
 }
 
+/** Returns the SQL spelling of a function call instead of the parser's class-specific AST key. */
+export function astFunctionName(node: SqlAstNode, text: string): string {
+  if (node.ownStart !== undefined) {
+    const sourceName = text.slice(node.nameStart, node.nameEnd).trim();
+    if (/^[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*$/u.test(sourceName)) {
+      return sourceName.replace(/\s+/gu, '');
+    }
+  }
+  if (node.kind === 'anonymous' && node.name) return node.name.replace(/^!/u, '');
+  return AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
+}
+
 function normalizeExpression(expression: Expression): SqlAstNode {
   const args: Record<string, SqlAstValue> = {};
   for (const [key, value] of Object.entries(expression.args)) {
@@ -200,6 +214,7 @@ function normalizeExpression(expression: Expression): SqlAstNode {
     outputName: expression.outputName,
     start,
     end,
+    ownStart,
     nameStart: start,
     nameEnd: end,
     args,
@@ -233,27 +248,41 @@ function exactNodeNameSpan(node: SqlAstNode, text: string): { start: number; end
   if (node.role !== 'function' && node.role !== 'unnest') {
     return { start: node.start, end: node.end };
   }
-  const rawName = node.name || node.kind;
-  const name = rawName.replace(/^!/u, '');
-  if (!name || name === 'anonymous') return { start: node.start, end: node.end };
   const childStarts = Object.values(node.args).flatMap(collectValueSpans).map((span) => span.start);
   const before = childStarts.length > 0 ? Math.min(...childStarts) : node.end;
-  const searchStart = Math.max(0, Math.min(node.start, before) - name.length - 32);
-  const searchEnd = Math.min(text.length, Math.max(before, node.end) + 1);
+  const searchStart = Math.max(0, Math.min(node.start, before) - 160);
+  const searchEnd = Math.min(text.length, Math.max(before, node.end) + 2);
   const segment = text.slice(searchStart, searchEnd);
-  const matcher = new RegExp(`\\b${escapeRegExp(name)}\\b(?=\\s*\\()`, 'giu');
+  const matcher = /[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*(?=\s*\()/giu;
   let best: RegExpExecArray | undefined;
   for (const match of segment.matchAll(matcher)) {
     const absolute = searchStart + match.index;
-    if (absolute <= before) best = match;
+    if (node.ownStart !== undefined) {
+      if (absolute === node.ownStart) best = match;
+      continue;
+    }
+    if (absolute >= before) continue;
   }
-  if (!best) return { start: node.start, end: Math.min(node.end, node.start + name.length) };
+  if (!best) {
+    const fallbackName = node.kind === 'anonymous'
+      ? node.name.replace(/^!/u, '')
+      : AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
+    return { start: node.start, end: Math.min(node.end, node.start + fallbackName.length) };
+  }
   const start = searchStart + best.index;
   return { start, end: start + best[0].length };
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+const AST_FUNCTION_NAMES: Readonly<Record<string, string>> = {
+  arrayFilter: 'filter',
+  regexpSplit: 'split',
+  strPosition: 'position',
+  tsOrDsAdd: 'date_add',
+  tsOrDsDiff: 'date_diff',
+};
+
+function camelCaseToSqlName(value: string): string {
+  return value.replace(/([a-z0-9])([A-Z])/gu, '$1_$2').toLocaleLowerCase();
 }
 
 function normalizeValue(value: unknown): SqlAstValue {

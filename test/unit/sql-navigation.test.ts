@@ -110,6 +110,15 @@ describe('AST SQL symbol resolver', () => {
     expect(field?.definitions[0]?.location.source).toBe('file:///t.sql');
   });
 
+  it('publishes catalog signatures and inferred built-in return types', () => {
+    const sql = "SELECT split(payload.name, ',') FROM sales.orders";
+    const resolved = symbol(sql, 'split', 'spark');
+    expect(resolved?.functionCategory).toBe('builtin');
+    expect(resolved?.functionCatalogVersion).toBe('4.2.0');
+    expect(resolved?.functionSignatures?.[0]).toContain('ARRAY<STRING>');
+    expect(resolved?.type).toContain('ARRAY');
+  });
+
   it('keeps all same-level UNION projection definitions', () => {
     const schema = createSchemaSnapshot([
       parseDdlSchema('CREATE TABLE a (id BIGINT); CREATE TABLE b (id BIGINT);', 'spark', 'file:///ab.sql'),

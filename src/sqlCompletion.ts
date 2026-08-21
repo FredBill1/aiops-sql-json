@@ -5,6 +5,7 @@ import type { JsonServiceManager } from './jsonService';
 import type { SqlSchemaService } from './schemaService';
 import { getSqlSuggestions } from './sql';
 import { getSqlCatalog } from './sqlCatalog';
+import { formatSqlFunctionSignature } from './sqlFunctionSignatures';
 import { getSqlDocumentContext } from './sqlDocumentContext';
 import {
   collectSqlFieldNames,
@@ -106,7 +107,18 @@ function buildCompletionItems(
       const cased = applyTypedCase(functionName, casingPrefix);
       const item = new vscode.CompletionItem(cased, vscode.CompletionItemKind.Function);
       item.range = range;
-      item.detail = udfSet.has(functionName.toLocaleLowerCase()) ? 'User-defined SQL function' : `${configuration.dialect} SQL function`;
+      const definition = catalog.functionByName.get(functionName.toLocaleLowerCase());
+      if (udfSet.has(functionName.toLocaleLowerCase())) {
+        item.detail = 'User-defined SQL function';
+      } else if (definition?.signatures[0]) {
+        const overloads = definition.signatures.length - 1;
+        item.detail = `${configuration.dialect} ${catalog.version}: ${formatSqlFunctionSignature(
+          cased,
+          definition.signatures[0],
+        )}${overloads > 0 ? ` (+${overloads} overload${overloads === 1 ? '' : 's'})` : ''}`;
+      } else {
+        item.detail = `${configuration.dialect} ${catalog.version} SQL function`;
+      }
       item.sortText = `1-${functionName}`;
       item.insertText = nextNonWhitespace(context.sqlText, word.end) === '('
         ? cased

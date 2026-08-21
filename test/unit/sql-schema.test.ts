@@ -7,6 +7,7 @@ import {
   createSchemaSnapshot,
   getSqlSchemaAtOffset,
   getSqlScopeInfo,
+  getSqlSymbolAtOffset,
   parseDdlSchema,
 } from '../../src/sqlSchemaCore';
 import { SQL_DIALECTS, type SqlDialect } from '../../src/sql';
@@ -27,6 +28,10 @@ describe('SQL catalogs', () => {
     const catalog = getSqlCatalog(dialect);
     expect(catalog.keywords).toContain('SELECT');
     expect(catalog.functions.length).toBeGreaterThan(5);
+    expect(catalog.version).not.toBe('');
+    expect(catalog.functionDefinitions).toHaveLength(catalog.functions.length);
+    expect(catalog.functionDefinitions.every((definition) => definition.signatures.length > 0)).toBe(true);
+    expect(catalog.functionByName.size).toBeGreaterThanOrEqual(catalog.functions.length);
   });
 
   it('contains representative dialect-specific functions', () => {
@@ -38,6 +43,16 @@ describe('SQL catalogs', () => {
     expect(getSqlCatalog('mysql').functions).toContain('JSON_TABLE');
     expect(getSqlCatalog('postgresql').functions).toContain('TO_REGCLASS');
     expect(getSqlCatalog('trino').functions).toContain('ZIP_WITH');
+  });
+
+  it('defines Generic SQL as the portable function intersection', () => {
+    const generic = getSqlCatalog('generic');
+    const productDialects = SQL_DIALECTS.filter((dialect) => dialect !== 'generic');
+    for (const functionName of generic.functions) {
+      expect(productDialects.every((dialect) => (
+        getSqlCatalog(dialect).functions.includes(functionName)
+      )), functionName).toBe(true);
+    }
   });
 });
 
@@ -376,6 +391,65 @@ SELECT id, amount_hash, customer_hash FROM local_orders;`;
     for (const sql of cases) {
       expect(analyzeSqlSemantics(sql, 'spark', [], { tables: [], issues: [] }, [])).toEqual([]);
     }
+  });
+
+  it('propagates Spark array function types through posexplode aliases', () => {
+    const expressions = [
+      "split(tags, ',')",
+      "concat(split(tags, ','), array('fallback'))",
+      "transform(split(tags, ','), x -> upper(x))",
+      "filter(split(tags, ','), x -> x <> '')",
+      "transform(filter(split(tags, ','), x -> x <> ''), x -> concat(x, '!'))",
+    ];
+    for (const expression of expressions) {
+      const sql = `create table user_tags (
+  user_id bigint, user_name string, tags string
+);
+select user_id, user_name, pos, tag
+from user_tags lateral view posexplode(${expression}) t as pos, tag
+where tag <> 'tag1';`;
+      expect(analyzeSqlSemantics(sql, 'spark', [], { tables: [], issues: [] }, []), expression).toEqual([]);
+      const tag = getSqlSymbolAtOffset(
+        sql,
+        sql.indexOf('tag\nfrom'),
+        'spark',
+        [],
+        { tables: [], issues: [] },
+      );
+      expect(tag?.type, expression).toMatch(/string/i);
+    }
+  });
+
+  it('conservatively validates known built-in function signatures', () => {
+    const wrongCount = analyzeSqlSemantics(
+      'CREATE TABLE t (value STRING); SELECT sha2(value) FROM t;',
+      'spark',
+      [],
+      { tables: [], issues: [] },
+      [],
+    );
+    expect(wrongCount).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'function-argument-count' }),
+    ]));
+
+    const wrongType = analyzeSqlSemantics(
+      "CREATE TABLE t (value STRING); SELECT sha2(value, '256') FROM t;",
+      'spark',
+      [],
+      { tables: [], issues: [] },
+      [],
+    );
+    expect(wrongType).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'function-argument-type' }),
+    ]));
+
+    expect(analyzeSqlSemantics(
+      'CREATE TABLE t (value STRING); SELECT configured_udf(value, 1, 2) FROM t;',
+      'spark',
+      [],
+      { tables: [], issues: [] },
+      ['configured_udf'],
+    )).toEqual([]);
   });
 
   it('retains nested-field errors when a complex type is known', () => {

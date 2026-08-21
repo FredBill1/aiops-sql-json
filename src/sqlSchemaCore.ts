@@ -3,12 +3,20 @@ import { analyzeSql, lexSql, type SqlDialect, type SqlLexToken } from './sql';
 import {
   astChild,
   astChildren,
+  astFunctionName,
   isSqlAstNode,
   parseSqlAst,
   type SqlAstNode,
   type SqlAstValue,
 } from './sqlAst';
 import { getSqlCatalog } from './sqlCatalog';
+import {
+  formatSqlFunctionSignature,
+  type SqlFunctionDefinition,
+  type SqlFunctionParameter,
+  type SqlFunctionReturnRule,
+  type SqlFunctionSignature,
+} from './sqlFunctionSignatures';
 
 export type SqlTypeFamily = 'number' | 'string' | 'boolean' | 'date' | 'time' | 'binary' | 'complex' | 'unknown';
 
@@ -65,6 +73,8 @@ export interface SqlSymbolResolution {
   };
   definitions: readonly SqlSymbolDefinition[];
   functionCategory?: 'builtin' | 'udf';
+  functionSignatures?: readonly string[];
+  functionCatalogVersion?: string;
   dialect?: SqlDialect;
 }
 
@@ -1132,6 +1142,8 @@ interface AstModelContext {
   readonly placeholderRanges: readonly { start: number; end: number }[];
   readonly functions: ReadonlySet<string>;
   readonly builtinFunctions: ReadonlySet<string>;
+  readonly functionDefinitions: ReadonlyMap<string, SqlFunctionDefinition>;
+  readonly functionCatalogVersion: string;
   readonly udfs: ReadonlySet<string>;
   readonly validate: boolean;
   readonly sparkStoreAssignmentPolicy: SparkStoreAssignmentPolicy;
@@ -1200,6 +1212,8 @@ function buildAstSqlModel(
     placeholderRanges: findPlaceholderRanges(text, placeholders),
     functions: new Set([...builtinFunctions, ...configuredUdfs]),
     builtinFunctions,
+    functionDefinitions: catalog.functionByName,
+    functionCatalogVersion: catalog.version,
     udfs: configuredUdfs,
     validate,
     sparkStoreAssignmentPolicy,
@@ -1607,7 +1621,7 @@ function bindAstExpansion(
 ): RelationBinding {
   if (context.validate) validateAstExpression(source, scope, ctes, context);
   else collectAstReferences(source, context);
-  const functionName = normalizeBareIdentifier(source.name || source.kind, context.dialect).replace(/^!/u, '');
+  const functionName = normalizeBareIdentifier(astFunctionName(source, context.text), context.dialect).replace(/^!/u, '');
   const inputs = astExpressionArguments(source);
   const inputTypes = inputs.map((input) => inferAstExpressionType(input, scope, context));
   const inputType = inputTypes[0] ?? UNKNOWN_DATA_TYPE;
@@ -1653,9 +1667,10 @@ function bindAstExpansion(
 
   const typedAliasColumns = astTypedAliasColumns(relation, source, context.dialect);
   if (typedAliasColumns.length > 0) columns = typedAliasColumns;
+  const expansionName = astFunctionName(source, context.text);
   const implicitDefinition = symbolDefinition(
     'generator-column',
-    source.name || source.kind,
+    expansionName,
     '',
     source.start,
     source.end,
@@ -1693,6 +1708,23 @@ function bindAstExpansion(
           ? [symbolDefinition('generator-column', name, '', explicitNodes[index]!.start, explicitNodes[index]!.end)]
           : undefined,
       ));
+    } else if (explicit.length > columns.length) {
+      columns = [
+        ...columns,
+        ...explicit.slice(columns.length).map((name, relativeIndex) => {
+          const index = columns.length + relativeIndex;
+          return renameVirtualColumn(
+            name,
+            undefined,
+            context.dialect,
+            explicitNodes[index]
+              ? [symbolDefinition(
+                  'generator-column', name, '', explicitNodes[index]!.start, explicitNodes[index]!.end,
+                )]
+              : undefined,
+          );
+        }),
+      ];
     }
   } else if (columns.length === 0) {
     columns = [virtualColumn(
@@ -1720,7 +1752,7 @@ function bindAstExpansion(
       [symbolDefinition('generator-column', offset.name || 'ordinality', '', offset.start, offset.end)],
     ));
   }
-  const alias = relation.alias || source.alias || source.name || source.kind;
+  const alias = relation.alias || source.alias || expansionName;
   const binding = relationBindingWithDefinitions(relation.alias ? relation : source, {
     name: alias,
     aliases: alias ? [normalizeQualifiedName(alias, context.dialect)] : [],
@@ -1729,7 +1761,7 @@ function bindAstExpansion(
     kind: 'generator',
     targetDefinitions: [symbolDefinition(
       'function',
-      source.name || source.kind,
+      expansionName,
       '',
       source.start,
       source.end,
@@ -1862,10 +1894,11 @@ function validateAstExpression(
     }
   }
   if (node.role === 'function' || node.role === 'unnest') {
-    const name = (node.name || node.kind).replace(/^!/u, '');
+    const name = astFunctionName(node, context.text).replace(/^!/u, '');
     const normalized = normalizeQualifiedName(name, context.dialect);
-    const knownFunction = context.functions.has(normalized);
     const category = context.udfs.has(normalized) ? 'udf' : 'builtin';
+    const definition = category === 'builtin' ? findAstFunctionDefinition(normalized, context) : undefined;
+    const knownFunction = context.functions.has(normalized) || Boolean(definition);
     const dataType = inferAstExpressionType(node, scope, context, environment);
     if (knownFunction) {
       appendSymbol(context, {
@@ -1876,6 +1909,10 @@ function validateAstExpression(
         type: displaySqlDataType(dataType),
         definitions: [],
         functionCategory: category,
+        functionSignatures: definition?.signatures.map((signatureValue) => (
+          formatSqlFunctionSignature(definition.name, signatureValue)
+        )),
+        functionCatalogVersion: category === 'builtin' ? context.functionCatalogVersion : undefined,
         dialect: context.dialect,
       });
     }
@@ -1886,9 +1923,11 @@ function validateAstExpression(
       end: node.nameEnd,
       isFunction: true,
     });
-    if (node.kind === 'anonymous' && name && !context.functions.has(normalized)) {
+    if (node.kind === 'anonymous' && name && !knownFunction) {
       appendAstIssue(context, node, 'unknown-function',
         `Unknown function ${name}. Add it to aiopsSqlJson.udfs if it is user-defined.`, 'warning');
+    } else if (context.validate && definition && node.kind !== 'exists') {
+      validateAstFunctionSignature(node, definition, scope, context, environment);
     }
   }
   if (validateAstHigherOrderExpression(node, scope, ctes, context, environment)) return;
@@ -2173,7 +2212,7 @@ function inferAstExpressionType(
     if (baseType.kind === 'map') return baseType.valueType;
     return UNKNOWN_DATA_TYPE;
   }
-  const normalizedFunction = normalizeBareIdentifier(node.name || node.kind, context.dialect).replace(/^!/u, '');
+  const normalizedFunction = normalizeBareIdentifier(astFunctionName(node, context.text), context.dialect).replace(/^!/u, '');
   const args = astExpressionArguments(node);
   const higherOrderType = inferAstHigherOrderType(node, normalizedFunction, scope, context, environment);
   if (higherOrderType) return higherOrderType;
@@ -2228,7 +2267,7 @@ function inferAstExpressionType(
     }
     return { kind: 'struct', fields };
   }
-  if (['lower', 'upper', 'lcase', 'ucase', 'trim', 'ltrim', 'rtrim', 'concat', 'concat_ws', 'substring', 'substr'].includes(normalizedFunction)) {
+  if (['lower', 'upper', 'lcase', 'ucase', 'trim', 'ltrim', 'rtrim', 'concat_ws', 'substring', 'substr'].includes(normalizedFunction)) {
     return dataTypeFromFamily('string');
   }
   if (normalizedFunction === 'split') return { kind: 'array', elementType: dataTypeFromFamily('string') };
@@ -2266,7 +2305,229 @@ function inferAstExpressionType(
   if (['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'and', 'or', 'not', 'is', 'in', 'between'].includes(node.kind)) {
     return dataTypeFromFamily('boolean');
   }
+  const definition = findAstFunctionDefinition(normalizedFunction, context);
+  if (definition) {
+    return inferAstFunctionDefinitionType(node, definition, scope, context, environment);
+  }
   return UNKNOWN_DATA_TYPE;
+}
+
+interface AstFunctionSignatureResolution {
+  readonly arityCandidates: readonly SqlFunctionSignature[];
+  readonly compatibleCandidates: readonly SqlFunctionSignature[];
+  readonly arguments: readonly SqlAstNode[];
+}
+
+function findAstFunctionDefinition(
+  normalizedName: string,
+  context: AstModelContext,
+): SqlFunctionDefinition | undefined {
+  return context.functionDefinitions.get(normalizedName)
+    ?? context.functionDefinitions.get(normalizedName.split('.').at(-1) ?? normalizedName);
+}
+
+function resolveAstFunctionSignatures(
+  node: SqlAstNode,
+  definition: SqlFunctionDefinition,
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): AstFunctionSignatureResolution {
+  const args = astExpressionArguments(node);
+  const arityCandidates = definition.signatures.filter((candidate) => signatureAcceptsArity(candidate, args.length));
+  const compatibleCandidates = arityCandidates.filter((candidate) => candidate.parameters.every((parameter, index) => {
+    if (parameter.variadic) {
+      return args.slice(index).every((argument) => astArgumentMatchesParameter(
+        argument, parameter, scope, context, environment,
+      ));
+    }
+    const argument = args[index];
+    return !argument || astArgumentMatchesParameter(argument, parameter, scope, context, environment);
+  }));
+  return { arityCandidates, compatibleCandidates, arguments: args };
+}
+
+function inferAstFunctionDefinitionType(
+  node: SqlAstNode,
+  definition: SqlFunctionDefinition,
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): SqlDataType {
+  const resolution = resolveAstFunctionSignatures(node, definition, scope, context, environment);
+  const candidates = resolution.compatibleCandidates.length > 0
+    ? resolution.compatibleCandidates
+    : resolution.arityCandidates;
+  if (candidates.length === 0) return UNKNOWN_DATA_TYPE;
+  return commonAstDataType(candidates.map((candidate) => evaluateFunctionReturnRule(
+    candidate.returns,
+    resolution.arguments,
+    scope,
+    context,
+    environment,
+  )));
+}
+
+function validateAstFunctionSignature(
+  node: SqlAstNode,
+  definition: SqlFunctionDefinition,
+  scope: AstScope,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): void {
+  const resolution = resolveAstFunctionSignatures(node, definition, scope, context, environment);
+  if (resolution.arityCandidates.length === 0) {
+    const expected = definition.signatures.map(signatureArityText).filter((value, index, values) => (
+      values.indexOf(value) === index
+    )).join(' or ');
+    appendAstIssue(
+      context,
+      node,
+      'function-argument-count',
+      `Function ${definition.name} expects ${expected} argument(s), but received ${resolution.arguments.length}.`,
+    );
+  } else if (resolution.compatibleCandidates.length === 0) {
+    const actual = resolution.arguments.map((argument) => displaySqlDataType(
+      inferAstExpressionType(argument, scope, context, environment),
+    )).join(', ');
+    appendAstIssue(
+      context,
+      node,
+      'function-argument-type',
+      `Function ${definition.name} does not accept argument types (${actual}).`,
+    );
+  }
+}
+
+function signatureAcceptsArity(signatureValue: SqlFunctionSignature, argumentCount: number): boolean {
+  const required = signatureValue.parameters.filter((parameter) => !parameter.optional && !parameter.variadic).length;
+  const variadic = signatureValue.parameters.some((parameter) => parameter.variadic);
+  return argumentCount >= required && (variadic || argumentCount <= signatureValue.parameters.length);
+}
+
+function signatureArityText(signatureValue: SqlFunctionSignature): string {
+  const required = signatureValue.parameters.filter((parameter) => !parameter.optional && !parameter.variadic).length;
+  if (signatureValue.parameters.some((parameter) => parameter.variadic)) return `${required}+`;
+  const maximum = signatureValue.parameters.length;
+  return required === maximum ? String(required) : `${required}-${maximum}`;
+}
+
+function astArgumentMatchesParameter(
+  argument: SqlAstNode,
+  parameter: SqlFunctionParameter,
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): boolean {
+  if (parameter.type === 'ANY') return true;
+  if (parameter.type === 'LAMBDA') return argument.kind === 'lambda';
+  const actual = inferAstExpressionType(argument, scope, context, environment);
+  if (actual.kind === 'unknown') return true;
+  switch (parameter.type) {
+    case 'NUMBER': return actual.kind === 'scalar' && actual.family === 'number';
+    case 'STRING': return actual.kind === 'scalar' && actual.family === 'string';
+    case 'BOOLEAN': return actual.kind === 'scalar' && actual.family === 'boolean';
+    case 'DATE': return actual.kind === 'scalar' && actual.family === 'date';
+    case 'TIME': return actual.kind === 'scalar' && (actual.family === 'time' || actual.family === 'date');
+    case 'BINARY': return actual.kind === 'scalar' && actual.family === 'binary';
+    case 'ARRAY': return actual.kind === 'array';
+    case 'MAP': return actual.kind === 'map';
+    case 'COMPLEX': return actual.kind === 'array' || actual.kind === 'map' || actual.kind === 'struct';
+  }
+}
+
+function evaluateFunctionReturnRule(
+  rule: SqlFunctionReturnRule,
+  args: readonly SqlAstNode[],
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): SqlDataType {
+  const argumentTypes = (): SqlDataType[] => args.map((argument) => (
+    inferAstExpressionType(argument, scope, context, environment)
+  ));
+  switch (rule.kind) {
+    case 'fixed': return parseSqlDataType(rule.type, context.dialect);
+    case 'argument': return args[rule.index]
+      ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+      : UNKNOWN_DATA_TYPE;
+    case 'common': {
+      const types = argumentTypes();
+      return commonAstDataType(rule.indexes ? rule.indexes.flatMap((index) => types[index] ? [types[index]!] : []) : types);
+    }
+    case 'array': return {
+      kind: 'array',
+      elementType: evaluateFunctionReturnRule(rule.element, args, scope, context, environment),
+    };
+    case 'array-element': {
+      const input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      return input.kind === 'array' ? input.elementType : UNKNOWN_DATA_TYPE;
+    }
+    case 'map-keys': {
+      const input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      return input.kind === 'map' ? { kind: 'array', elementType: input.keyType } : UNKNOWN_DATA_TYPE;
+    }
+    case 'map-values': {
+      const input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      return input.kind === 'map' ? { kind: 'array', elementType: input.valueType } : UNKNOWN_DATA_TYPE;
+    }
+    case 'element-at': {
+      const input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      if (input.kind === 'array') return input.elementType;
+      if (input.kind === 'map') return input.valueType;
+      return UNKNOWN_DATA_TYPE;
+    }
+    case 'concat': return inferConcatReturnType(argumentTypes(), context.dialect);
+    case 'from-json': return args[1]?.role === 'literal'
+      ? parseSqlDataType(args[1].name, context.dialect)
+      : UNKNOWN_DATA_TYPE;
+    case 'array-constructor': return { kind: 'array', elementType: commonAstDataType(argumentTypes()) };
+    case 'map-constructor': {
+      const types = argumentTypes();
+      return {
+        kind: 'map',
+        keyType: commonAstDataType(types.filter((_value, index) => index % 2 === 0)),
+        valueType: commonAstDataType(types.filter((_value, index) => index % 2 === 1)),
+      };
+    }
+    case 'struct-constructor':
+    case 'higher-order':
+    case 'generator': return UNKNOWN_DATA_TYPE;
+    case 'dynamic': {
+      const parsed = parseSqlDataType(rule.display, context.dialect);
+      if (parsed.kind !== 'unknown') return parsed;
+      return commonAstDataType(argumentTypes());
+    }
+  }
+}
+
+function inferConcatReturnType(types: readonly SqlDataType[], dialect: SqlDialect): SqlDataType {
+  const known = types.filter((type) => type.kind !== 'unknown');
+  if (known.length === 0) return UNKNOWN_DATA_TYPE;
+  if (known.every((type) => type.kind === 'array')) {
+    return {
+      kind: 'array',
+      elementType: commonAstDataType(known.map((type) => type.kind === 'array' ? type.elementType : UNKNOWN_DATA_TYPE)),
+    };
+  }
+  if (known.every((type) => type.kind === 'scalar' && type.family === 'binary')) return known[0]!;
+  if (known.some((type) => type.kind === 'array' || type.kind === 'map' || type.kind === 'struct')) {
+    return UNKNOWN_DATA_TYPE;
+  }
+  return parseSqlDataType(
+    dialect === 'postgresql' ? 'TEXT' : dialect === 'mysql' || dialect === 'trino' || dialect === 'flink'
+      ? 'VARCHAR'
+      : 'STRING',
+    dialect,
+  );
 }
 
 function validateAstHigherOrderExpression(
@@ -2276,7 +2537,7 @@ function validateAstHigherOrderExpression(
   context: AstModelContext,
   environment: AstTypeEnvironment,
 ): boolean {
-  const name = normalizeBareIdentifier(node.name || node.kind, context.dialect).replace(/^!/u, '');
+  const name = normalizeBareIdentifier(astFunctionName(node, context.text), context.dialect).replace(/^!/u, '');
   const invocations = astHigherOrderInvocations(node, name, scope, context, environment);
   if (!invocations) return false;
   forEachAstChild(node, (child) => {
@@ -2704,8 +2965,11 @@ function forEachAstChild(node: SqlAstNode, visit: (child: SqlAstNode) => void): 
 function astExpressionArguments(node: SqlAstNode): readonly SqlAstNode[] {
   const expressions = astChildren(node, 'expressions');
   if (expressions.length > 0) return expressions;
-  const thisNode = astChild(node, 'this');
-  return thisNode ? [thisNode] : [];
+  const ignoredKeys = new Set(['alias', 'kind', 'order', 'partitionBy', 'spec']);
+  return Object.entries(node.args).flatMap(([key, value]) => {
+    if (ignoredKeys.has(key) || !isSqlAstNode(value)) return [];
+    return value.role === 'data-type' || value.role === 'schema' ? [] : [value];
+  });
 }
 
 function astIdentifierReference(node: SqlAstNode): IdentifierReference {
@@ -3163,6 +3427,8 @@ function deriveAstStatementColumns(
     placeholderRanges: findPlaceholderRanges(text, placeholders),
     functions: new Set(),
     builtinFunctions: new Set(),
+    functionDefinitions: new Map(),
+    functionCatalogVersion: '',
     udfs: new Set(),
     validate: false,
     sparkStoreAssignmentPolicy: 'ansi',
