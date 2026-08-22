@@ -178,11 +178,11 @@ export function isSqlAstNode(value: SqlAstValue | unknown): value is SqlAstNode 
 
 /** Returns the SQL spelling of a function call instead of the parser's class-specific AST key. */
 export function astFunctionName(node: SqlAstNode, text: string): string {
-  if (node.ownStart !== undefined) {
-    const sourceName = text.slice(node.nameStart, node.nameEnd).trim();
-    if (/^[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*$/u.test(sourceName)) {
-      return sourceName.replace(/\s+/gu, '');
-    }
+  const sourceName = text.slice(node.nameStart, node.nameEnd).trim();
+  if (/^[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*$/u.test(sourceName)) {
+    const normalizedSource = sourceName.replace(/\s+/gu, '');
+    const leaf = normalizedSource.split('.').at(-1)?.toLocaleLowerCase() ?? '';
+    if (node.ownStart !== undefined || astFunctionSourceNames(node).has(leaf)) return normalizedSource;
   }
   if (node.kind === 'anonymous' && node.name) return node.name.replace(/^!/u, '');
   return AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
@@ -248,13 +248,14 @@ function exactNodeNameSpan(node: SqlAstNode, text: string): { start: number; end
   if (node.role !== 'function' && node.role !== 'unnest') {
     return { start: node.start, end: node.end };
   }
-  const childStarts = Object.values(node.args).flatMap(collectValueSpans).map((span) => span.start);
+  const childStarts = Object.values(node.args).flatMap(collectValueOwnStarts);
   const before = childStarts.length > 0 ? Math.min(...childStarts) : node.end;
   const searchStart = Math.max(0, Math.min(node.start, before) - 160);
   const searchEnd = Math.min(text.length, Math.max(before, node.end) + 2);
   const segment = text.slice(searchStart, searchEnd);
   const matcher = /[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*(?=\s*\()/giu;
   let best: RegExpExecArray | undefined;
+  const allowedNames = astFunctionSourceNames(node);
   for (const match of segment.matchAll(matcher)) {
     const absolute = searchStart + match.index;
     if (node.ownStart !== undefined) {
@@ -262,6 +263,8 @@ function exactNodeNameSpan(node: SqlAstNode, text: string): { start: number; end
       continue;
     }
     if (absolute >= before) continue;
+    const leaf = match[0].replace(/\s+/gu, '').split('.').at(-1)?.toLocaleLowerCase() ?? '';
+    if (allowedNames.has(leaf)) best = match;
   }
   if (!best) {
     const fallbackName = node.kind === 'anonymous'
@@ -275,11 +278,64 @@ function exactNodeNameSpan(node: SqlAstNode, text: string): { start: number; end
 
 const AST_FUNCTION_NAMES: Readonly<Record<string, string>> = {
   arrayFilter: 'filter',
+  approxQuantile: 'approx_percentile',
+  argMax: 'max_by',
+  argMin: 'min_by',
+  cast: 'cast',
+  chr: 'chr',
+  dateDiff: 'date_diff',
+  extract: 'extract',
+  groupConcat: 'string_agg',
+  jsonArrayAgg: 'json_agg',
+  jsonExtract: 'json_extract',
+  jsonObjectAgg: 'json_objectagg',
+  quantile: 'percentile',
   regexpSplit: 'split',
   strPosition: 'position',
+  substring: 'substring',
   tsOrDsAdd: 'date_add',
   tsOrDsDiff: 'date_diff',
+  xmlElement: 'xmlelement',
+  xmlTable: 'xmltable',
 };
+
+const AST_FUNCTION_SOURCE_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  arrayFilter: ['filter'],
+  approxQuantile: ['approx_percentile', 'percentile_approx'],
+  argMax: ['max_by'],
+  argMin: ['min_by'],
+  cast: ['cast', 'convert', 'from_utc_timestamp', 'to_utc_timestamp'],
+  chr: ['char', 'chr'],
+  dateDiff: ['date_diff', 'datediff', 'to_days'],
+  extract: ['date_part', 'extract'],
+  groupConcat: ['group_concat', 'listagg', 'string_agg'],
+  jsonArrayAgg: ['json_agg', 'json_arrayagg'],
+  jsonExtract: ['json_extract', 'json_query'],
+  jsonObjectAgg: [
+    'json_object_agg',
+    'json_objectagg',
+    'jsonb_object_agg',
+  ],
+  quantile: ['percentile'],
+  regexpSplit: ['regexp_split', 'split'],
+  strPosition: ['position'],
+  substring: ['substr', 'substring'],
+  tsOrDsAdd: ['date_add', 'dateadd'],
+  tsOrDsDiff: ['date_diff', 'datediff'],
+  xmlElement: ['xmlelement'],
+  xmlTable: ['xmltable'],
+};
+
+function astFunctionSourceNames(node: SqlAstNode): ReadonlySet<string> {
+  if (node.kind === 'anonymous' && node.name) {
+    return new Set([node.name.replace(/^!/u, '').toLocaleLowerCase()]);
+  }
+  const canonical = AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
+  return new Set([
+    canonical.toLocaleLowerCase(),
+    ...(AST_FUNCTION_SOURCE_ALIASES[node.kind] ?? []),
+  ]);
+}
 
 function camelCaseToSqlName(value: string): string {
   return value.replace(/([a-z0-9])([A-Z])/gu, '$1_$2').toLocaleLowerCase();
@@ -300,6 +356,17 @@ function normalizeValue(value: unknown): SqlAstValue {
 function collectValueSpans(value: SqlAstValue): Array<{ start: number; end: number }> {
   if (isSqlAstNode(value)) return [{ start: value.start, end: value.end }];
   if (Array.isArray(value)) return value.flatMap(collectValueSpans);
+  return [];
+}
+
+function collectValueOwnStarts(value: SqlAstValue): number[] {
+  if (isSqlAstNode(value)) {
+    return [
+      ...(value.ownStart === undefined ? [] : [value.ownStart]),
+      ...Object.values(value.args).flatMap(collectValueOwnStarts),
+    ];
+  }
+  if (Array.isArray(value)) return value.flatMap(collectValueOwnStarts);
   return [];
 }
 

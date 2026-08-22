@@ -23,9 +23,11 @@ export type SqlTypeFamily = 'number' | 'string' | 'boolean' | 'date' | 'time' | 
 export type SqlDataType =
   | { kind: 'unknown' }
   | { kind: 'scalar'; family: Exclude<SqlTypeFamily, 'complex' | 'unknown'>; name: string }
+  | { kind: 'opaque'; name: string; typeArguments: readonly SqlDataType[] }
   | { kind: 'array'; elementType: SqlDataType }
+  | { kind: 'multiset'; elementType: SqlDataType }
   | { kind: 'map'; keyType: SqlDataType; valueType: SqlDataType }
-  | { kind: 'struct'; fields: readonly SchemaColumn[] };
+  | { kind: 'struct'; fields: readonly SchemaColumn[]; recordKind?: 'struct' | 'row' };
 
 type SparkStoreAssignmentPolicy = 'ansi' | 'legacy' | 'strict';
 
@@ -1499,6 +1501,28 @@ function bindAstRelation(
   ctes: ReadonlyMap<string, RelationBinding>,
   context: AstModelContext,
 ): RelationBinding {
+  if (relation.kind === 'values') {
+    const result = analyzeAstQuery(relation, context, undefined, ctes);
+    const aliasNode = astChild(relation, 'alias');
+    const aliasColumns = aliasNode ? astChildren(aliasNode, 'columns') : [];
+    const columns = result.columns.map((column, index) => relation.aliasColumns[index]
+      ? renameVirtualColumn(
+          relation.aliasColumns[index]!,
+          column,
+          context.dialect,
+          aliasColumns[index]
+            ? [symbolDefinition(
+                'column',
+                relation.aliasColumns[index]!,
+                '',
+                aliasColumns[index]!.start,
+                aliasColumns[index]!.end,
+              )]
+            : column.definitions,
+        )
+      : column);
+    return astDerivedBinding(relation, columns, context, result.open);
+  }
   if (relation.role === 'subquery') {
     const query = astChild(relation, 'this');
     const result = query
@@ -1583,7 +1607,7 @@ function bindImpalaCollectionRelation(
   if (resolution.status !== 'found' || !resolution.column) return undefined;
   const dataType = columnDataType(resolution.column, context.dialect);
   let columns: SchemaColumn[] = [];
-  if (dataType.kind === 'array') {
+  if (dataType.kind === 'array' || dataType.kind === 'multiset') {
     columns = [virtualColumn(
       'item',
       dataTypeFamily(dataType.elementType),
@@ -1627,7 +1651,7 @@ function bindAstExpansion(
   const inputType = inputTypes[0] ?? UNKNOWN_DATA_TYPE;
   let columns: SchemaColumn[] = [];
   if (functionName === 'posexplode' || functionName === 'posexplode_outer') {
-    columns.push(virtualColumn('pos', 'number'));
+    columns.push(virtualColumn('pos', 'number', '', parseSqlDataType('INT', context.dialect)));
     if (inputType.kind === 'array') {
       columns.push(virtualColumn('col', dataTypeFamily(inputType.elementType), '', inputType.elementType));
     } else if (inputType.kind === 'map') {
@@ -1647,9 +1671,37 @@ function bindAstExpansion(
     } else {
       columns.push(virtualColumn('col'));
     }
+  } else if (functionName === 'inline' || functionName === 'inline_outer') {
+    const element = inputType.kind === 'array' || inputType.kind === 'multiset'
+      ? inputType.elementType
+      : UNKNOWN_DATA_TYPE;
+    if (element.kind === 'struct') {
+      columns = element.fields.map((field) => virtualColumn(
+        field.name,
+        dataTypeFamily(columnDataType(field, context.dialect)),
+        '',
+        columnDataType(field, context.dialect),
+        field.definitions,
+      ));
+    }
+  } else if (functionName === 'variant_explode' || functionName === 'variant_explode_outer') {
+    columns = [
+      virtualColumn('pos', 'number', '', parseSqlDataType('INT', context.dialect)),
+      virtualColumn('key', 'string', '', parseSqlDataType('STRING', context.dialect)),
+      virtualColumn('value', 'unknown', '', parseSqlDataType('VARIANT', context.dialect)),
+    ];
   } else if (functionName === 'unnest') {
     columns = inputTypes.flatMap((dataType) => {
-      if (dataType.kind === 'array') {
+      if (dataType.kind === 'array' || dataType.kind === 'multiset') {
+        if (dataType.elementType.kind === 'struct') {
+          return dataType.elementType.fields.map((field) => virtualColumn(
+            field.name,
+            dataTypeFamily(columnDataType(field, context.dialect)),
+            '',
+            columnDataType(field, context.dialect),
+            field.definitions,
+          ));
+        }
         return [virtualColumn('col', dataTypeFamily(dataType.elementType), '', dataType.elementType)];
       }
       if (dataType.kind === 'map') {
@@ -1680,6 +1732,19 @@ function bindAstExpansion(
     column.definitions?.length ? column : { ...column, definitions: [implicitDefinition] }
   ));
   const explicit = relation.aliasColumns.length > 0 ? relation.aliasColumns : source.aliasColumns;
+  if (functionName === 'unnest' && explicit.length === 1 && inputTypes.length === 1) {
+    const collection = inputTypes[0]!;
+    if ((collection.kind === 'array' || collection.kind === 'multiset')
+      && collection.elementType.kind === 'struct') {
+      columns = [virtualColumn(
+        'col',
+        dataTypeFamily(collection.elementType),
+        '',
+        collection.elementType,
+        [implicitDefinition],
+      )];
+    }
+  }
   const aliasNode = astChild(relation, 'alias') ?? astChild(source, 'alias');
   const explicitNodes = aliasNode ? astChildren(aliasNode, 'columns') : [];
   if (explicit.length > 0) {
@@ -2087,10 +2152,10 @@ function resolveDataTypeField(
   if (dataType.kind === 'unknown') {
     return { dataType: UNKNOWN_DATA_TYPE, column: virtualColumn(field) };
   }
-  if (dataType.kind === 'array') {
+  if (dataType.kind === 'array' || dataType.kind === 'multiset') {
     const nested = resolveDataTypeField(dataType.elementType, field, dialect);
     return nested
-      ? { dataType: { kind: 'array', elementType: nested.dataType }, column: nested.column }
+      ? { dataType: { kind: dataType.kind, elementType: nested.dataType }, column: nested.column }
       : undefined;
   }
   if (dataType.kind !== 'struct') return undefined;
@@ -2192,7 +2257,10 @@ function inferAstExpressionType(
   }
   if (node.role === 'literal') {
     if (node.args.isString === true) return dataTypeFromFamily('string');
-    return /^[-+]?\d/u.test(node.name) ? dataTypeFromFamily('number') : UNKNOWN_DATA_TYPE;
+    if (/^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?$/iu.test(node.name)) {
+      return parseSqlDataType(/[.e]/iu.test(node.name) ? 'DOUBLE' : 'INT', context.dialect);
+    }
+    return UNKNOWN_DATA_TYPE;
   }
   if (node.kind === 'boolean') return dataTypeFromFamily('boolean');
   if (node.kind === 'cast' || node.kind === 'tryCast') {
@@ -2212,6 +2280,16 @@ function inferAstExpressionType(
     if (baseType.kind === 'map') return baseType.valueType;
     return UNKNOWN_DATA_TYPE;
   }
+  if (node.kind === 'tuple') {
+    return {
+      kind: 'struct',
+      recordKind: 'row',
+      fields: astChildren(node, 'expressions').map((expression, index) => {
+        const dataType = inferAstExpressionType(expression, scope, context, environment);
+        return virtualColumn(`field${index}`, dataTypeFamily(dataType), '', dataType);
+      }),
+    };
+  }
   const normalizedFunction = normalizeBareIdentifier(astFunctionName(node, context.text), context.dialect).replace(/^!/u, '');
   const args = astExpressionArguments(node);
   const higherOrderType = inferAstHigherOrderType(node, normalizedFunction, scope, context, environment);
@@ -2225,10 +2303,10 @@ function inferAstExpressionType(
   if (['md5', 'sha', 'sha1', 'sha2'].includes(normalizedFunction)) {
     return dataTypeFromFamily('string');
   }
-  if (['sum', 'avg', 'max', 'min'].includes(normalizedFunction) && args[0]) {
+  if (['sum', 'avg'].includes(normalizedFunction) && args[0]) {
     return inferAstExpressionType(args[0], scope, context, environment);
   }
-  if (normalizedFunction === 'from_json' && args[1]?.role === 'literal') {
+  if (['from_json', 'from_csv', 'from_xml'].includes(normalizedFunction) && args[1]?.role === 'literal') {
     return dataTypeWithLiteralOrigins(
       parseSqlDataType(args[1].name, context.dialect),
       args[1],
@@ -2238,6 +2316,7 @@ function inferAstExpressionType(
   if (normalizedFunction === 'struct') {
     return {
       kind: 'struct',
+      recordKind: context.dialect === 'trino' || context.dialect === 'flink' ? 'row' : 'struct',
       fields: args.map((argument, index) => {
         const dataType = inferAstExpressionType(argument, scope, context, environment);
         const name = argument.outputName || argument.name || `col${index + 1}`;
@@ -2265,20 +2344,29 @@ function inferAstExpressionType(
         [symbolDefinition('field', name, '', args[index]!.start, args[index]!.end)],
       ));
     }
-    return { kind: 'struct', fields };
+    return { kind: 'struct', recordKind: 'struct', fields };
   }
   if (['lower', 'upper', 'lcase', 'ucase', 'trim', 'ltrim', 'rtrim', 'concat_ws', 'substring', 'substr'].includes(normalizedFunction)) {
     return dataTypeFromFamily('string');
   }
   if (normalizedFunction === 'split') return { kind: 'array', elementType: dataTypeFromFamily('string') };
   if (normalizedFunction === 'array') {
-    return { kind: 'array', elementType: args[0] ? inferAstExpressionType(args[0], scope, context, environment) : UNKNOWN_DATA_TYPE };
+    return {
+      kind: 'array',
+      elementType: commonAstDataType(args.map((argument) => (
+        inferAstExpressionType(argument, scope, context, environment)
+      ))),
+    };
   }
   if (normalizedFunction === 'map') {
+    const types = args.map((argument) => inferAstExpressionType(argument, scope, context, environment));
+    if (types.length === 2 && types[0]?.kind === 'array' && types[1]?.kind === 'array') {
+      return { kind: 'map', keyType: types[0].elementType, valueType: types[1].elementType };
+    }
     return {
       kind: 'map',
-      keyType: args[0] ? inferAstExpressionType(args[0], scope, context, environment) : UNKNOWN_DATA_TYPE,
-      valueType: args[1] ? inferAstExpressionType(args[1], scope, context, environment) : UNKNOWN_DATA_TYPE,
+      keyType: commonAstDataType(types.filter((_value, index) => index % 2 === 0)),
+      valueType: commonAstDataType(types.filter((_value, index) => index % 2 === 1)),
     };
   }
   if (['element_at', 'try_element_at'].includes(normalizedFunction) && args[0]) {
@@ -2361,6 +2449,7 @@ function inferAstFunctionDefinitionType(
   if (candidates.length === 0) return UNKNOWN_DATA_TYPE;
   return commonAstDataType(candidates.map((candidate) => evaluateFunctionReturnRule(
     candidate.returns,
+    node,
     resolution.arguments,
     scope,
     context,
@@ -2432,12 +2521,14 @@ function astArgumentMatchesParameter(
     case 'BINARY': return actual.kind === 'scalar' && actual.family === 'binary';
     case 'ARRAY': return actual.kind === 'array';
     case 'MAP': return actual.kind === 'map';
-    case 'COMPLEX': return actual.kind === 'array' || actual.kind === 'map' || actual.kind === 'struct';
+    case 'COMPLEX': return actual.kind === 'array' || actual.kind === 'multiset'
+      || actual.kind === 'map' || actual.kind === 'struct';
   }
 }
 
 function evaluateFunctionReturnRule(
   rule: SqlFunctionReturnRule,
+  node: SqlAstNode,
   args: readonly SqlAstNode[],
   scope: AstScope | undefined,
   context: AstModelContext,
@@ -2457,13 +2548,49 @@ function evaluateFunctionReturnRule(
     }
     case 'array': return {
       kind: 'array',
-      elementType: evaluateFunctionReturnRule(rule.element, args, scope, context, environment),
+      elementType: evaluateFunctionReturnRule(rule.element, node, args, scope, context, environment),
+    };
+    case 'multiset': return {
+      kind: 'multiset',
+      elementType: evaluateFunctionReturnRule(rule.element, node, args, scope, context, environment),
+    };
+    case 'map': return {
+      kind: 'map',
+      keyType: evaluateFunctionReturnRule(rule.key, node, args, scope, context, environment),
+      valueType: evaluateFunctionReturnRule(rule.value, node, args, scope, context, environment),
+    };
+    case 'opaque': return {
+      kind: 'opaque',
+      name: rule.name,
+      typeArguments: rule.typeArguments.map((argument) => (
+        evaluateFunctionReturnRule(argument, node, args, scope, context, environment)
+      )),
+    };
+    case 'record': return {
+      kind: 'struct',
+      recordKind: rule.recordKind,
+      fields: rule.fields.map((field) => {
+        const dataType = evaluateFunctionReturnRule(field.type, node, args, scope, context, environment);
+        return virtualColumn(field.name, dataTypeFamily(dataType), '', dataType);
+      }),
     };
     case 'array-element': {
       const input = args[rule.index]
         ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
         : UNKNOWN_DATA_TYPE;
       return input.kind === 'array' ? input.elementType : UNKNOWN_DATA_TYPE;
+    }
+    case 'map-key': {
+      const input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      return input.kind === 'map' ? input.keyType : UNKNOWN_DATA_TYPE;
+    }
+    case 'map-value': {
+      const input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      return input.kind === 'map' ? input.valueType : UNKNOWN_DATA_TYPE;
     }
     case 'map-keys': {
       const input = args[rule.index]
@@ -2477,6 +2604,23 @@ function evaluateFunctionReturnRule(
         : UNKNOWN_DATA_TYPE;
       return input.kind === 'map' ? { kind: 'array', elementType: input.valueType } : UNKNOWN_DATA_TYPE;
     }
+    case 'field': {
+      let input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      if (rule.arrayElement) input = input.kind === 'array' ? input.elementType : UNKNOWN_DATA_TYPE;
+      if (input.kind !== 'struct') return UNKNOWN_DATA_TYPE;
+      const field = typeof rule.field === 'number'
+        ? input.fields[rule.field]
+        : findColumn(input.fields, rule.field, context.dialect);
+      return field ? columnDataType(field, context.dialect) : UNKNOWN_DATA_TYPE;
+    }
+    case 'type-argument': {
+      const input = args[rule.index]
+        ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
+        : UNKNOWN_DATA_TYPE;
+      return input.kind === 'opaque' ? input.typeArguments[rule.argument] ?? UNKNOWN_DATA_TYPE : UNKNOWN_DATA_TYPE;
+    }
     case 'element-at': {
       const input = args[rule.index]
         ? inferAstExpressionType(args[rule.index]!, scope, context, environment)
@@ -2484,6 +2628,34 @@ function evaluateFunctionReturnRule(
       if (input.kind === 'array') return input.elementType;
       if (input.kind === 'map') return input.valueType;
       return UNKNOWN_DATA_TYPE;
+    }
+    case 'schema-literal': return args[rule.index]?.role === 'literal'
+      ? dataTypeWithLiteralOrigins(parseSqlDataType(args[rule.index]!.name, context.dialect), args[rule.index]!, context)
+      : UNKNOWN_DATA_TYPE;
+    case 'zip-record': return {
+      kind: 'array',
+      elementType: {
+        kind: 'struct',
+        recordKind: rule.recordKind,
+        fields: args.map((argument, index) => {
+          const input = inferAstExpressionType(argument, scope, context, environment);
+          const dataType = input.kind === 'array' ? input.elementType : UNKNOWN_DATA_TYPE;
+          const name = rule.recordKind === 'row'
+            ? `field${index}`
+            : argument.outputName || argument.name || String(index);
+          return virtualColumn(name, dataTypeFamily(dataType), '', dataType);
+        }),
+      },
+    };
+    case 'json-query': {
+      const option = astChild(node, 'option');
+      const optionText = option
+        ? astPrimitiveString(option.args.this)
+        : context.text.slice(node.start, node.end);
+      const stringType = parseSqlDataType(rule.stringType, context.dialect);
+      return /\bARRAY\b/iu.test(optionText)
+        ? { kind: 'array', elementType: stringType }
+        : stringType;
     }
     case 'concat': return inferConcatReturnType(argumentTypes(), context.dialect);
     case 'from-json': return args[1]?.role === 'literal'
@@ -2519,7 +2691,8 @@ function inferConcatReturnType(types: readonly SqlDataType[], dialect: SqlDialec
     };
   }
   if (known.every((type) => type.kind === 'scalar' && type.family === 'binary')) return known[0]!;
-  if (known.some((type) => type.kind === 'array' || type.kind === 'map' || type.kind === 'struct')) {
+  if (known.some((type) => type.kind === 'array' || type.kind === 'multiset'
+    || type.kind === 'map' || type.kind === 'struct' || type.kind === 'opaque')) {
     return UNKNOWN_DATA_TYPE;
   }
   return parseSqlDataType(
@@ -2717,6 +2890,13 @@ function commonSetOperationDataType(
     const elementType = commonSetOperationDataType(left.elementType, right.elementType, dialect);
     return elementType ? { kind: 'array', elementType } : undefined;
   }
+  if (left.kind === 'multiset' && right.kind === 'multiset') {
+    const elementType = commonSetOperationDataType(left.elementType, right.elementType, dialect);
+    return elementType ? { kind: 'multiset', elementType } : undefined;
+  }
+  if (left.kind === 'opaque' && right.kind === 'opaque') {
+    return areDataTypesCompatible(left, right) ? left : undefined;
+  }
   if (left.kind === 'map' && right.kind === 'map') {
     const keyType = commonSetOperationDataType(left.keyType, right.keyType, dialect);
     const valueType = commonSetOperationDataType(left.valueType, right.valueType, dialect);
@@ -2738,7 +2918,7 @@ function commonSetOperationDataType(
         ...(rightField.definitions ?? []),
       ])));
     }
-    return { kind: 'struct', fields };
+    return { kind: 'struct', recordKind: left.recordKind ?? right.recordKind, fields };
   }
   return undefined;
 }
@@ -2936,10 +3116,12 @@ function analyzeAstValuesQuery(
 
 function deriveAstValuesColumns(node: SqlAstNode, context: AstModelContext, scope: AstScope | undefined): SchemaColumn[] {
   if (node.kind !== 'values') return [];
-  const firstRow = astChildren(node, 'expressions')[0];
-  const values = firstRow ? astChildren(firstRow, 'expressions') : [];
-  return values.map((value, index) => {
-    const dataType = inferAstExpressionType(value, scope, context);
+  const rows = astChildren(node, 'expressions').map((row) => astChildren(row, 'expressions'));
+  const width = Math.max(0, ...rows.map((row) => row.length));
+  return Array.from({ length: width }, (_unused, index) => {
+    const dataType = commonAstDataType(rows.flatMap((row) => row[index]
+      ? [inferAstExpressionType(row[index]!, scope, context)]
+      : []));
     return virtualColumn(`col${index + 1}`, dataTypeFamily(dataType), '', dataType);
   });
 }
@@ -2963,13 +3145,48 @@ function forEachAstChild(node: SqlAstNode, visit: (child: SqlAstNode) => void): 
 }
 
 function astExpressionArguments(node: SqlAstNode): readonly SqlAstNode[] {
-  const expressions = astChildren(node, 'expressions');
-  if (expressions.length > 0) return expressions;
-  const ignoredKeys = new Set(['alias', 'kind', 'order', 'partitionBy', 'spec']);
-  return Object.entries(node.args).flatMap(([key, value]) => {
-    if (ignoredKeys.has(key) || !isSqlAstNode(value)) return [];
-    return value.role === 'data-type' || value.role === 'schema' ? [] : [value];
+  const ignoredKeys = new Set([
+    'alias',
+    'kind',
+    'order',
+    'orderBy',
+    'onCondition',
+    'option',
+    'partitionBy',
+    'quote',
+    'spec',
+    'window',
+  ]);
+  const candidates = Object.entries(node.args).flatMap(([key, value]) => {
+    if (ignoredKeys.has(key)) return [];
+    const children = isSqlAstNode(value)
+      ? [value]
+      : Array.isArray(value)
+        ? value.filter(isSqlAstNode)
+        : [];
+    return children.filter((child) => child.role !== 'data-type' && child.role !== 'schema');
+  }).sort((left, right) => astSemanticArgumentStart(left) - astSemanticArgumentStart(right)
+    || left.end - right.end);
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    const key = `${candidate.start}:${candidate.end}:${candidate.role}:${candidate.kind}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
+}
+
+function astSemanticArgumentStart(node: SqlAstNode): number {
+  return astOwnDescendantStart(node) ?? node.start;
+}
+
+function astOwnDescendantStart(node: SqlAstNode): number | undefined {
+  let start = node.ownStart;
+  forEachAstChild(node, (child) => {
+    const childStart = astOwnDescendantStart(child);
+    if (childStart !== undefined && (start === undefined || childStart < start)) start = childStart;
+  });
+  return start;
 }
 
 function astIdentifierReference(node: SqlAstNode): IdentifierReference {
@@ -3344,8 +3561,14 @@ function rebaseColumnDefinitions(column: SchemaColumn, offset: number, source: s
 }
 
 function rebaseDataTypeDefinitions(dataType: SqlDataType, offset: number, source: string): SqlDataType {
-  if (dataType.kind === 'array') {
-    return { kind: 'array', elementType: rebaseDataTypeDefinitions(dataType.elementType, offset, source) };
+  if (dataType.kind === 'array' || dataType.kind === 'multiset') {
+    return { kind: dataType.kind, elementType: rebaseDataTypeDefinitions(dataType.elementType, offset, source) };
+  }
+  if (dataType.kind === 'opaque') {
+    return {
+      ...dataType,
+      typeArguments: dataType.typeArguments.map((argument) => rebaseDataTypeDefinitions(argument, offset, source)),
+    };
   }
   if (dataType.kind === 'map') {
     return {
@@ -3356,7 +3579,7 @@ function rebaseDataTypeDefinitions(dataType: SqlDataType, offset: number, source
   }
   if (dataType.kind === 'struct') {
     return {
-      kind: 'struct',
+      ...dataType,
       fields: dataType.fields.map((field) => rebaseColumnDefinitions(field, offset, source)),
     };
   }
@@ -3385,8 +3608,14 @@ export function formatSqlDataType(
   const render = (value: SqlDataType, depth: number): string => {
     if (value.kind === 'unknown') return 'UNKNOWN';
     if (value.kind === 'scalar') return value.name || value.family.toUpperCase();
+    if (value.kind === 'opaque') {
+      return value.typeArguments.length > 0
+        ? `${value.name}<${value.typeArguments.map((argument) => render(argument, depth + 1)).join(', ')}>`
+        : value.name;
+    }
     if (depth >= maxDepth) return value.kind.toUpperCase();
     if (value.kind === 'array') return `ARRAY<${render(value.elementType, depth + 1)}>`;
+    if (value.kind === 'multiset') return `MULTISET<${render(value.elementType, depth + 1)}>`;
     if (value.kind === 'map') {
       return `MAP<${render(value.keyType, depth + 1)}, ${render(value.valueType, depth + 1)}>`;
     }
@@ -3394,7 +3623,7 @@ export function formatSqlDataType(
     const fields = visible.map((field) => `${field.name}: ${render(columnDataType(field, 'generic'), depth + 1)}`);
     const omitted = value.fields.length - visible.length;
     if (omitted > 0) fields.push(`… ${omitted} more`);
-    return `STRUCT<${fields.join(', ')}>`;
+    return `${(value.recordKind ?? 'struct').toUpperCase()}<${fields.join(', ')}>`;
   };
   return render(dataType, 0);
 }
@@ -3450,7 +3679,17 @@ function areDataTypesCompatible(target: SqlDataType, source: SqlDataType): boole
   if (target.kind === 'scalar' && source.kind === 'scalar') {
     return areTypesCompatible(target.family, source.family);
   }
+  if (target.kind === 'opaque' && source.kind === 'opaque') {
+    return target.name.toLocaleUpperCase() === source.name.toLocaleUpperCase()
+      && target.typeArguments.length === source.typeArguments.length
+      && target.typeArguments.every((argument, index) => (
+        source.typeArguments[index] ? areDataTypesCompatible(argument, source.typeArguments[index]!) : false
+      ));
+  }
   if (target.kind === 'array' && source.kind === 'array') {
+    return areDataTypesCompatible(target.elementType, source.elementType);
+  }
+  if (target.kind === 'multiset' && source.kind === 'multiset') {
     return areDataTypesCompatible(target.elementType, source.elementType);
   }
   if (target.kind === 'map' && source.kind === 'map') {
@@ -3492,6 +3731,10 @@ function canStoreAssignDataType(
   if (target.kind === 'array' && source.kind === 'array') {
     return canStoreAssignDataType(target.elementType, source.elementType, dialect, policy);
   }
+  if (target.kind === 'multiset' && source.kind === 'multiset') {
+    return canStoreAssignDataType(target.elementType, source.elementType, dialect, policy);
+  }
+  if (target.kind === 'opaque' && source.kind === 'opaque') return areDataTypesCompatible(target, source);
   if (target.kind === 'map' && source.kind === 'map') {
     return canStoreAssignDataType(target.keyType, source.keyType, dialect, policy)
       && canStoreAssignDataType(target.valueType, source.valueType, dialect, policy);
@@ -3590,7 +3833,7 @@ function dataTypeWithAstOrigins(
   if (dataType.kind === 'struct') {
     const definitions = astChildren(node, 'expressions').filter((child) => child.kind === 'columnDef');
     return {
-      kind: 'struct',
+      ...dataType,
       fields: dataType.fields.map((field, index) => {
         const definition = definitions[index];
         const identifier = definition ? astChild(definition, 'this') : undefined;
@@ -3609,10 +3852,10 @@ function dataTypeWithAstOrigins(
       }),
     };
   }
-  if (dataType.kind === 'array') {
+  if (dataType.kind === 'array' || dataType.kind === 'multiset') {
     const nested = firstAstDataTypeChild(node);
     return {
-      kind: 'array',
+      kind: dataType.kind,
       elementType: nested
         ? dataTypeWithAstOrigins(dataType.elementType, nested, dialect, source)
         : dataType.elementType,
@@ -3630,6 +3873,15 @@ function dataTypeWithAstOrigins(
         : dataType.valueType,
     };
   }
+  if (dataType.kind === 'opaque') {
+    const nested = astDataTypeChildren(node);
+    return {
+      ...dataType,
+      typeArguments: dataType.typeArguments.map((argument, index) => (
+        nested[index] ? dataTypeWithAstOrigins(argument, nested[index]!, dialect, source) : argument
+      )),
+    };
+  }
   return dataType;
 }
 
@@ -3641,13 +3893,16 @@ function dataTypeWithLiteralOrigins(
   const raw = context.text.slice(literal.start, literal.end);
   let cursor = 0;
   const visit = (value: SqlDataType): SqlDataType => {
-    if (value.kind === 'array') return { kind: 'array', elementType: visit(value.elementType) };
+    if (value.kind === 'array' || value.kind === 'multiset') {
+      return { kind: value.kind, elementType: visit(value.elementType) };
+    }
+    if (value.kind === 'opaque') return { ...value, typeArguments: value.typeArguments.map(visit) };
     if (value.kind === 'map') {
       return { kind: 'map', keyType: visit(value.keyType), valueType: visit(value.valueType) };
     }
     if (value.kind !== 'struct') return value;
     return {
-      kind: 'struct',
+      ...value,
       fields: value.fields.map((field) => {
         const match = findIdentifierInTypeLiteral(raw, field.name, cursor);
         if (match) cursor = match.end;
@@ -3728,6 +3983,10 @@ function parseSqlDataType(type: string, dialect: SqlDialect): SqlDataType {
   if (arrayBody !== undefined) {
     return { kind: 'array', elementType: parseSqlDataType(arrayBody, dialect) };
   }
+  const multisetBody = genericTypeBody(trimmed, 'MULTISET');
+  if (multisetBody !== undefined) {
+    return { kind: 'multiset', elementType: parseSqlDataType(multisetBody, dialect) };
+  }
   const mapBody = genericTypeBody(trimmed, 'MAP');
   if (mapBody !== undefined) {
     const parts = splitTopLevel(mapBody, ',');
@@ -3739,25 +3998,37 @@ function parseSqlDataType(type: string, dialect: SqlDialect): SqlDataType {
         }
       : UNKNOWN_DATA_TYPE;
   }
-  const structBody = genericTypeBody(trimmed, 'STRUCT') ?? parenthesizedTypeBody(trimmed, 'ROW');
+  const rowBody = genericTypeBody(trimmed, 'ROW') ?? parenthesizedTypeBody(trimmed, 'ROW');
+  const structBody = genericTypeBody(trimmed, 'STRUCT') ?? rowBody;
   if (structBody !== undefined) {
-    const fields = splitTopLevel(structBody, ',').flatMap((definition) => {
+    const fields = splitTopLevel(structBody, ',').flatMap((definition, index) => {
       const field = splitTypeField(definition);
-      return field
-        ? [declaredColumn(field.name, field.type, 0, 0, dialect)]
-        : [];
+      if (field) return [declaredColumn(field.name, field.type, 0, 0, dialect)];
+      const unnamedType = parseSqlDataType(definition, dialect);
+      return unnamedType.kind === 'unknown'
+        ? []
+        : [declaredColumn(`field${index}`, definition, 0, 0, dialect, unnamedType)];
     });
-    return fields.length > 0 ? { kind: 'struct', fields } : UNKNOWN_DATA_TYPE;
+    return fields.length > 0
+      ? { kind: 'struct', recordKind: rowBody !== undefined ? 'row' : 'struct', fields }
+      : UNKNOWN_DATA_TYPE;
   }
   const family = typeFamily(trimmed);
-  return family === 'complex' || family === 'unknown'
-    ? UNKNOWN_DATA_TYPE
-    : { kind: 'scalar', family, name: trimmed };
+  if (family !== 'complex' && family !== 'unknown') return { kind: 'scalar', family, name: trimmed };
+  const parameterized = /^([\p{L}_$][\p{L}\p{N}_$]*)\s*[<(]([\s\S]*)[>)]$/u.exec(trimmed);
+  return {
+    kind: 'opaque',
+    name: parameterized?.[1] ?? trimmed,
+    typeArguments: parameterized
+      ? splitTopLevel(parameterized[2]!, ',').map((argument) => parseSqlDataType(argument, dialect))
+      : [],
+  };
 }
 
 function dataTypeFamily(dataType: SqlDataType): SqlTypeFamily {
   if (dataType.kind === 'unknown') return 'unknown';
   if (dataType.kind === 'scalar') return dataType.family;
+  if (dataType.kind === 'opaque') return 'unknown';
   return 'complex';
 }
 
@@ -3772,9 +4043,9 @@ function columnDataType(column: SchemaColumn, dialect: SqlDialect): SqlDataType 
 
 function fieldDataType(dataType: SqlDataType, field: string, dialect: SqlDialect): SqlDataType | undefined {
   if (dataType.kind === 'unknown') return UNKNOWN_DATA_TYPE;
-  if (dataType.kind === 'array') {
+  if (dataType.kind === 'array' || dataType.kind === 'multiset') {
     const elementField = fieldDataType(dataType.elementType, field, dialect);
-    return elementField ? { kind: 'array', elementType: elementField } : undefined;
+    return elementField ? { kind: dataType.kind, elementType: elementField } : undefined;
   }
   if (dataType.kind !== 'struct') return undefined;
   const column = findColumn(dataType.fields, field, dialect);

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { SQL_DIALECTS, type SqlDialect } from '../../src/sql';
-import { parseSqlAst, walkSqlAst, type SqlAstNode } from '../../src/sqlAst';
+import { getSqlCatalog } from '../../src/sqlCatalog';
+import { astFunctionName, parseSqlAst, walkSqlAst, type SqlAstNode } from '../../src/sqlAst';
 
 const expectedParser: Record<SqlDialect, string> = {
   spark: 'spark',
@@ -53,6 +54,41 @@ FROM recent JOIN orders o USING (id)`;
   ] as const)('normalizes the %s expansion relation', (dialect, sql, expectedKind) => {
     const root = parseSqlAst(sql, dialect)?.statements[0];
     expect(findNodes(root, (node) => node.kind === expectedKind).length).toBeGreaterThan(0);
+  });
+
+  it('recovers source names and exact spans for parser-specialized catalog functions', () => {
+    const mismatches: string[] = [];
+    for (const dialect of SQL_DIALECTS.filter((candidate) => candidate !== 'generic')) {
+      for (const catalogName of getSqlCatalog(dialect).functions) {
+        if (dialect === 'postgresql' && catalogName === 'XMLTABLE') continue;
+        let checked = false;
+        for (const arity of [2, 1, 3, 0, 4]) {
+          if (checked) break;
+          const args = Array.from({ length: arity }, (_unused, index) => String(index + 1)).join(', ');
+          const sql = `SELECT ${catalogName}(${args})`;
+          const root = parseSqlAst(sql, dialect)?.statements[0];
+          const functions = findNodes(root, (node) => node.role === 'function');
+          const source = functions[0];
+          if (!source) continue;
+          checked = true;
+          if (source.ownStart !== undefined) continue;
+          const actual = astFunctionName(source, sql).split('.').at(-1)?.toLocaleUpperCase();
+          const span = sql.slice(source.nameStart, source.nameEnd).replace(/\s+/gu, '').toLocaleUpperCase();
+          if (actual !== catalogName.toLocaleUpperCase() || span !== catalogName.toLocaleUpperCase()) {
+            mismatches.push(`${dialect}.${catalogName}:${source.kind}->${actual ?? ''}@${span}`);
+          }
+        }
+      }
+    }
+    expect(mismatches).toEqual([]);
+  }, 30_000);
+
+  it('recovers XMLTABLE from its PostgreSQL-specific syntax', () => {
+    const sql = `SELECT * FROM XMLTABLE('/ROWS/ROW' PASSING doc COLUMNS id INT PATH 'ID') AS x`;
+    const root = parseSqlAst(sql, 'postgresql')?.statements[0];
+    const node = findNodes(root, (candidate) => candidate.kind === 'xmlTable')[0];
+    expect(node && astFunctionName(node, sql).toLocaleUpperCase()).toBe('XMLTABLE');
+    expect(node && sql.slice(node.nameStart, node.nameEnd).toLocaleUpperCase()).toBe('XMLTABLE');
   });
 });
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed AST argument collection and source-name recovery for parser-rewritten functions such as Spark `percentile_approx`, including exact function-name Hover ranges.
+- Added dialect-specific composite return signatures across the pinned Spark, Hive, Flink, MySQL, PostgreSQL, Trino, and Impala catalogs, with version-locked audits that prevent reviewed functions from silently falling back to `UNKNOWN`.
+- Extended SQL type inference and Hover formatting for nested `ARRAY`, `MAP`, named `STRUCT`, positional `ROW`, `MULTISET`, and parameterized opaque types, including schema-driven, zip, field-extraction, and scalar-or-array return rules.
+- Fixed Generator and `UNNEST` propagation for composite elements. Spark `histogram_numeric` now expands as `ARRAY<STRUCT<x: DOUBLE, y: DOUBLE>>`, while array-form `percentile_approx` propagates `ARRAY<DOUBLE>` through `POSEXPLODE` with an `INT` position column.
+
 ## 0.0.16
 
 - Fixed Spark `POSEXPLODE` alias validation and element-type propagation for arrays returned by `split`, `concat`, `transform`, `filter`, and nested combinations of those functions.

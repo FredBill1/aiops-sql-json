@@ -1671,7 +1671,7 @@ SELECT id, amount FROM local_orders;`,
       'local_id AST information',
     );
     assert.ok(hovers.some((hover) => hoverText(hover).includes('local_id')));
-    assert.ok(hovers.some((hover) => hoverText(hover).includes('number')));
+    assert.ok(hovers.some((hover) => /INT|number/iu.test(hoverText(hover))));
 
     const definitions = await executeDefinitions(document, usageOffset);
     assert.equal(definitions.length, 1);
@@ -1699,6 +1699,46 @@ SELECT id, amount FROM local_orders;`,
       const text = hoverText(hover);
       return text.includes('ARRAY') && text.includes('STRING');
     }));
+
+    const compoundDocument = await openFile(
+      'local-compound-function-hover.sql',
+      [
+        'SELECT hist.x AS bin_center, hist.y AS bin_count',
+        'FROM (SELECT histogram_numeric(value, 5) AS histogram',
+        '  FROM VALUES (1.0), (2.0), (2.5) AS t (value)) s',
+        'LATERAL VIEW explode(s.histogram) e AS hist;',
+        'SELECT pos, val AS percentile_value',
+        'FROM (SELECT percentile_approx(value, array(0.25, 0.5, 0.75), 10000) AS percentiles',
+        '  FROM VALUES (1.0), (2.0), (3.0) AS t (value)) s',
+        'LATERAL VIEW posexplode(s.percentiles) lv AS pos, val;',
+      ].join('\n'),
+    );
+    const compoundDiagnostics = await waitForDiagnostics(compoundDocument.uri);
+    assert.ok(
+      !compoundDiagnostics.some((diagnostic) => diagnostic.source?.includes('SQL')),
+      `Unexpected SQL diagnostic: ${compoundDiagnostics.map((diagnostic) => diagnostic.message).join(' | ')}`,
+    );
+    for (const alias of ['bin_center', 'bin_count', 'percentile_value']) {
+      const aliasOffset = compoundDocument.getText().indexOf(alias);
+      const aliasHovers = await fixture.waitForHovers(
+        compoundDocument,
+        aliasOffset,
+        (items) => items.some((hover) => /DOUBLE|NUMBER/u.test(hoverText(hover).toUpperCase())),
+        `${alias} compound return type`,
+      );
+      assert.ok(aliasHovers.some((hover) => /DOUBLE|NUMBER/u.test(hoverText(hover).toUpperCase())));
+    }
+    const percentileName = 'percentile_approx';
+    const percentileOffset = compoundDocument.getText().indexOf(percentileName);
+    const percentileHovers = await fixture.waitForHovers(
+      compoundDocument,
+      percentileOffset,
+      (items) => items.some((hover) => hoverText(hover).includes('ARRAY<DOUBLE>')),
+      'percentile_approx selected array return type',
+    );
+    const percentileHover = percentileHovers.find((hover) => hoverText(hover).includes('ARRAY<DOUBLE>'));
+    assert.ok(percentileHover?.range);
+    assert.equal(compoundDocument.getText(percentileHover.range), percentileName);
 
     await vscode.workspace.getConfiguration('aiopsSqlJson').update(
       'plainSql.enabled',

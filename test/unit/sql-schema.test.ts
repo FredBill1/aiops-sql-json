@@ -11,6 +11,11 @@ import {
   parseDdlSchema,
 } from '../../src/sqlSchemaCore';
 import { SQL_DIALECTS, type SqlDialect } from '../../src/sql';
+import {
+  SQL_FUNCTION_CATALOG_VERSIONS,
+  SQL_FUNCTION_SHAPE_REVIEW_VERSIONS,
+  SQL_SHAPE_SENSITIVE_FUNCTIONS,
+} from '../../src/sqlFunctionSignatures';
 
 const ddlByDialect: Record<SqlDialect, string> = {
   spark: 'CREATE TABLE sales.orders (id BIGINT, amount DECIMAL(10,2), customer_id STRING);',
@@ -32,6 +37,16 @@ describe('SQL catalogs', () => {
     expect(catalog.functionDefinitions).toHaveLength(catalog.functions.length);
     expect(catalog.functionDefinitions.every((definition) => definition.signatures.length > 0)).toBe(true);
     expect(catalog.functionByName.size).toBeGreaterThanOrEqual(catalog.functions.length);
+  });
+
+  it.each(SQL_DIALECTS)('keeps reviewed composite signatures explicit for %s', (dialect) => {
+    expect(SQL_FUNCTION_SHAPE_REVIEW_VERSIONS[dialect]).toBe(SQL_FUNCTION_CATALOG_VERSIONS[dialect]);
+    const catalog = getSqlCatalog(dialect);
+    for (const name of SQL_SHAPE_SENSITIVE_FUNCTIONS[dialect] ?? []) {
+      const definition = catalog.functionByName.get(name.toLocaleLowerCase());
+      expect(definition, `${dialect}.${name} is missing from the catalog`).toBeDefined();
+      expect(definition?.signatureSource, `${dialect}.${name} uses a fallback signature`).toBe('explicit');
+    }
   });
 
   it('contains representative dialect-specific functions', () => {
@@ -418,6 +433,98 @@ where tag <> 'tag1';`;
       );
       expect(tag?.type, expression).toMatch(/string/i);
     }
+  });
+
+  it('propagates Spark histogram and percentile aggregate shapes through lateral views', () => {
+    const histogramSql = `select hist.x as bin_center, hist.y as bin_count
+from (
+  select histogram_numeric(value, 5) as histogram
+  from
+  values
+    (1.0),
+    (2.0),
+    (2.5),
+    (3.0),
+    (4.5),
+    (5.0),
+    (7.5),
+    (10.0) as t (value)
+) s lateral view explode(s.histogram) e as hist;`;
+    expect(analyzeSqlSemantics(histogramSql, 'spark', [], { tables: [], issues: [] }, [])).toEqual([]);
+    for (const marker of ['hist.x', 'hist.y', 'bin_center', 'bin_count']) {
+      const symbol = getSqlSymbolAtOffset(
+        histogramSql,
+        histogramSql.indexOf(marker) + marker.length - 1,
+        'spark',
+        [],
+        { tables: [], issues: [] },
+      );
+      expect(symbol?.type, marker).toMatch(/double|number/i);
+    }
+
+    const percentileSql = `select pos, val as percentile_value
+from (
+  select percentile_approx(value, array(0.25, 0.5, 0.75, 0.9), 10000) as percentiles
+  from
+  values
+    (1.0),
+    (2.0),
+    (3.0),
+    (4.0),
+    (5.0),
+    (6.0),
+    (7.0),
+    (8.0),
+    (9.0),
+    (10.0) as t (value)
+) s lateral view posexplode(s.percentiles) lv as pos, val;`;
+    expect(analyzeSqlSemantics(percentileSql, 'spark', [], { tables: [], issues: [] }, [])).toEqual([]);
+    for (const marker of ['val as', 'percentile_value']) {
+      const symbol = getSqlSymbolAtOffset(
+        percentileSql,
+        percentileSql.indexOf(marker) + 1,
+        'spark',
+        [],
+        { tables: [], issues: [] },
+      );
+      expect(symbol?.type, marker).toMatch(/double|number/i);
+    }
+    const functionOffset = percentileSql.indexOf('percentile_approx') + 2;
+    const functionSymbol = getSqlSymbolAtOffset(
+      percentileSql,
+      functionOffset,
+      'spark',
+      [],
+      { tables: [], issues: [] },
+    );
+    expect(functionSymbol?.name).toBe('percentile_approx');
+    expect(functionSymbol?.type).toMatch(/ARRAY<DOUBLE>/i);
+    expect(functionSymbol?.reference).toEqual({
+      start: percentileSql.indexOf('percentile_approx'),
+      end: percentileSql.indexOf('percentile_approx') + 'percentile_approx'.length,
+    });
+    expect(functionSymbol?.functionSignatures).toEqual(expect.arrayContaining([
+      expect.stringMatching(/ARRAY.*ARRAY/i),
+    ]));
+  });
+
+  it.each([
+    ['spark', "SELECT arrays_zip(array(1), array('x'))", 'arrays_zip', /ARRAY<STRUCT<.*(?:INT|number).*string/is],
+    ['hive', 'SELECT collect_list(value) FROM (SELECT 1 value) t', 'collect_list', /ARRAY<.*(?:INT|number)/is],
+    ['flink', 'SELECT COLLECT(value) FROM (VALUES (1)) AS t(value)', 'COLLECT', /MULTISET<.*(?:INT|number)/is],
+    ['mysql', 'SELECT JSON_ARRAYAGG(value) FROM (SELECT 1 AS value) t', 'JSON_ARRAYAGG', /^JSON$/i],
+    ['postgresql', 'SELECT ARRAY_AGG(value) FROM (VALUES (1)) AS t(value)', 'ARRAY_AGG', /ARRAY<.*(?:INT|number)/is],
+    ['trino', "SELECT map_agg(k, v) FROM (VALUES (1, 'x')) AS t(k, v)", 'map_agg', /MAP<.*(?:INT|number).*string/is],
+  ] as const)('infers representative %s composite function shapes', (dialect, sql, marker, expected) => {
+    expect(analyzeSqlSemantics(sql, dialect, [], { tables: [], issues: [] }, [])).toEqual([]);
+    const symbol = getSqlSymbolAtOffset(
+      sql,
+      sql.toLocaleLowerCase().indexOf(marker.toLocaleLowerCase()) + 1,
+      dialect,
+      [],
+      { tables: [], issues: [] },
+    );
+    expect(symbol?.type).toMatch(expected);
   });
 
   it('conservatively validates known built-in function signatures', () => {

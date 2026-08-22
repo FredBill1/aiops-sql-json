@@ -26,10 +26,25 @@ export type SqlFunctionReturnRule =
   | { readonly kind: 'argument'; readonly index: number }
   | { readonly kind: 'common'; readonly indexes?: readonly number[] }
   | { readonly kind: 'array'; readonly element: SqlFunctionReturnRule }
+  | { readonly kind: 'multiset'; readonly element: SqlFunctionReturnRule }
+  | { readonly kind: 'map'; readonly key: SqlFunctionReturnRule; readonly value: SqlFunctionReturnRule }
+  | { readonly kind: 'opaque'; readonly name: string; readonly typeArguments: readonly SqlFunctionReturnRule[] }
+  | {
+      readonly kind: 'record';
+      readonly recordKind: 'struct' | 'row';
+      readonly fields: readonly { readonly name: string; readonly type: SqlFunctionReturnRule }[];
+    }
   | { readonly kind: 'array-element'; readonly index: number }
+  | { readonly kind: 'map-key'; readonly index: number }
+  | { readonly kind: 'map-value'; readonly index: number }
   | { readonly kind: 'map-keys'; readonly index: number }
   | { readonly kind: 'map-values'; readonly index: number }
+  | { readonly kind: 'field'; readonly index: number; readonly field: string | number; readonly arrayElement?: boolean }
+  | { readonly kind: 'type-argument'; readonly index: number; readonly argument: number }
   | { readonly kind: 'element-at'; readonly index: number }
+  | { readonly kind: 'schema-literal'; readonly index: number }
+  | { readonly kind: 'zip-record'; readonly recordKind: 'struct' | 'row' }
+  | { readonly kind: 'json-query'; readonly stringType: string }
   | { readonly kind: 'concat' }
   | { readonly kind: 'from-json' }
   | { readonly kind: 'array-constructor' }
@@ -49,6 +64,7 @@ export interface SqlFunctionDefinition {
   readonly aliases: readonly string[];
   readonly kind: SqlFunctionKind;
   readonly signatures: readonly SqlFunctionSignature[];
+  readonly signatureSource: 'explicit' | 'fallback';
 }
 
 export const SQL_FUNCTION_CATALOG_VERSIONS: Readonly<Record<SqlDialect, string>> = {
@@ -62,10 +78,82 @@ export const SQL_FUNCTION_CATALOG_VERSIONS: Readonly<Record<SqlDialect, string>>
   generic: 'portable-common-2026-08',
 };
 
+/** Versions whose composite-returning functions were reviewed against the upstream documentation. */
+export const SQL_FUNCTION_SHAPE_REVIEW_VERSIONS: Readonly<Record<SqlDialect, string>> = {
+  spark: '4.2.0',
+  hive: '4.2.0',
+  flink: '2.3.0',
+  mysql: '26.7.0',
+  postgresql: '18.6',
+  trino: '483',
+  impala: '4.5.0',
+  generic: 'portable-common-2026-08',
+};
+
+/** Composite signatures that must never silently fall back to the broad name-based heuristics. */
+export const SQL_SHAPE_SENSITIVE_FUNCTIONS: Readonly<Partial<Record<SqlDialect, readonly string[]>>> = {
+  spark: [
+    'APPROX_PERCENTILE', 'APPROX_TOP_K', 'ARRAY_AGG', 'ARRAYS_ZIP', 'COLLECT_LIST', 'COLLECT_SET',
+    'FILTER', 'FLATTEN', 'FROM_CSV', 'FROM_JSON', 'FROM_XML', 'HISTOGRAM_NUMERIC', 'JSON_OBJECT_KEYS',
+    'MAP_ENTRIES', 'MAP_FILTER', 'MAP_FROM_ARRAYS', 'MAP_FROM_ENTRIES', 'MAP_ZIP_WITH', 'MAX_BY', 'MIN_BY',
+    'PERCENTILE', 'PERCENTILE_APPROX', 'SENTENCES', 'SESSION_WINDOW', 'STR_TO_MAP', 'TRANSFORM',
+    'TRANSFORM_KEYS', 'TRANSFORM_VALUES', 'WINDOW', 'XPATH', 'ZIP_WITH',
+  ],
+  hive: [
+    'COLLECT_LIST', 'COLLECT_SET', 'CONTEXT_NGRAMS', 'FILTER', 'HISTOGRAM_NUMERIC',
+    'NGRAMS', 'PERCENTILE', 'PERCENTILE_APPROX', 'SENTENCES', 'STR_TO_MAP', 'TRANSFORM', 'ZIP_WITH',
+  ],
+  flink: [
+    'ARRAY_AGG', 'BITMAP_TO_ARRAY', 'COLLECT', 'JSON_ARRAYAGG', 'JSON_OBJECTAGG', 'JSON_QUERY',
+    'MAP_ENTRIES', 'MAP_FROM_ARRAYS', 'MAP_UNION', 'PERCENTILE', 'STR_TO_MAP',
+  ],
+  mysql: ['JSON_ARRAY', 'JSON_ARRAYAGG', 'JSON_OBJECT', 'JSON_OBJECTAGG', 'ST_COLLECT'],
+  postgresql: [
+    'ARRAY_AGG', 'ARRAY_FILL', 'ARRAY_TO_JSON', 'ENUM_RANGE', 'JSON_AGG', 'JSON_AGG_STRICT',
+    'JSON_ARRAY', 'JSON_ARRAYAGG', 'JSON_BUILD_ARRAY', 'JSON_OBJECT_AGG', 'JSON_OBJECTAGG', 'JSONB_AGG',
+    'JSONB_BUILD_ARRAY', 'PERCENTILE_CONT', 'PERCENTILE_DISC', 'REGEXP_MATCH', 'REGEXP_MATCHES',
+    'REGEXP_SPLIT_TO_ARRAY', 'STRING_TO_ARRAY', 'TSVECTOR_TO_ARRAY', 'XPATH',
+  ],
+  trino: [
+    'APPROX_MOST_FREQUENT', 'APPROX_PERCENTILE', 'ARRAY_AGG', 'ARRAY_HISTOGRAM', 'CLASSIFY',
+    'COMBINATIONS', 'FEATURES', 'FLATTEN', 'HASH_COUNTS', 'HISTOGRAM', 'MAP', 'MAP_AGG', 'MAP_ENTRIES',
+    'MAP_FROM_ENTRIES', 'MAP_UNION', 'MAX', 'MAX_BY', 'MIN', 'MIN_BY', 'MULTIMAP_AGG',
+    'MULTIMAP_FROM_ENTRIES', 'NGRAMS', 'NUMERIC_HISTOGRAM', 'QDIGEST_AGG', 'SPLIT_TO_MAP',
+    'SPLIT_TO_MULTIMAP', 'VALUE_AT_QUANTILE', 'VALUES_AT_QUANTILES', 'ZIP',
+  ],
+  impala: [],
+  generic: [],
+};
+
 const FIXED = (type: string): SqlFunctionReturnRule => ({ kind: 'fixed', type });
 const ARGUMENT = (index = 0): SqlFunctionReturnRule => ({ kind: 'argument', index });
+const ARRAY = (element: SqlFunctionReturnRule): SqlFunctionReturnRule => ({ kind: 'array', element });
+const MULTISET = (element: SqlFunctionReturnRule): SqlFunctionReturnRule => ({ kind: 'multiset', element });
+const MAP = (key: SqlFunctionReturnRule, value: SqlFunctionReturnRule): SqlFunctionReturnRule => ({
+  kind: 'map', key, value,
+});
+const RECORD = (
+  recordKind: 'struct' | 'row',
+  fields: readonly { readonly name: string; readonly type: SqlFunctionReturnRule }[],
+): SqlFunctionReturnRule => ({ kind: 'record', recordKind, fields });
+const OPAQUE = (name: string, typeArguments: readonly SqlFunctionReturnRule[] = []): SqlFunctionReturnRule => ({
+  kind: 'opaque', name, typeArguments,
+});
+const ARRAY_ELEMENT = (index: number): SqlFunctionReturnRule => ({ kind: 'array-element', index });
+const MAP_KEY = (index: number): SqlFunctionReturnRule => ({ kind: 'map-key', index });
+const MAP_VALUE = (index: number): SqlFunctionReturnRule => ({ kind: 'map-value', index });
+const FIELD = (index: number, field: string | number, arrayElement = false): SqlFunctionReturnRule => ({
+  kind: 'field', index, field, ...(arrayElement ? { arrayElement: true } : {}),
+});
+const TYPE_ARGUMENT = (index: number, argument = 0): SqlFunctionReturnRule => ({
+  kind: 'type-argument', index, argument,
+});
 const COMMON: SqlFunctionReturnRule = { kind: 'common' };
 const ANY_VARIADIC: SqlFunctionParameter = { type: 'ANY', variadic: true, optional: true };
+const ANY: SqlFunctionParameter = { type: 'ANY' };
+const NUMBER: SqlFunctionParameter = { type: 'NUMBER' };
+const OPTIONAL_NUMBER: SqlFunctionParameter = { type: 'NUMBER', optional: true };
+const ARRAY_PARAMETER: SqlFunctionParameter = { type: 'ARRAY' };
 
 const AGGREGATE_FUNCTIONS = words(`
   ANY ANY_VALUE APPROX_COUNT_DISTINCT APPROX_DISTINCT APPROX_MOST_FREQUENT APPROX_PERCENTILE
@@ -206,6 +294,8 @@ const EXPLICIT_SIGNATURES: Readonly<Record<string, readonly SqlFunctionSignature
     signature([{ type: 'ARRAY' }], ARGUMENT()),
     signature([{ type: 'ARRAY' }, { type: 'LAMBDA' }], { kind: 'higher-order', name: 'array_sort' }),
   ],
+  array_repeat: [signature([{ type: 'ANY' }, { type: 'NUMBER' }], ARRAY(ARGUMENT()))],
+  flatten: [signature([{ type: 'ARRAY' }], ARRAY_ELEMENT(0))],
   from_json: [signature([{ type: 'STRING' }, { type: 'STRING' }, { type: 'MAP', optional: true }], { kind: 'from-json' })],
   array: [signature([{ type: 'ANY', variadic: true, optional: true }], { kind: 'array-constructor' })],
   map: [signature([{ type: 'ANY', variadic: true, optional: true }], { kind: 'map-constructor' })],
@@ -234,6 +324,228 @@ const EXPLICIT_SIGNATURES: Readonly<Record<string, readonly SqlFunctionSignature
   sha2: [signature([{ type: 'ANY' }, { type: 'NUMBER' }], FIXED('STRING'))],
 };
 
+const COLLECTION_ARRAY_SIGNATURES = [signature([ANY], ARRAY(ARGUMENT()))];
+const PROPAGATED_PERCENTILE_SIGNATURES = [
+  signature([ANY, NUMBER, OPTIONAL_NUMBER], ARGUMENT()),
+  signature([ANY, ARRAY_PARAMETER, OPTIONAL_NUMBER], ARRAY(ARGUMENT())),
+];
+const DOUBLE_PERCENTILE_SIGNATURES = [
+  signature([NUMBER, NUMBER, OPTIONAL_NUMBER], FIXED('DOUBLE')),
+  signature([NUMBER, ARRAY_PARAMETER, OPTIONAL_NUMBER], ARRAY(FIXED('DOUBLE'))),
+];
+const HISTOGRAM_NUMERIC_SIGNATURES = [signature(
+  [NUMBER, NUMBER],
+  ARRAY(RECORD('struct', [
+    { name: 'x', type: ARGUMENT() },
+    { name: 'y', type: FIXED('DOUBLE') },
+  ])),
+)];
+const MAP_ENTRIES_STRUCT_SIGNATURES = [signature(
+  [{ type: 'MAP' }],
+  ARRAY(RECORD('struct', [
+    { name: 'key', type: MAP_KEY(0) },
+    { name: 'value', type: MAP_VALUE(0) },
+  ])),
+)];
+const MAP_ENTRIES_ROW_SIGNATURES = [signature(
+  [{ type: 'MAP' }],
+  ARRAY(RECORD('row', [
+    { name: 'field0', type: MAP_KEY(0) },
+    { name: 'field1', type: MAP_VALUE(0) },
+  ])),
+)];
+const MAP_FROM_ARRAYS_SIGNATURES = [signature(
+  [ARRAY_PARAMETER, ARRAY_PARAMETER],
+  MAP(ARRAY_ELEMENT(0), ARRAY_ELEMENT(1)),
+)];
+const MAP_FROM_ENTRIES_SIGNATURES = [signature(
+  [ARRAY_PARAMETER],
+  MAP(FIELD(0, 0, true), FIELD(0, 1, true)),
+)];
+
+const DIALECT_SIGNATURES: Readonly<Partial<Record<SqlDialect, Readonly<Record<string, readonly SqlFunctionSignature[]>>>>> = {
+  spark: {
+    array_agg: COLLECTION_ARRAY_SIGNATURES,
+    collect_list: COLLECTION_ARRAY_SIGNATURES,
+    collect_set: COLLECTION_ARRAY_SIGNATURES,
+    histogram_numeric: HISTOGRAM_NUMERIC_SIGNATURES,
+    approx_percentile: PROPAGATED_PERCENTILE_SIGNATURES,
+    percentile: PROPAGATED_PERCENTILE_SIGNATURES,
+    percentile_approx: PROPAGATED_PERCENTILE_SIGNATURES,
+    min_by: [
+      signature([ANY, ANY], ARGUMENT()),
+      signature([ANY, ANY, NUMBER], ARRAY(ARGUMENT())),
+    ],
+    max_by: [
+      signature([ANY, ANY], ARGUMENT()),
+      signature([ANY, ANY, NUMBER], ARRAY(ARGUMENT())),
+    ],
+    approx_top_k: [signature(
+      [ANY, OPTIONAL_NUMBER, OPTIONAL_NUMBER],
+      ARRAY(RECORD('struct', [
+        { name: 'item', type: ARGUMENT() },
+        { name: 'count', type: FIXED('BIGINT') },
+      ])),
+    )],
+    count_min_sketch: [signature([NUMBER, NUMBER, NUMBER, NUMBER], FIXED('BINARY'))],
+    arrays_zip: [signature([{ type: 'ARRAY', variadic: true }], { kind: 'zip-record', recordKind: 'struct' })],
+    map_entries: MAP_ENTRIES_STRUCT_SIGNATURES,
+    map_from_arrays: MAP_FROM_ARRAYS_SIGNATURES,
+    map_from_entries: MAP_FROM_ENTRIES_SIGNATURES,
+    from_csv: [signature([{ type: 'STRING' }, { type: 'STRING' }, { type: 'MAP', optional: true }], {
+      kind: 'schema-literal', index: 1,
+    })],
+    from_xml: [signature([{ type: 'STRING' }, { type: 'STRING' }, { type: 'MAP', optional: true }], {
+      kind: 'schema-literal', index: 1,
+    })],
+    json_object_keys: [signature([{ type: 'STRING' }], ARRAY(FIXED('STRING')))],
+    str_to_map: [signature([ANY_VARIADIC], MAP(FIXED('STRING'), FIXED('STRING')))],
+    sentences: [signature([ANY_VARIADIC], ARRAY(ARRAY(FIXED('STRING'))))],
+    xpath: [signature([{ type: 'STRING' }, { type: 'STRING' }], ARRAY(FIXED('STRING')))],
+    window: [signature([ANY_VARIADIC], RECORD('struct', [
+      { name: 'start', type: FIXED('TIMESTAMP') },
+      { name: 'end', type: FIXED('TIMESTAMP') },
+    ]))],
+    session_window: [signature([ANY_VARIADIC], RECORD('struct', [
+      { name: 'start', type: FIXED('TIMESTAMP') },
+      { name: 'end', type: FIXED('TIMESTAMP') },
+    ]))],
+  },
+  hive: {
+    collect_list: COLLECTION_ARRAY_SIGNATURES,
+    collect_set: COLLECTION_ARRAY_SIGNATURES,
+    histogram_numeric: [signature([NUMBER, NUMBER], ARRAY(RECORD('struct', [
+      { name: 'x', type: FIXED('DOUBLE') },
+      { name: 'y', type: FIXED('DOUBLE') },
+    ])))],
+    percentile: DOUBLE_PERCENTILE_SIGNATURES,
+    percentile_approx: DOUBLE_PERCENTILE_SIGNATURES,
+    context_ngrams: [signature([ANY_VARIADIC], ARRAY(RECORD('struct', [
+      { name: 'ngram', type: ARRAY(FIXED('STRING')) },
+      { name: 'estfrequency', type: FIXED('DOUBLE') },
+    ])))],
+    ngrams: [signature([ANY_VARIADIC], ARRAY(RECORD('struct', [
+      { name: 'ngram', type: ARRAY(FIXED('STRING')) },
+      { name: 'estfrequency', type: FIXED('DOUBLE') },
+    ])))],
+    sentences: [signature([ANY_VARIADIC], ARRAY(ARRAY(FIXED('STRING'))))],
+    str_to_map: [signature([ANY_VARIADIC], MAP(FIXED('STRING'), FIXED('STRING')))],
+  },
+  flink: {
+    array_agg: COLLECTION_ARRAY_SIGNATURES,
+    collect: [signature([ANY], MULTISET(ARGUMENT()))],
+    percentile: DOUBLE_PERCENTILE_SIGNATURES,
+    bitmap_to_array: [signature([ANY], ARRAY(FIXED('INT')))],
+    map_entries: MAP_ENTRIES_ROW_SIGNATURES,
+    map_from_arrays: MAP_FROM_ARRAYS_SIGNATURES,
+    map_union: [signature([{ type: 'MAP', variadic: true }], ARGUMENT())],
+    str_to_map: [signature([ANY_VARIADIC], MAP(FIXED('VARCHAR'), FIXED('VARCHAR')))],
+    json_query: [signature([{ type: 'STRING' }, { type: 'STRING' }], {
+      kind: 'json-query', stringType: 'VARCHAR',
+    })],
+    json_arrayagg: [signature([ANY_VARIADIC], FIXED('VARCHAR'))],
+    json_objectagg: [signature([ANY_VARIADIC], FIXED('VARCHAR'))],
+  },
+  mysql: {
+    json_array: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_arrayagg: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_object: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_objectagg: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    st_collect: [signature([ANY_VARIADIC], FIXED('GEOMETRY'))],
+  },
+  postgresql: {
+    array_agg: COLLECTION_ARRAY_SIGNATURES,
+    regexp_match: [signature([ANY_VARIADIC], ARRAY(FIXED('TEXT')))],
+    regexp_matches: [signature([ANY_VARIADIC], ARRAY(FIXED('TEXT')))],
+    regexp_split_to_array: [signature([ANY_VARIADIC], ARRAY(FIXED('TEXT')))],
+    string_to_array: [signature([ANY_VARIADIC], ARRAY(FIXED('TEXT')))],
+    array_fill: [signature([ANY, ARRAY_PARAMETER, { type: 'ARRAY', optional: true }], ARRAY(ARGUMENT()))],
+    enum_range: [signature([ANY, { type: 'ANY', optional: true }], ARRAY(COMMON))],
+    pg_blocking_pids: [signature([NUMBER], ARRAY(FIXED('INT')))],
+    pg_safe_snapshot_blocking_pids: [signature([NUMBER], ARRAY(FIXED('INT')))],
+    tsvector_to_array: [signature([ANY], ARRAY(FIXED('TEXT')))],
+    xpath: [signature([ANY_VARIADIC], ARRAY(FIXED('XML')))],
+    percentile_cont: [
+      signature([NUMBER], FIXED('DOUBLE PRECISION')),
+      signature([ARRAY_PARAMETER], ARRAY(FIXED('DOUBLE PRECISION'))),
+    ],
+    percentile_disc: [
+      signature([NUMBER], { kind: 'common', indexes: [] }),
+      signature([ARRAY_PARAMETER], ARRAY({ kind: 'common', indexes: [] })),
+    ],
+    array_to_json: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_array: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_build_array: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    jsonb_build_array: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    jsonb_path_query_array: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    jsonb_path_query_array_tz: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    json_agg: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_agg_strict: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    jsonb_agg: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    jsonb_agg_strict: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    json_arrayagg: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_objectagg: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_object_agg: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_object_agg_strict: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_object_agg_unique: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    json_object_agg_unique_strict: [signature([ANY_VARIADIC], FIXED('JSON'))],
+    jsonb_object_agg: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    jsonb_object_agg_strict: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    jsonb_object_agg_unique: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+    jsonb_object_agg_unique_strict: [signature([ANY_VARIADIC], FIXED('JSONB'))],
+  },
+  trino: {
+    map: [
+      signature([], MAP({ kind: 'common', indexes: [] }, { kind: 'common', indexes: [] })),
+      signature([ARRAY_PARAMETER, ARRAY_PARAMETER], MAP(ARRAY_ELEMENT(0), ARRAY_ELEMENT(1))),
+    ],
+    array_agg: COLLECTION_ARRAY_SIGNATURES,
+    approx_percentile: [
+      signature([ANY, NUMBER], ARGUMENT()),
+      signature([ANY, ARRAY_PARAMETER], ARRAY(ARGUMENT())),
+      signature([ANY, NUMBER, NUMBER], ARGUMENT()),
+      signature([ANY, NUMBER, ARRAY_PARAMETER], ARRAY(ARGUMENT())),
+    ],
+    min: [signature([ANY], ARGUMENT()), signature([ANY, NUMBER], ARRAY(ARGUMENT()))],
+    max: [signature([ANY], ARGUMENT()), signature([ANY, NUMBER], ARRAY(ARGUMENT()))],
+    min_by: [signature([ANY, ANY], ARGUMENT()), signature([ANY, ANY, NUMBER], ARRAY(ARGUMENT()))],
+    max_by: [signature([ANY, ANY], ARGUMENT()), signature([ANY, ANY, NUMBER], ARRAY(ARGUMENT()))],
+    histogram: [signature([ANY], MAP(ARGUMENT(), FIXED('BIGINT')))],
+    array_histogram: [signature([ARRAY_PARAMETER], MAP(ARRAY_ELEMENT(0), FIXED('BIGINT')))],
+    numeric_histogram: [signature([NUMBER, NUMBER, OPTIONAL_NUMBER], MAP(FIXED('DOUBLE'), FIXED('DOUBLE')))],
+    approx_most_frequent: [signature([NUMBER, ANY, NUMBER], MAP(ARGUMENT(1), FIXED('BIGINT')))],
+    map_agg: [signature([ANY, ANY], MAP(ARGUMENT(), ARGUMENT(1)))],
+    multimap_agg: [signature([ANY, ANY], MAP(ARGUMENT(), ARRAY(ARGUMENT(1))))],
+    map_union: [signature([{ type: 'MAP' }], ARGUMENT())],
+    map_entries: MAP_ENTRIES_ROW_SIGNATURES,
+    map_from_entries: MAP_FROM_ENTRIES_SIGNATURES,
+    multimap_from_entries: [signature(
+      [ARRAY_PARAMETER],
+      MAP(FIELD(0, 0, true), ARRAY(FIELD(0, 1, true))),
+    )],
+    split_to_map: [signature([ANY_VARIADIC], MAP(FIXED('VARCHAR'), FIXED('VARCHAR')))],
+    split_to_multimap: [signature([ANY_VARIADIC], MAP(FIXED('VARCHAR'), ARRAY(FIXED('VARCHAR'))))],
+    zip: [signature([{ type: 'ARRAY', variadic: true }], { kind: 'zip-record', recordKind: 'row' })],
+    flatten: [signature([ARRAY_PARAMETER], ARRAY_ELEMENT(0))],
+    combinations: [signature([ARRAY_PARAMETER, NUMBER], ARRAY(ARGUMENT()))],
+    ngrams: [signature([ARRAY_PARAMETER, NUMBER], ARRAY(ARGUMENT()))],
+    qdigest_agg: [signature([ANY, OPTIONAL_NUMBER, OPTIONAL_NUMBER], OPAQUE('QDIGEST', [ARGUMENT()]))],
+    value_at_quantile: [signature([ANY, NUMBER], TYPE_ARGUMENT(0))],
+    values_at_quantiles: [signature([ANY, ARRAY_PARAMETER], ARRAY(TYPE_ARGUMENT(0)))],
+    classify: [signature([ANY, { type: 'MAP' }], MAP(FIXED('VARCHAR'), FIXED('DOUBLE')))],
+    features: [signature([ANY_VARIADIC], MAP(FIXED('VARCHAR'), FIXED('DOUBLE')))],
+    hash_counts: [signature([ANY], MAP(FIXED('BIGINT'), FIXED('BIGINT')))],
+    bing_tiles_around: [signature([ANY_VARIADIC], ARRAY(OPAQUE('BING_TILE')))],
+    geometry_nearest_points: [signature([ANY_VARIADIC], ARRAY(OPAQUE('GEOMETRY')))],
+    geometry_to_bing_tiles: [signature([ANY_VARIADIC], ARRAY(OPAQUE('BING_TILE')))],
+    line_interpolate_points: [signature([ANY_VARIADIC], ARRAY(OPAQUE('GEOMETRY')))],
+    st_envelopeaspts: [signature([ANY_VARIADIC], ARRAY(OPAQUE('GEOMETRY')))],
+    st_geometries: [signature([ANY_VARIADIC], ARRAY(OPAQUE('GEOMETRY')))],
+    st_interiorrings: [signature([ANY_VARIADIC], ARRAY(OPAQUE('GEOMETRY')))],
+    st_points: [signature([ANY_VARIADIC], ARRAY(OPAQUE('GEOMETRY')))],
+  },
+};
+
 export function buildSqlFunctionDefinitions(
   dialect: SqlDialect,
   names: readonly string[],
@@ -255,7 +567,7 @@ export function formatSqlFunctionSignature(
 function createDefinition(dialect: SqlDialect, rawName: string): SqlFunctionDefinition {
   const name = rawName.toLocaleLowerCase();
   const upper = rawName.toUpperCase();
-  const explicit = EXPLICIT_SIGNATURES[name];
+  const explicit = DIALECT_SIGNATURES[dialect]?.[name] ?? EXPLICIT_SIGNATURES[name];
   const kind: SqlFunctionKind = GENERATOR_FUNCTIONS.has(upper)
     ? 'generator'
     : WINDOW_FUNCTIONS.has(upper)
@@ -268,6 +580,7 @@ function createDefinition(dialect: SqlDialect, rawName: string): SqlFunctionDefi
     aliases: [],
     kind,
     signatures: explicit ?? [signature([ANY_VARIADIC], inferredReturnRule(dialect, upper))],
+    signatureSource: explicit ? 'explicit' : 'fallback',
   };
 }
 
@@ -316,10 +629,25 @@ function returnRuleText(rule: SqlFunctionReturnRule): string {
     case 'argument': return `ARG${rule.index + 1}`;
     case 'common': return 'COMMON';
     case 'array': return `ARRAY<${returnRuleText(rule.element)}>`;
+    case 'multiset': return `MULTISET<${returnRuleText(rule.element)}>`;
+    case 'map': return `MAP<${returnRuleText(rule.key)}, ${returnRuleText(rule.value)}>`;
+    case 'opaque': return rule.typeArguments.length > 0
+      ? `${rule.name}<${rule.typeArguments.map(returnRuleText).join(', ')}>`
+      : rule.name;
+    case 'record': return `${rule.recordKind.toUpperCase()}<${rule.fields.map((field) => (
+      `${field.name}: ${returnRuleText(field.type)}`
+    )).join(', ')}>`;
     case 'array-element': return `ELEMENT(ARG${rule.index + 1})`;
+    case 'map-key': return `KEY(ARG${rule.index + 1})`;
+    case 'map-value': return `VALUE(ARG${rule.index + 1})`;
     case 'map-keys': return `ARRAY<KEY(ARG${rule.index + 1})>`;
     case 'map-values': return `ARRAY<VALUE(ARG${rule.index + 1})>`;
+    case 'field': return `FIELD(ARG${rule.index + 1}, ${String(rule.field)})`;
+    case 'type-argument': return `TYPE_ARG(ARG${rule.index + 1}, ${rule.argument + 1})`;
     case 'element-at': return `ELEMENT(ARG${rule.index + 1})`;
+    case 'schema-literal': return `SCHEMA(ARG${rule.index + 1})`;
+    case 'zip-record': return `ARRAY<${rule.recordKind.toUpperCase()}<ELEMENTS>>`;
+    case 'json-query': return `${rule.stringType} | ARRAY<${rule.stringType}>`;
     case 'concat': return 'CONCAT_TYPE';
     case 'from-json': return 'PARSED_SCHEMA';
     case 'array-constructor': return 'ARRAY<COMMON>';

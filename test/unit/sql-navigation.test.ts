@@ -106,7 +106,7 @@ describe('AST SQL symbol resolver', () => {
     const position = symbol(sql, 'pos', 'spark', snapshot);
     const field = symbol(sql, 'sku', 'spark', snapshot);
     expect(position?.definitions[0]?.location.selectionStart).toBe(sql.lastIndexOf('pos'));
-    expect(position?.type).toMatch(/number/i);
+    expect(position?.type).toMatch(/INT|number/i);
     expect(field?.definitions[0]?.location.source).toBe('file:///t.sql');
   });
 
