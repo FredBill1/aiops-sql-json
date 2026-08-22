@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed Spark complex-type formatting so `ARRAY<...>`, `MAP<...>`, and `STRUCT<field: type>` retain compact delimiters, and kept `LATERAL VIEW` output aliases together when an enclosing `FROM` list expands.
 - Fixed AST argument collection and source-name recovery for parser-rewritten functions such as Spark `percentile_approx`, including exact function-name Hover ranges.
 - Added dialect-specific composite return signatures across the pinned Spark, Hive, Flink, MySQL, PostgreSQL, Trino, and Impala catalogs, with version-locked audits that prevent reviewed functions from silently falling back to `UNKNOWN`.
 - Extended SQL type inference and Hover formatting for nested `ARRAY`, `MAP`, named `STRUCT`, positional `ROW`, `MULTISET`, and parameterized opaque types, including schema-driven, zip, field-extraction, and scalar-or-array return rules.

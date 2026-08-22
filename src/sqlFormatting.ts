@@ -42,6 +42,8 @@ interface FormattingToken extends SqlLexToken {
   upper: string;
   protected: boolean;
   kind: TokenKind;
+  compactTypePunctuation: boolean;
+  localListComma: boolean;
   expressionDepth: number;
   sourceLine: number;
 }
@@ -96,6 +98,8 @@ const DATA_TYPES = new Set([
   'STRING', 'STRUCT', 'TEXT', 'TIME', 'TIMESTAMP', 'TINYINT', 'VARCHAR',
 ]);
 
+const COMPLEX_TYPE_CONSTRUCTORS = new Set(['ARRAY', 'MAP', 'STRUCT']);
+
 const KEYWORDS = new Set([
   'ALL', 'ALTER', 'AND', 'AS', 'ASC', 'BETWEEN', 'BY', 'CASE', 'CLUSTER', 'CREATE', 'CROSS', 'DELETE',
   'DESC', 'DISTINCT', 'BUCKETS', 'CLUSTERED', 'COMMENT', 'DISTRIBUTE', 'DROP', 'ELSE', 'END', 'EXCEPT',
@@ -136,6 +140,7 @@ export function formatSql(
     throw new SqlFormattingError('The SQL tokenizer returned no tokens.');
   }
   annotateExpressionDepth(tokens, parsed.statements);
+  annotateLateralAliasCommas(tokens, parsed.statements);
   const pairs = pairParentheses(tokens, configuration, editor);
   const cases = pairCases(tokens);
   const ddlClauseStarts = identifyDdlClauseStarts(tokens, pairs);
@@ -240,6 +245,7 @@ function createFormattingTokens(
       tokens[index]!.kind = 'word';
     }
   }
+  annotateComplexTypePunctuation(tokens);
   return tokens;
 }
 
@@ -293,9 +299,40 @@ function makeToken(token: SqlLexToken, placeholders: readonly PlaceholderRange[]
     upper,
     protected: isProtected,
     kind: opaque ? 'opaque' : classifyToken(token, raw, upper),
+    compactTypePunctuation: false,
+    localListComma: false,
     expressionDepth: 0,
     sourceLine: 0,
   };
+}
+
+function annotateComplexTypePunctuation(tokens: FormattingToken[]): void {
+  const stack: Array<{ punctuation: number[] }> = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    const previous = tokens[index - 1];
+    if (
+      token.raw === '<'
+      && previous?.kind === 'dataType'
+      && COMPLEX_TYPE_CONSTRUCTORS.has(previous.upper)
+      && !token.protected
+      && !previous.protected
+    ) {
+      stack.push({ punctuation: [index] });
+      continue;
+    }
+    const context = stack.at(-1);
+    if (!context || token.protected) continue;
+    if (token.raw === ':') {
+      context.punctuation.push(index);
+    } else if (token.raw === '>') {
+      context.punctuation.push(index);
+      stack.pop();
+      for (const punctuation of context.punctuation) {
+        tokens[punctuation]!.compactTypePunctuation = true;
+      }
+    }
+  }
 }
 
 function classifyToken(token: SqlLexToken, raw: string, upper: string): TokenKind {
@@ -314,6 +351,36 @@ function annotateExpressionDepth(tokens: FormattingToken[], statements: readonly
   for (const statement of statements) {
     annotateNodeDepth(statement, 0, tokens);
   }
+}
+
+function annotateLateralAliasCommas(
+  tokens: FormattingToken[],
+  statements: readonly SqlAstNode[],
+): void {
+  const visit = (node: SqlAstNode): void => {
+    if (node.role === 'lateral') {
+      const alias = node.args.alias;
+      const columns = isSqlAstNode(alias) && Array.isArray(alias.args.columns)
+        ? alias.args.columns.filter(isSqlAstNode)
+        : [];
+      for (let index = 1; index < columns.length; index += 1) {
+        const left = columns[index - 1]!;
+        const right = columns[index]!;
+        const comma = tokens.find((token) => (
+          token.raw === ',' && token.start >= left.end && token.end <= right.start
+        ));
+        if (comma) comma.localListComma = true;
+      }
+    }
+    for (const value of Object.values(node.args)) {
+      if (isSqlAstNode(value)) {
+        visit(value);
+      } else if (Array.isArray(value)) {
+        for (const child of value) if (isSqlAstNode(child)) visit(child);
+      }
+    }
+  };
+  for (const statement of statements) visit(statement);
 }
 
 function annotateNodeDepth(node: SqlAstNode, parentDepth: number, tokens: FormattingToken[]): void {
@@ -1203,7 +1270,7 @@ class SqlLayoutBuilder {
       } else if (token.raw === ')' && !token.protected) {
         this.closeParenthesis(index);
       } else if (token.raw === ',' && !token.protected) {
-        this.comma(index, this.shouldBreakList());
+        this.comma(index, this.shouldBreakList(index));
       } else if (token.raw === ';' && !token.protected) {
         this.semicolon(index);
       } else if (isLogical(token) && this.logicalBreaks.has(index)) {
@@ -1613,7 +1680,8 @@ class SqlLayoutBuilder {
     }
   }
 
-  private shouldBreakList(): boolean {
+  private shouldBreakList(index: number): boolean {
+    if (this.tokens[index]?.localListComma) return false;
     const context = this.contexts.at(-1);
     return context?.pair.listBroken === true
       || (this.clauseList && this.clauseListBroken);
@@ -1676,6 +1744,8 @@ function needsSpaceBefore(tokens: readonly FormattingToken[], index: number, cur
   const token = tokens[index]!;
   const previous = tokens[index - 1];
   if (!previous) return false;
+  if (token.compactTypePunctuation) return false;
+  if (previous.compactTypePunctuation && previous.raw === '<') return false;
   if (token.raw === '.' || token.raw === ']' || token.raw === ')' || token.raw === ',' || token.raw === ';') return false;
   if (previous.raw === '.' || previous.raw === '[' || previous.raw === '(') return false;
   if (token.raw === '[') return false;
@@ -1713,7 +1783,7 @@ function countTopLevelItems(
       hasContent = true;
       continue;
     }
-    if (token.raw === ',' && depth === 0) {
+    if (token.raw === ',' && depth === 0 && !token.localListComma) {
       commas += 1;
       continue;
     }

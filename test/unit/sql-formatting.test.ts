@@ -861,6 +861,100 @@ describe('SQL formatting', () => {
     ].join('\n'));
   });
 
+  it('keeps Spark complex types compact and lateral-view alias columns on the same line', () => {
+    const source = [
+      'create table tmp_table (',
+      '  value double, arr array < double >, strt struct < a : int, b : int >',
+      ');',
+      '',
+      'select pos, val as percentile_value',
+      'from (',
+      '  select percentile_approx(value, array(0.25, 0.5, 0.75, 0.9), 10000) as percentiles',
+      '  from tmp_table',
+      ') s lateral view posexplode(s.percentiles) lv as pos,',
+      '  val;',
+    ].join('\n');
+    const formatConfiguration = {
+      ...configuration,
+      maxLineWidth: 300,
+      maxInlineExpressionDepth: 20,
+    };
+    const result = formatSql(source, 'spark', placeholders, formatConfiguration, editor).text;
+    const expected = [
+      'CREATE TABLE tmp_table (',
+      '  value DOUBLE, arr ARRAY<DOUBLE>, strt STRUCT<a: INT, b: INT>',
+      ');',
+      '',
+      'SELECT pos, val AS percentile_value',
+      'FROM (',
+      '  SELECT PERCENTILE_APPROX(value, ARRAY(0.25, 0.5, 0.75, 0.9), 10000) AS percentiles',
+      '  FROM tmp_table',
+      ') s LATERAL VIEW POSEXPLODE(s.percentiles) lv AS pos, val;',
+    ].join('\n');
+
+    expect(result).toBe(expected);
+    expect(formatSql(result, 'spark', placeholders, formatConfiguration, editor).text).toBe(result);
+  });
+
+  it('formats nested complex types without changing comparison-operator spacing', () => {
+    const typeSource = 'create table nested_types(payload map < string, array < struct < amount : decimal(10,2), label : string > > >)';
+    const upper = formatSql(
+      typeSource,
+      'spark',
+      placeholders,
+      { ...configuration, maxLineWidth: 300, maxInlineExpressionDepth: 20 },
+      editor,
+    ).text;
+    const lower = formatSql(
+      typeSource,
+      'spark',
+      placeholders,
+      {
+        ...configuration,
+        maxLineWidth: 300,
+        maxInlineExpressionDepth: 20,
+        dataTypeCase: 'lower',
+      },
+      editor,
+    ).text;
+    const comparisons = formatSql(
+      'select a<b as lower_value,c>d as greater_value from comparisons',
+      'spark',
+      placeholders,
+      { ...configuration, maxLineWidth: 300 },
+      editor,
+    ).text;
+
+    expect(upper).toContain('payload MAP<STRING, ARRAY<STRUCT<amount: DECIMAL(10, 2), label: STRING>>>');
+    expect(lower).toContain('payload map<string, array<struct<amount: decimal(10, 2), label: string>>>');
+    expect(comparisons).toBe('SELECT a < b AS lower_value, c > d AS greater_value\nFROM comparisons');
+  });
+
+  it.each([
+    ['compact', 'trailing'],
+    ['compact', 'leading'],
+    ['expanded', 'trailing'],
+    ['expanded', 'leading'],
+  ] as const)('keeps lateral-view aliases local in %s mode with %s commas', (layoutMode, commaPosition) => {
+    const source = 'select pos,val from (select array(1,2) as items) s lateral view posexplode(s.items) lv as pos,val';
+    const result = formatSql(
+      source,
+      'spark',
+      placeholders,
+      {
+        ...configuration,
+        maxLineWidth: 300,
+        maxInlineExpressionDepth: 20,
+        layoutMode,
+        commaPosition,
+      },
+      editor,
+    ).text;
+
+    expect(result).toContain(') s LATERAL VIEW POSEXPLODE(s.items) lv AS pos, val');
+    expect(result).not.toContain('AS pos,\n');
+  });
+
   it('applies keyword, function, and data-type casing independently', () => {
     const result = formatSql(
       'select coalesce(cast(value as decimal(10,2)),0) as result from source_table',
