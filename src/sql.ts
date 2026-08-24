@@ -12,7 +12,13 @@ import type { CaretPosition, EntityContext, ParseError, Suggestions } from 'dt-s
 import type { ParserRuleContext, Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
-import { sqlingoCanParse } from './sqlAst';
+import {
+  isSqlAstNode,
+  parseSqlAst,
+  type ParsedSqlAst,
+  type SqlAstNode,
+  type SqlAstValue,
+} from './sqlAst';
 
 export const SQL_DIALECTS = [
   'spark',
@@ -88,9 +94,13 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
   const masked = maskPlaceholders(text, placeholders).text;
   let errors: ParseError[] = [];
   let antlrTokens: Token[] = [];
+  let parseTree: ParserRuleContext | undefined;
   try {
     errors = parser.validate(masked);
     antlrTokens = parser.getAllTokens(masked);
+    if (errors.length === 0 && hasMultipleTopLevelStatementStarts(antlrTokens)) {
+      parseTree = parser.parse(masked);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -100,13 +110,18 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
   }
 
   const hasUnmaskedTemplate = /\$\{|\$[\p{L}_]/u.test(masked);
-  const parserIssues = errors.length > 0 && !hasUnmaskedTemplate && sqlingoCanParse(text, dialect, placeholders)
+  const fallbackAst = !hasUnmaskedTemplate
+    && (errors.length > 0 || hasParenthesizedAliasCandidate(antlrTokens))
+    ? parseSqlAst(text, dialect, placeholders)
+    : undefined;
+  const structuralIssues = findStructuralIssues(antlrTokens, parseTree, fallbackAst);
+  const parserIssues = errors.length > 0 && fallbackAst && structuralIssues.length === 0
     ? []
     : errors.map((error) => parseErrorToIssue(text, error));
-  const structuralIssues = findStructuralIssues(antlrTokens)
+  const uncoveredStructuralIssues = structuralIssues
     .filter((issue) => !parserIssues.some((parserIssue) => parserIssueCoversStructuralIssue(parserIssue, issue)))
     .map(stripStructuralContext);
-  const issues = deduplicateIssues([...parserIssues, ...structuralIssues]);
+  const issues = deduplicateIssues([...parserIssues, ...uncoveredStructuralIssues]);
   const tokens = antlrTokens.flatMap((token, index) => {
     if (token.start < 0 || token.stop < token.start) {
       return [];
@@ -195,17 +210,23 @@ export function offsetToCaret(text: string, offset: number): CaretPosition {
   return { lineNumber, column };
 }
 
-function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
+function findStructuralIssues(
+  tokens: readonly Token[],
+  parseTree?: ParserRuleContext,
+  ast?: ParsedSqlAst,
+): StructuralSqlIssue[] {
   const significant = tokens.filter((token) => token.channel === 0 && token.start >= 0 && token.stop >= token.start);
   const issues: StructuralSqlIssue[] = [];
   const seen = new Set<string>();
   const relationBoundaries = new Set([
     'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
-    'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', 'AND', 'OR', ';', ')',
+    'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', 'AND', 'OR', 'SELECT', 'WITH',
+    ';', ')',
   ]);
   const expressionBoundaries = new Set([
     'AND', 'OR', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT',
-    'EXCEPT', 'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', ';', ')',
+    'EXCEPT', 'QUALIFY', 'WINDOW', 'CLUSTER', 'DISTRIBUTE', 'SORT', 'SELECT', 'VALUES', 'WITH',
+    ';', ')', ',',
   ]);
   const clauseBoundaries = new Set([
     'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
@@ -215,6 +236,13 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
     ...relationBoundaries,
     'FROM', 'JOIN', 'ON', 'USING', 'THEN', 'ELSE', 'END', 'WHEN', ']', ',',
   ]);
+  const queryStarts = new Set(['SELECT', 'WITH', 'VALUES', 'TABLE']);
+  const statementStarts = new Set(['SELECT', 'WITH', 'VALUES', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'TABLE']);
+  const terminators = new Set([';', ')']);
+  const clauseSeen = new Map<number, Set<string>>();
+  const joinHasOn = new Map<number, boolean>();
+  let parenthesisDepth = 0;
+  let caseDepth = 0;
 
   for (let index = 0; index < significant.length; index += 1) {
     const token = significant[index]!;
@@ -223,9 +251,16 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
     const next = nextToken ? structuralTokenName(nextToken) : undefined;
     const previousToken = significant[index - 1];
     const previous = previousToken ? structuralTokenName(previousToken) : undefined;
+    const afterNextToken = significant[index + 2];
+    const afterNext = afterNextToken ? structuralTokenName(afterNextToken) : undefined;
 
-    if (current === 'SELECT' && next === 'FROM' && nextToken) {
-      appendStructuralIssue(issues, seen, nextToken, 'Expected a select expression before FROM.');
+    if (current === ')') parenthesisDepth = Math.max(parenthesisDepth - 1, 0);
+    const depth = parenthesisDepth;
+    const atBoundary = (value: string | undefined): boolean => value === undefined || expressionBoundaries.has(value);
+
+    if (current === 'SELECT'
+      && (atBoundary(next) || ((next === 'ALL' || next === 'DISTINCT') && atBoundary(afterNext)))) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, 'Expected a select expression after SELECT.');
     }
     if ((current === 'FROM' || current === 'JOIN') && (!next || relationBoundaries.has(next))) {
       appendStructuralIssue(issues, seen, nextToken ?? token, `Expected a relation after ${current}.`);
@@ -237,6 +272,10 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
     if (current === ',' && (!next || listBoundaries.has(next))) {
       appendStructuralIssue(issues, seen, nextToken ?? token, 'Expected a list item after comma.');
     }
+    if (current === ',' && (previous === undefined || previous === '(' || previous === ','
+      || previous === 'SELECT' || previous === 'VALUES')) {
+      appendStructuralIssue(issues, seen, token, 'Expected a list item before comma.');
+    }
     if ((current === 'AND' || current === 'OR')
       && (!next || clauseBoundaries.has(next) || previous === undefined
         || previous === '(' || previous === ',' || previous === 'AND' || previous === 'OR'
@@ -244,8 +283,198 @@ function findStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[] {
         || previous === 'WHERE' || previous === 'HAVING' || previous === 'ON' || previous === 'QUALIFY')) {
       appendStructuralIssue(issues, seen, token, `Boolean operator ${current} is missing an operand.`);
     }
+
+    if (current === 'AS' && (next === undefined || next === ';' || next === ')' || next === ',')) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, 'Expected an alias or type after AS.');
+    }
+    if ((current === 'GROUP' || current === 'ORDER') && next !== 'BY' && next !== '(') {
+      appendStructuralIssue(issues, seen, nextToken ?? token, `Expected BY after ${current}.`);
+    }
+    if ((current === 'GROUP' || current === 'ORDER') && next === 'BY' && atBoundary(afterNext)) {
+      appendStructuralIssue(issues, seen, afterNextToken ?? nextToken ?? token, `Expected an expression after ${current} BY.`);
+    }
+    if ((current === 'LIMIT' || current === 'OFFSET' || current === 'WINDOW' || current === 'OVER')
+      && atBoundary(next)) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, `Expected a value after ${current}.`);
+    }
+    if ((current === 'IN' || current === 'IS' || current === 'NOT') && atBoundary(next)) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, `Expected an expression after ${current}.`);
+    }
+    if (current === 'IN' && next === '(' && (afterNext === ')' || afterNext === ',')) {
+      appendStructuralIssue(issues, seen, afterNextToken ?? nextToken ?? token, 'Expected a value or query inside IN parentheses.');
+    }
+    if (current === '(' && next === ')' && ['SELECT', 'VALUES', 'IN', 'EXISTS', 'USING'].includes(previous ?? '')) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, `Expected content inside ${previous ?? ''} parentheses.`);
+    }
+    if (current === 'VALUES' && (next === undefined || next === ';' || next === ')')) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, 'Expected at least one row after VALUES.');
+    }
+    if (current === 'WITH' && (next === undefined || terminators.has(next))) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, 'Expected a common table expression after WITH.');
+    }
+    if (current === 'DISTINCT' && previous === 'SELECT' && atBoundary(next)) {
+      appendStructuralIssue(issues, seen, nextToken ?? token, 'Expected a select expression after DISTINCT.');
+    }
+    if (current === 'UNION' || current === 'INTERSECT' || current === 'EXCEPT') {
+      const rightStart = next === 'ALL' || next === 'DISTINCT' ? afterNext : next;
+      if (!rightStart || !queryStarts.has(rightStart) && rightStart !== '(') {
+        appendStructuralIssue(issues, seen, nextToken ?? token, `Expected a query after ${current}.`);
+      }
+    }
+
+    if (current === 'CASE') caseDepth += 1;
+    if (current === 'END') {
+      if (caseDepth === 0 && previous !== undefined && previous !== ';') {
+        appendStructuralIssue(issues, seen, token, 'END does not close a CASE expression.');
+      } else {
+        caseDepth = Math.max(caseDepth - 1, 0);
+      }
+    }
+
+    const clauses = clauseSeen.get(depth) ?? new Set<string>();
+    clauseSeen.set(depth, clauses);
+    if (current === ';') {
+      clauseSeen.clear();
+      joinHasOn.clear();
+    } else if (current === 'SELECT' || current === 'VALUES') {
+      clauseSeen.set(depth, new Set());
+    } else if (current === 'ORDER' && next === 'BY') {
+      if (clauses.has('ORDER BY')) appendStructuralIssue(issues, seen, token, 'ORDER BY appears more than once in the same query.');
+      clauses.add('ORDER BY');
+    } else if (current === 'LIMIT') {
+      if (clauses.has('LIMIT')) appendStructuralIssue(issues, seen, token, 'LIMIT appears more than once in the same query.');
+      clauses.add('LIMIT');
+    }
+    if (current === 'JOIN') joinHasOn.set(depth, false);
+    if (current === 'ON') {
+      if (joinHasOn.get(depth)) appendStructuralIssue(issues, seen, token, 'JOIN contains more than one ON clause.');
+      joinHasOn.set(depth, true);
+    }
+
+    if (current === '(') parenthesisDepth += 1;
   }
+
+  appendCteStructuralIssues(significant, issues, seen, statementStarts);
+  appendAlterStructuralIssues(significant, issues, seen);
+  if (parseTree) appendStatementSeparatorIssues(parseTree, issues, seen);
+  if (ast) appendAstStructuralIssues(ast, significant, issues, seen);
   return [...issues, ...findCaseStructuralIssues(significant)];
+}
+
+function appendCteStructuralIssues(
+  tokens: readonly Token[],
+  issues: StructuralSqlIssue[],
+  seen: Set<string>,
+  statementStarts: ReadonlySet<string>,
+): void {
+  for (let statementStart = 0; statementStart < tokens.length;) {
+    let statementEnd = tokens.findIndex((token, index) => index >= statementStart && structuralTokenName(token) === ';');
+    if (statementEnd < 0) statementEnd = tokens.length;
+    if (structuralTokenName(tokens[statementStart]!) === 'WITH') {
+      let depth = 0;
+      let hasMainStatement = false;
+      for (let index = statementStart + 1; index < statementEnd; index += 1) {
+        const current = structuralTokenName(tokens[index]!);
+        if (current === '(') depth += 1;
+        else if (current === ')') depth = Math.max(depth - 1, 0);
+        else if (depth === 0 && statementStarts.has(current)) {
+          hasMainStatement = true;
+          break;
+        }
+      }
+      if (!hasMainStatement) {
+        appendStructuralIssue(issues, seen, tokens[Math.max(statementEnd - 1, statementStart)]!, 'Expected a main statement after WITH clause.');
+      }
+    }
+    statementStart = statementEnd + 1;
+  }
+}
+
+function appendAlterStructuralIssues(
+  tokens: readonly Token[],
+  issues: StructuralSqlIssue[],
+  seen: Set<string>,
+): void {
+  const actions = new Set([
+    'ADD', 'ALTER', 'CHANGE', 'DROP', 'MODIFY', 'RENAME', 'REPLACE', 'SET', 'UNSET', 'ENABLE',
+    'DISABLE', 'OWNER', 'CLUSTER', 'PARTITION', 'RECOVER', 'EXECUTE',
+  ]);
+  for (let statementStart = 0; statementStart < tokens.length;) {
+    let statementEnd = tokens.findIndex((token, index) => index >= statementStart && structuralTokenName(token) === ';');
+    if (statementEnd < 0) statementEnd = tokens.length;
+    if (structuralTokenName(tokens[statementStart]!) === 'ALTER'
+      && structuralTokenName(tokens[statementStart + 1]!) === 'TABLE') {
+      const action = tokens.slice(statementStart + 2, statementEnd).find((token) => actions.has(structuralTokenName(token)));
+      if (!action) {
+        appendStructuralIssue(issues, seen, tokens[Math.max(statementEnd - 1, statementStart)]!, 'Expected an ALTER TABLE action.');
+      }
+    }
+    statementStart = statementEnd + 1;
+  }
+}
+
+interface RootContextChild {
+  readonly start?: Token;
+  readonly stop?: Token;
+  readonly symbol?: Token;
+}
+
+function appendStatementSeparatorIssues(
+  root: ParserRuleContext,
+  issues: StructuralSqlIssue[],
+  seen: Set<string>,
+): void {
+  const children = ((root as unknown as { children?: readonly RootContextChild[] }).children ?? [])
+    .filter((child) => child.symbol === undefined && child.start && child.stop
+      && child.start.start >= 0 && child.stop.stop >= child.start.start)
+    .sort((left, right) => left.start!.start - right.start!.start);
+  let previous: RootContextChild | undefined;
+  for (const child of children) {
+    if (previous && previous.stop?.text !== ';' && child.start!.start > previous.stop!.stop) {
+      appendStructuralIssue(issues, seen, child.start!, 'Expected a semicolon between SQL statements.');
+    }
+    if (!previous || child.stop!.stop >= previous.stop!.stop) previous = child;
+  }
+}
+
+function appendAstStructuralIssues(
+  ast: ParsedSqlAst,
+  tokens: readonly Token[],
+  issues: StructuralSqlIssue[],
+  seen: Set<string>,
+): void {
+  const visit = (node: SqlAstNode, parent?: SqlAstNode, argument?: string): void => {
+    const rowConstructorField = parent?.role === 'function'
+      && parent.kind === 'anonymous'
+      && parent.name.replace(/^!/u, '').toLocaleLowerCase() === 'struct';
+    if (node.role === 'alias'
+      && !(parent?.role === 'select' && argument === 'expressions')
+      && !rowConstructorField) {
+      const asToken = tokens.find((token) => token.start >= node.start && token.stop < node.end
+        && structuralTokenName(token) === 'AS');
+      appendStructuralIssue(
+        issues,
+        seen,
+        asToken ?? tokens.find((token) => token.start >= node.start && token.stop < node.end) ?? tokens[0]!,
+        'Aliases are only valid on select items and relations, not inside scalar expressions.',
+      );
+    }
+    for (const [key, value] of Object.entries(node.args)) visitAstValue(value, node, key, visit);
+  };
+  for (const statement of ast.statements) visit(statement);
+}
+
+function visitAstValue(
+  value: SqlAstValue,
+  parent: SqlAstNode,
+  argument: string,
+  visit: (node: SqlAstNode, parent?: SqlAstNode, argument?: string) => void,
+): void {
+  if (isSqlAstNode(value)) {
+    visit(value, parent, argument);
+  } else if (Array.isArray(value)) {
+    for (const child of value) if (isSqlAstNode(child)) visit(child, parent, argument);
+  }
 }
 
 interface CaseDiagnosticState {
@@ -406,7 +635,37 @@ function findCaseStructuralIssues(tokens: readonly Token[]): StructuralSqlIssue[
   return issues;
 }
 
-function structuralTokenName(token: Token): string {
+function hasMultipleTopLevelStatementStarts(tokens: readonly Token[]): boolean {
+  const starts = new Set(['ALTER', 'CREATE', 'DELETE', 'DROP', 'INSERT', 'MERGE', 'SELECT', 'UPDATE', 'VALUES', 'WITH']);
+  let depth = 0;
+  let count = 0;
+  for (const token of tokens) {
+    if (token.channel !== 0 || token.start < 0 || token.stop < token.start) continue;
+    const current = structuralTokenName(token);
+    if (current === ')') depth = Math.max(depth - 1, 0);
+    if (depth === 0 && starts.has(current)) {
+      count += 1;
+      if (count > 1) return true;
+    }
+    if (current === '(') depth += 1;
+  }
+  return false;
+}
+
+function hasParenthesizedAliasCandidate(tokens: readonly Token[]): boolean {
+  let depth = 0;
+  for (const token of tokens) {
+    if (token.channel !== 0 || token.start < 0 || token.stop < token.start) continue;
+    const current = structuralTokenName(token);
+    if (current === ')') depth = Math.max(depth - 1, 0);
+    if (current === 'AS' && depth > 0) return true;
+    if (current === '(') depth += 1;
+  }
+  return false;
+}
+
+function structuralTokenName(token: Token | undefined): string {
+  if (!token) return '';
   const symbolicName = getSymbolicName(token).toUpperCase();
   if (symbolicName.startsWith('KW_')) {
     return symbolicName.slice(3);

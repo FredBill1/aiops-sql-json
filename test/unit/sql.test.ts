@@ -23,6 +23,34 @@ describe('SQL analysis', () => {
     expect(analyzeSql(sql, 'spark', []).issues).toEqual([]);
   });
 
+  it.each(SQL_DIALECTS)('accepts explicitly separated statements and legal aliases for %s SQL', (dialect) => {
+    const sql = 'SELECT t.a AS value FROM (SELECT 1 AS a) AS t; SELECT 2;';
+    expect(analyzeSql(sql, dialect, []).issues).toEqual([]);
+  });
+
+  it.each([
+    [
+      'spark',
+      "SELECT CAST(MAP('id', 1) AS MAP<STRING, INT>) AS value",
+    ],
+    [
+      'mysql',
+      "SELECT jt.value FROM JSON_TABLE('[1]', '$[*]' COLUMNS(value INT PATH '$')) AS jt",
+    ],
+    [
+      'generic',
+      'SELECT u.value FROM UNNEST(ARRAY[1, 2]) WITH ORDINALITY AS u(value, position)',
+    ],
+  ] as const)('retains the valid %s fallback-parser path', (dialect, sql) => {
+    expect(analyzeSql(sql, dialect, []).issues).toEqual([]);
+  });
+
+  it('accepts zero-argument window calls and Spark named struct fields', () => {
+    expect(analyzeSql('SELECT ROW_NUMBER() OVER () FROM source_table', 'spark', []).issues).toEqual([]);
+    expect(analyzeSql('SELECT struct(1 AS id, 2 AS value)', 'spark', []).issues).toEqual([]);
+    expect(analyzeSql('SELECT value FROM VALUES (1), (2) AS t(value)', 'spark', []).issues).toEqual([]);
+  });
+
   it('supports configurable placeholder masking', () => {
     const placeholders = compilePlaceholderPatterns(['\\$\\{[^}]+\\}']).patterns;
     const strict = analyzeSql('SELECT * FROM ${table};', 'spark', []);

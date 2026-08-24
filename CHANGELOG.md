@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.0.18
+
+- Fixed schema-enabled SQL analysis silently accepting malformed statements when the fallback AST parser could build a partial tree. Structural validation now checks statement separators, expression and relation slots, clause completeness and duplication, CTE and set-operation roots, and invalid aliases inside scalar expressions across all supported dialects.
+- Preserved valid dialect-specific fallback syntax, including MySQL `JSON_TABLE`, Spark complex-type `CAST`, named `STRUCT` fields and `FROM VALUES`, and `UNNEST` relations, while rejecting incomplete or lossy parses.
+- Fixed formatting for keyword-shaped and table-valued functions by deriving function names and call parentheses from AST source spans. Calls such as `SPLIT(...)` inside `TRIM ... FROM`, `WINDOW(...)`, `JSON_TABLE(...)`, and functions after `FROM` or `JOIN` no longer gain an extra space before `(`.
+
 ## 0.0.17
 
 - Fixed Spark complex-type formatting so `ARRAY<...>`, `MAP<...>`, and `STRUCT<field: type>` retain compact delimiters, and kept `LATERAL VIEW` output aliases together when an enclosing `FROM` list expands.

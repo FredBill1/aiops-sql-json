@@ -42,6 +42,8 @@ interface FormattingToken extends SqlLexToken {
   upper: string;
   protected: boolean;
   kind: TokenKind;
+  functionName: boolean;
+  functionOpen: boolean;
   compactTypePunctuation: boolean;
   localListComma: boolean;
   expressionDepth: number;
@@ -139,6 +141,7 @@ export function formatSql(
   if (tokens.length === 0) {
     throw new SqlFormattingError('The SQL tokenizer returned no tokens.');
   }
+  annotateFunctionCalls(tokens, parsed.statements);
   annotateExpressionDepth(tokens, parsed.statements);
   annotateLateralAliasCommas(tokens, parsed.statements);
   const pairs = pairParentheses(tokens, configuration, editor);
@@ -299,11 +302,45 @@ function makeToken(token: SqlLexToken, placeholders: readonly PlaceholderRange[]
     upper,
     protected: isProtected,
     kind: opaque ? 'opaque' : classifyToken(token, raw, upper),
+    functionName: false,
+    functionOpen: false,
     compactTypePunctuation: false,
     localListComma: false,
     expressionDepth: 0,
     sourceLine: 0,
   };
+}
+
+function annotateFunctionCalls(tokens: FormattingToken[], statements: readonly SqlAstNode[]): void {
+  const nonCallKinds = new Set([
+    'and', 'between', 'case', 'exists', 'in', 'is', 'like', 'not', 'or', 'over', 'similar', 'xor',
+  ]);
+  const visit = (node: SqlAstNode): void => {
+    if ((node.role === 'function' || node.role === 'unnest') && !nonCallKinds.has(node.kind.toLocaleLowerCase())) {
+      const nameIndices: number[] = [];
+      for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index]!;
+        if (token.protected || token.end <= node.nameStart || token.start >= node.nameEnd) continue;
+        if (token.start >= node.nameStart && token.end <= node.nameEnd && WORD_TEXT.test(token.raw)) {
+          nameIndices.push(index);
+        }
+      }
+      const lastNameIndex = nameIndices.at(-1);
+      const open = lastNameIndex === undefined ? undefined : tokens[lastNameIndex + 1];
+      if (lastNameIndex !== undefined && open?.raw === '(' && open.start >= node.nameEnd) {
+        for (const nameIndex of nameIndices) tokens[nameIndex]!.functionName = true;
+        open.functionOpen = true;
+      }
+    }
+    for (const value of Object.values(node.args)) {
+      if (isSqlAstNode(value)) {
+        visit(value);
+      } else if (Array.isArray(value)) {
+        for (const child of value) if (isSqlAstNode(child)) visit(child);
+      }
+    }
+  };
+  for (const statement of statements) visit(statement);
 }
 
 function annotateComplexTypePunctuation(tokens: FormattingToken[]): void {
@@ -1714,6 +1751,7 @@ function displayToken(
   configuration: SqlFormatConfiguration,
 ): string {
   if (token.protected || token.kind === 'string' || token.kind === 'comment' || token.kind === 'opaque') return token.raw;
+  if (token.functionName) return applyCase(token.raw, configuration.functionCase);
   if (token.kind === 'keyword') return applyCase(token.raw, configuration.keywordCase);
   if (token.kind === 'dataType') return applyCase(token.raw, configuration.dataTypeCase);
   const index = tokens.indexOf(token);
@@ -1728,13 +1766,15 @@ function applyCase(value: string, mode: 'preserve' | 'upper' | 'lower'): string 
 }
 
 function isFunctionName(tokens: readonly FormattingToken[], index: number): boolean {
+  if (tokens[index]?.functionName) return true;
   if (index < 0 || tokens[index]?.kind !== 'word' || tokens[index + 1]?.raw !== '(') return false;
   return !['AS', 'EXISTS', 'FROM', 'INTO', 'JOIN', 'TABLE', 'UPDATE'].includes(tokens[index - 1]?.upper ?? '');
 }
 
 function isFunctionOpen(tokens: readonly FormattingToken[], index: number): boolean {
   const previous = tokens[index - 1];
-  return isFunctionName(tokens, index - 1)
+  return tokens[index]?.functionOpen === true
+    || isFunctionName(tokens, index - 1)
     || previous?.kind === 'dataType'
     || (previous?.protected === true && previous.end === tokens[index]?.start);
 }
@@ -1796,6 +1836,7 @@ function clausePhraseAt(
   tokens: readonly FormattingToken[],
   index: number,
 ): { kind: string; length: number } | undefined {
+  if (tokens[index]?.functionName) return undefined;
   const at = (...words: string[]): boolean => words.every((word, offset) => tokens[index + offset]?.upper === word);
   const phrases: Array<[string, string[]]> = [
     ['join', ['LEFT', 'OUTER', 'JOIN']], ['join', ['RIGHT', 'OUTER', 'JOIN']], ['join', ['FULL', 'OUTER', 'JOIN']],
