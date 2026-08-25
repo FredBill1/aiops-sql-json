@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.0.19
+
+- Fixed cross-dialect expression type inference for window functions, `DISTINCT` and ordered aggregates, scalar subqueries, unary and bitwise operators, string predicates and concatenation, and date, timestamp, and interval arithmetic.
+- Propagated those inferred types consistently into workspace and statement-local CTAS and view schemas, including Spark temporal types and windowed aggregate outputs.
+- Added Hover and Go to Definition throughout `CREATE TABLE ... AS` and `CREATE VIEW ... AS` query bodies, including parenthesized queries, replacement and temporary variants, and nested CTEs.
+- Added AST-based semantic analysis, Hover, and Go to Definition for `DELETE` and `MERGE`, including target and source relations, match predicates, unknown references, and assignment compatibility checks.
+
 ## 0.0.18
 
 - Fixed schema-enabled SQL analysis silently accepting malformed statements when the fallback AST parser could build a partial tree. Structural validation now checks statement separators, expression and relation slots, clause completeness and duplication, CTE and set-operation roots, and invalid aliases inside scalar expressions across all supported dialects.

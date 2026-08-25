@@ -673,9 +673,10 @@ export function getSqlSymbolAtOffset(
   const kind = sqlStatementKind(statement.text, dialect, placeholders);
   if (kind === 'create' || kind === 'drop') {
     const declaration = resolveDdlSymbolAtOffset(statement.text, localOffset, dialect, effective);
-    return declaration ? offsetSymbolResolution(declaration, statement.start) : undefined;
+    if (declaration) return offsetSymbolResolution(declaration, statement.start);
+    if (kind === 'drop') return undefined;
   }
-  if (!isDataStatementKind(kind)) return undefined;
+  if (kind !== 'create' && !isDataStatementKind(kind)) return undefined;
   const model = buildSqlModel(statement.text, dialect, effective, placeholders, udfs, true);
   const matches = model.symbols.filter((symbol) => (
     localOffset >= symbol.reference.start && localOffset <= symbol.reference.end
@@ -1153,6 +1154,7 @@ interface AstModelContext {
   readonly references: IdentifierReference[];
   readonly issues: SqlSemanticIssue[];
   readonly symbols: SqlSymbolResolution[];
+  readonly queryResults: Map<SqlAstNode, AstQueryResult>;
 }
 
 interface AstColumnResolution {
@@ -1196,6 +1198,35 @@ function buildAstSqlModel(
   issues: SqlSemanticIssue[];
   symbols: SqlSymbolResolution[];
 } {
+  const context = createAstModelContext(
+    text,
+    dialect,
+    snapshot,
+    placeholders,
+    udfs,
+    validate,
+    sparkStoreAssignmentPolicy,
+  );
+  for (const statement of statements) {
+    analyzeAstStatement(statement, context, new Map());
+  }
+  return {
+    scopes: context.scopes,
+    references: context.references,
+    issues: deduplicateSemanticIssues(context.issues),
+    symbols: deduplicateSymbolResolutions(context.symbols),
+  };
+}
+
+function createAstModelContext(
+  text: string,
+  dialect: SqlDialect,
+  snapshot: SchemaSnapshot,
+  placeholders: readonly RegExp[],
+  udfs: readonly string[],
+  validate: boolean,
+  sparkStoreAssignmentPolicy: SparkStoreAssignmentPolicy,
+): AstModelContext {
   const catalog = getSqlCatalog(dialect);
   const builtinFunctions = new Set([
     ...catalog.functions.map((name) => normalizeQualifiedName(name, dialect)),
@@ -1207,7 +1238,7 @@ function buildAstSqlModel(
     'named_struct', 'struct', 'array', 'map', 'element_at', 'try_element_at',
   ]);
   const configuredUdfs = new Set(udfs.map((name) => normalizeQualifiedName(name, dialect)));
-  const context: AstModelContext = {
+  return {
     text,
     dialect,
     snapshot,
@@ -1223,15 +1254,7 @@ function buildAstSqlModel(
     references: [],
     issues: [],
     symbols: [],
-  };
-  for (const statement of statements) {
-    analyzeAstStatement(statement, context, new Map());
-  }
-  return {
-    scopes: context.scopes,
-    references: context.references,
-    issues: deduplicateSemanticIssues(context.issues),
-    symbols: deduplicateSymbolResolutions(context.symbols),
+    queryResults: new Map(),
   };
 }
 
@@ -1261,10 +1284,33 @@ function analyzeAstStatement(
   if (statement.role === 'update') {
     analyzeAstUpdate(statement, context, ctes);
   }
+  if (statement.role === 'delete') {
+    analyzeAstDelete(statement, context, ctes);
+  }
+  if (statement.role === 'merge') {
+    analyzeAstMerge(statement, context, ctes);
+  }
+  if (statement.role === 'create') {
+    const query = astChild(statement, 'expression');
+    return query ? analyzeAstQuery(query, context, undefined, ctes).columns : [];
+  }
   return [];
 }
 
 function analyzeAstQuery(
+  query: SqlAstNode,
+  context: AstModelContext,
+  parent: AstScope | undefined,
+  inheritedCtes: ReadonlyMap<string, RelationBinding>,
+): AstQueryResult {
+  const cached = context.queryResults.get(query);
+  if (cached) return cached;
+  const result = analyzeAstQueryUncached(query, context, parent, inheritedCtes);
+  context.queryResults.set(query, result);
+  return result;
+}
+
+function analyzeAstQueryUncached(
   query: SqlAstNode,
   context: AstModelContext,
   parent: AstScope | undefined,
@@ -1424,6 +1470,9 @@ function analyzeAstQuery(
   }
 
   const projections = astChildren(query, 'expressions');
+  for (const projection of projections) {
+    analyzeAstNestedQueries(projection, scope, ctes, context);
+  }
   const outputColumns = deriveAstProjectionColumns(projections, scope, context);
   if (context.validate) {
     for (const projection of projections) validateAstExpression(projection, scope, ctes, context);
@@ -1461,6 +1510,19 @@ function analyzeAstQuery(
     columns: outputColumns,
     open: projections.some((projection) => astProjectionHasOpenOutput(projection, scope, context)),
   };
+}
+
+function analyzeAstNestedQueries(
+  node: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): void {
+  if (isAstQueryNode(node)) {
+    analyzeAstQuery(node, context, scope, ctes);
+    return;
+  }
+  forEachAstChild(node, (child) => analyzeAstNestedQueries(child, scope, ctes, context));
 }
 
 function astProjectionHasOpenOutput(
@@ -2021,16 +2083,6 @@ function validateAstColumn(node: SqlAstNode, scope: AstScope, context: AstModelC
   }
 }
 
-function resolveAstColumn(
-  scope: AstScope | undefined,
-  qualifier: string,
-  name: string,
-  dialect: SqlDialect,
-): AstColumnResolution {
-  const qualifierParts = qualifier ? splitQualifiedName(qualifier).map((part) => part.text) : [];
-  return resolveAstColumnPath(scope, [...qualifierParts, name], dialect);
-}
-
 function resolveAstColumnPath(
   scope: AstScope | undefined,
   parts: readonly string[],
@@ -2244,6 +2296,13 @@ function inferAstExpressionType(
   context: AstModelContext,
   environment: AstTypeEnvironment = EMPTY_AST_TYPE_ENVIRONMENT,
 ): SqlDataType {
+  if (node.role === 'subquery') {
+    const inner = astChild(node, 'this');
+    const result = context.queryResults.get(node) ?? (inner ? context.queryResults.get(inner) : undefined);
+    return result?.columns.length === 1
+      ? columnDataType(result.columns[0]!, context.dialect)
+      : UNKNOWN_DATA_TYPE;
+  }
   if (node.role === 'alias') {
     const inner = astChild(node, 'this');
     return inner ? inferAstExpressionType(inner, scope, context, environment) : UNKNOWN_DATA_TYPE;
@@ -2290,6 +2349,18 @@ function inferAstExpressionType(
       }),
     };
   }
+  if (node.kind === 'interval') {
+    return { kind: 'opaque', name: 'INTERVAL', typeArguments: [] };
+  }
+  if (['window', 'withinGroup', 'ordered', 'order', 'neg', 'paren'].includes(node.kind)) {
+    const inner = astChild(node, 'this');
+    return inner ? inferAstExpressionType(inner, scope, context, environment) : UNKNOWN_DATA_TYPE;
+  }
+  if (node.kind === 'distinct') {
+    return commonAstDataType(astChildren(node, 'expressions').map((expression) => (
+      inferAstExpressionType(expression, scope, context, environment)
+    )));
+  }
   const normalizedFunction = normalizeBareIdentifier(astFunctionName(node, context.text), context.dialect).replace(/^!/u, '');
   const args = astExpressionArguments(node);
   const higherOrderType = inferAstHigherOrderType(node, normalizedFunction, scope, context, environment);
@@ -2305,6 +2376,15 @@ function inferAstExpressionType(
   }
   if (['sum', 'avg'].includes(normalizedFunction) && args[0]) {
     return inferAstExpressionType(args[0], scope, context, environment);
+  }
+  if (['lead', 'lag', 'first_value', 'last_value', 'nth_value'].includes(normalizedFunction) && args[0]) {
+    return inferAstExpressionType(args[0], scope, context, environment);
+  }
+  if (['array_agg', 'collect_list', 'collect_set'].includes(normalizedFunction) && args[0]) {
+    return {
+      kind: 'array',
+      elementType: inferAstExpressionType(args[0], scope, context, environment),
+    };
   }
   if (['from_json', 'from_csv', 'from_xml'].includes(normalizedFunction) && args[1]?.role === 'literal') {
     return dataTypeWithLiteralOrigins(
@@ -2389,8 +2469,18 @@ function inferAstExpressionType(
   if (normalizedFunction === 'if') {
     return commonAstDataType(args.slice(1).map((argument) => inferAstExpressionType(argument, scope, context, environment)));
   }
-  if (['add', 'sub', 'mul', 'div', 'intDiv', 'mod'].includes(node.kind)) return dataTypeFromFamily('number');
-  if (['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'and', 'or', 'not', 'is', 'in', 'between'].includes(node.kind)) {
+  if (node.kind === 'dPipe') return dataTypeFromFamily('string');
+  if (['bitwiseAnd', 'bitwiseOr', 'bitwiseXor', 'bitwiseLeftShift', 'bitwiseRightShift', 'bitwiseNot'].includes(node.kind)) {
+    return commonAstDataType(args.map((argument) => inferAstExpressionType(argument, scope, context, environment)));
+  }
+  if (['add', 'sub'].includes(node.kind)) {
+    return inferAstAdditiveType(node, scope, context, environment);
+  }
+  if (['mul', 'div', 'intDiv', 'mod'].includes(node.kind)) return dataTypeFromFamily('number');
+  if ([
+    'eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'and', 'or', 'not', 'is', 'in', 'between',
+    'like', 'iLike', 'similarTo', 'regexpLike', 'regexpILike', 'nullSafeEq', 'nullSafeNeq',
+  ].includes(node.kind)) {
     return dataTypeFromFamily('boolean');
   }
   const definition = findAstFunctionDefinition(normalizedFunction, context);
@@ -2398,6 +2488,38 @@ function inferAstExpressionType(
     return inferAstFunctionDefinitionType(node, definition, scope, context, environment);
   }
   return UNKNOWN_DATA_TYPE;
+}
+
+function inferAstAdditiveType(
+  node: SqlAstNode,
+  scope: AstScope | undefined,
+  context: AstModelContext,
+  environment: AstTypeEnvironment,
+): SqlDataType {
+  const leftNode = astChild(node, 'this');
+  const rightNode = astChild(node, 'expression');
+  const left = leftNode ? inferAstExpressionType(leftNode, scope, context, environment) : UNKNOWN_DATA_TYPE;
+  const right = rightNode ? inferAstExpressionType(rightNode, scope, context, environment) : UNKNOWN_DATA_TYPE;
+  const leftTemporal = left.kind === 'scalar' && (left.family === 'date' || left.family === 'time');
+  const rightTemporal = right.kind === 'scalar' && (right.family === 'date' || right.family === 'time');
+  const leftInterval = isIntervalDataType(left);
+  const rightInterval = isIntervalDataType(right);
+  if (node.kind === 'sub' && leftTemporal && rightTemporal) {
+    return { kind: 'opaque', name: 'INTERVAL', typeArguments: [] };
+  }
+  if (leftTemporal && (rightInterval || (right.kind === 'scalar' && right.family === 'number'))) return left;
+  if (node.kind === 'add' && rightTemporal
+    && (leftInterval || (left.kind === 'scalar' && left.family === 'number'))) return right;
+  if (leftInterval && rightInterval) return left;
+  if (left.kind === 'scalar' && left.family === 'number'
+    && right.kind === 'scalar' && right.family === 'number') {
+    return commonAstDataType([left, right]);
+  }
+  return UNKNOWN_DATA_TYPE;
+}
+
+function isIntervalDataType(dataType: SqlDataType): boolean {
+  return dataType.kind === 'opaque' && dataType.name.toLocaleUpperCase() === 'INTERVAL';
 }
 
 interface AstFunctionSignatureResolution {
@@ -3050,35 +3172,154 @@ function analyzeAstUpdate(
 ): void {
   const table = astChild(update, 'this');
   if (!table) return;
-  const scope: AstScope = {
-    start: update.start,
-    end: update.end,
+  const scope = createAstMutationScope(update);
+  context.scopes.push(scope);
+  scope.relations.push(bindAstRelation(table, scope, ctes, context));
+  for (const assignment of astChildren(update, 'expressions')) {
+    analyzeAstMutationAssignment(assignment, scope, scope, ctes, context);
+  }
+  const where = astChild(update, 'where');
+  if (where) analyzeAstScopedExpression(where, scope, ctes, context);
+}
+
+function analyzeAstDelete(
+  deleteNode: SqlAstNode,
+  context: AstModelContext,
+  ctes: ReadonlyMap<string, RelationBinding>,
+): void {
+  const scope = createAstMutationScope(deleteNode);
+  context.scopes.push(scope);
+  const target = astChild(deleteNode, 'this');
+  if (target) scope.relations.push(bindAstRelation(target, scope, ctes, context));
+  for (const relation of [
+    ...astChildren(deleteNode, 'using'),
+    ...astChildren(deleteNode, 'tables'),
+  ]) {
+    if (relation !== target) scope.relations.push(bindAstRelation(relation, scope, ctes, context));
+  }
+  for (const key of ['where', 'returning', 'order', 'limit', 'cluster'] as const) {
+    const clause = astChild(deleteNode, key);
+    if (clause) analyzeAstScopedExpression(clause, scope, ctes, context);
+  }
+}
+
+function analyzeAstMerge(
+  merge: SqlAstNode,
+  context: AstModelContext,
+  ctes: ReadonlyMap<string, RelationBinding>,
+): void {
+  const scope = createAstMutationScope(merge);
+  context.scopes.push(scope);
+  const targetNode = astChild(merge, 'this');
+  const targetBinding = targetNode ? bindAstRelation(targetNode, scope, ctes, context) : undefined;
+  if (targetBinding) scope.relations.push(targetBinding);
+  const sourceNode = astChild(merge, 'using');
+  if (sourceNode) scope.relations.push(bindAstRelation(sourceNode, scope, ctes, context));
+
+  const on = astChild(merge, 'on');
+  if (on) analyzeAstScopedExpression(on, scope, ctes, context);
+  const targetScope: AstScope = {
+    ...scope,
+    relations: targetBinding ? [targetBinding] : [],
+  };
+  const whens = astChild(merge, 'whens');
+  for (const when of whens ? astChildren(whens, 'expressions') : []) {
+    const condition = astChild(when, 'condition');
+    if (condition) analyzeAstScopedExpression(condition, scope, ctes, context);
+    const action = astChild(when, 'then');
+    if (!action) continue;
+    if (action.role === 'update') {
+      for (const assignment of astChildren(action, 'expressions')) {
+        analyzeAstMutationAssignment(assignment, targetScope, scope, ctes, context);
+      }
+    } else if (action.role === 'insert') {
+      analyzeAstMergeInsert(action, targetScope, scope, ctes, context);
+    }
+  }
+  const returning = astChild(merge, 'returning');
+  if (returning) analyzeAstScopedExpression(returning, scope, ctes, context);
+}
+
+function createAstMutationScope(node: SqlAstNode): AstScope {
+  return {
+    start: node.start,
+    end: Math.max(node.end, node.start + 1),
     depth: 0,
     relations: [],
     projectionAliases: new Set(),
     projectionColumns: new Map(),
   };
-  context.scopes.push(scope);
-  scope.relations.push(bindAstRelation(table, scope, ctes, context));
-  for (const assignment of astChildren(update, 'expressions')) {
-    const target = astChild(assignment, 'this');
-    const value = astChild(assignment, 'expression');
-    if (!target || !value) continue;
-    if (context.validate) {
-      validateAstExpression(target, scope, ctes, context);
-      validateAstExpression(value, scope, ctes, context);
-      const expected = target.role === 'column'
-        ? resolveAstColumn(scope, astColumnQualifier(target), target.name, context.dialect).column
-        : undefined;
-      const actualType = inferAstExpressionType(value, scope, context);
-      if (expected && !areDataTypesCompatible(columnDataType(expected, context.dialect), actualType)) {
-        appendAstIssue(context, value, 'incompatible-type',
-          `Cannot assign ${dataTypeFamily(actualType)} value to ${expected.name} (${expected.type || expected.typeFamily}).`);
-      }
-    }
+}
+
+function analyzeAstScopedExpression(
+  node: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): void {
+  if (context.validate) validateAstExpression(node, scope, ctes, context);
+  else collectAstReferences(node, context);
+}
+
+function analyzeAstMutationAssignment(
+  assignment: SqlAstNode,
+  targetScope: AstScope,
+  valueScope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): void {
+  const target = astChild(assignment, 'this');
+  const value = astChild(assignment, 'expression');
+  if (!target || !value) return;
+  analyzeAstScopedExpression(target, targetScope, ctes, context);
+  analyzeAstScopedExpression(value, valueScope, ctes, context);
+  if (!context.validate || target.role !== 'column') return;
+  const expected = resolveAstColumnPath(targetScope, astColumnPath(target), context.dialect).column;
+  if (expected) validateAstStoreAssignment(expected, value, valueScope, context);
+}
+
+function analyzeAstMergeInsert(
+  insert: SqlAstNode,
+  targetScope: AstScope,
+  valueScope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): void {
+  const targetTuple = astChild(insert, 'this');
+  const valueTuple = astChild(insert, 'expression');
+  const targets = targetTuple ? astChildren(targetTuple, 'expressions') : [];
+  const values = valueTuple ? astChildren(valueTuple, 'expressions') : [];
+  for (const target of targets) analyzeAstScopedExpression(target, targetScope, ctes, context);
+  for (const value of values) analyzeAstScopedExpression(value, valueScope, ctes, context);
+  if (!context.validate) return;
+  if (targets.length !== values.length) {
+    appendAstIssue(context, valueTuple ?? insert, 'insert-column-count',
+      `INSERT writes ${values.length} value(s) into ${targets.length} target column(s).`);
   }
-  const where = astChild(update, 'where');
-  if (where && context.validate) validateAstExpression(where, scope, ctes, context);
+  targets.slice(0, values.length).forEach((target, index) => {
+    const value = values[index];
+    if (!value || target.role !== 'column') return;
+    const expected = resolveAstColumnPath(targetScope, astColumnPath(target), context.dialect).column;
+    if (expected) validateAstStoreAssignment(expected, value, valueScope, context);
+  });
+}
+
+function validateAstStoreAssignment(
+  expected: SchemaColumn,
+  value: SqlAstNode,
+  scope: AstScope,
+  context: AstModelContext,
+): void {
+  const actualType = inferAstExpressionType(value, scope, context);
+  if (!canStoreAssignDataType(
+    columnDataType(expected, context.dialect),
+    actualType,
+    context.dialect,
+    context.sparkStoreAssignmentPolicy,
+  )) {
+    appendAstIssue(context, value, 'incompatible-type',
+      `Cannot assign ${dataTypeFamily(actualType)} value to ${expected.name} (${expected.type || expected.typeFamily}).`);
+  }
 }
 
 function analyzeAstValuesQuery(
@@ -3649,23 +3890,7 @@ function deriveAstStatementColumns(
   placeholders: readonly RegExp[],
   statement: SqlAstNode,
 ): SchemaColumn[] {
-  const context: AstModelContext = {
-    text,
-    dialect,
-    snapshot,
-    placeholderRanges: findPlaceholderRanges(text, placeholders),
-    functions: new Set(),
-    builtinFunctions: new Set(),
-    functionDefinitions: new Map(),
-    functionCatalogVersion: '',
-    udfs: new Set(),
-    validate: false,
-    sparkStoreAssignmentPolicy: 'ansi',
-    scopes: [],
-    references: [],
-    issues: [],
-    symbols: [],
-  };
+  const context = createAstModelContext(text, dialect, snapshot, placeholders, [], false, 'ansi');
   return analyzeAstStatement(statement, context, new Map());
 }
 
@@ -3967,7 +4192,7 @@ function typeFamily(type: string): SqlTypeFamily {
   if (/\b(?:CHAR|VARCHAR|STRING|TEXT|CLOB|JSON|UUID)\b/u.test(upper)) return 'string';
   if (/\b(?:BOOL|BOOLEAN)\b/u.test(upper)) return 'boolean';
   if (/\bDATE\b/u.test(upper)) return 'date';
-  if (/\b(?:TIME|TIMESTAMP|DATETIME)\b/u.test(upper)) return 'time';
+  if (/\b(?:TIME(?:TZ)?|TIMESTAMP(?:TZ|_NTZ|_LTZ)?|DATETIME)\b/u.test(upper)) return 'time';
   if (/\b(?:BINARY|VARBINARY|BLOB|BYTEA)\b/u.test(upper)) return 'binary';
   if (/\b(?:ARRAY|MAP|STRUCT|ROW|MULTISET)\b/u.test(upper)) return 'complex';
   return 'unknown';

@@ -42,6 +42,15 @@ FROM recent JOIN orders o USING (id)`;
     expect(findNodes(ast?.statements[1], (node) => node.role === 'schema')[0]?.aliasColumns).toEqual([]);
   });
 
+  it('normalizes DELETE and MERGE as statement roles', () => {
+    const ast = parseSqlAst(
+      'DELETE FROM target WHERE id = 1; '
+        + 'MERGE INTO target t USING source s ON t.id = s.id WHEN MATCHED THEN DELETE;',
+      'spark',
+    );
+    expect(ast?.statements.map((statement) => statement.role)).toEqual(['delete', 'merge']);
+  });
+
   it.each([
     ['spark', 'SELECT tag FROM batches b LATERAL VIEW EXPLODE(b.tags) e AS tag', 'anonymous'],
     ['hive', 'SELECT tag FROM batches b LATERAL VIEW EXPLODE(b.tags) e AS tag', 'anonymous'],

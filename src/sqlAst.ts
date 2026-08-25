@@ -5,6 +5,7 @@ import {
   CreateExpr,
   CteExpr,
   DataTypeExpr,
+  DeleteExpr,
   DropExpr,
   Expression,
   FuncExpr,
@@ -13,6 +14,7 @@ import {
   JoinExpr,
   LateralExpr,
   LiteralExpr,
+  MergeExpr,
   SchemaExpr,
   SelectExpr,
   SetOperationExpr,
@@ -39,6 +41,7 @@ export type SqlAstRole =
   | 'create'
   | 'cte'
   | 'data-type'
+  | 'delete'
   | 'drop'
   | 'expression'
   | 'function'
@@ -47,6 +50,7 @@ export type SqlAstRole =
   | 'join'
   | 'lateral'
   | 'literal'
+  | 'merge'
   | 'schema'
   | 'select'
   | 'set-operation'
@@ -381,6 +385,8 @@ function expressionRole(expression: Expression): SqlAstRole {
   if (expression instanceof UnnestExpr) return 'unnest';
   if (expression instanceof InsertExpr) return 'insert';
   if (expression instanceof UpdateExpr) return 'update';
+  if (expression instanceof DeleteExpr) return 'delete';
+  if (expression instanceof MergeExpr) return 'merge';
   if (expression instanceof CreateExpr) return 'create';
   if (expression instanceof DropExpr) return 'drop';
   if (expression instanceof CteExpr) return 'cte';
