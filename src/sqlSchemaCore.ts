@@ -1,8 +1,10 @@
 import { findPlaceholderRanges } from './patterns';
 import { analyzeSql, lexSql, type SqlDialect, type SqlLexToken } from './sql';
 import {
+  astArgumentRole,
   astChild,
   astChildren,
+  astExpressionChildren,
   astFunctionName,
   isSqlAstNode,
   parseSqlAst,
@@ -152,6 +154,8 @@ export interface RelationBinding {
   columns: readonly SchemaColumn[];
   unresolved: boolean;
   dynamic?: boolean;
+  /** Synthetic namespaces such as EXCLUDED and row-pattern variables. */
+  qualifiedOnly?: boolean;
   kind?: 'table' | 'view' | 'cte' | 'derived-table' | 'generator';
   definitions?: readonly SqlSymbolDefinition[];
   targetDefinitions?: readonly SqlSymbolDefinition[];
@@ -173,6 +177,7 @@ interface MutableScope {
 
 interface AstScope extends MutableScope {
   parent?: AstScope;
+  localFunctions?: ReadonlyMap<string, SqlFunctionDefinition>;
 }
 
 interface IdentifierReference {
@@ -1176,6 +1181,7 @@ interface AstTypeBinding {
 
 interface AstQueryResult {
   readonly columns: SchemaColumn[];
+  readonly scope?: AstScope;
   /** The query projection may expose additional columns that cannot be named statically. */
   readonly open: boolean;
 }
@@ -1273,22 +1279,23 @@ function isAstQueryNode(node: SqlAstNode): boolean {
 function analyzeAstStatement(
   statement: SqlAstNode,
   context: AstModelContext,
-  ctes: ReadonlyMap<string, RelationBinding>,
+  inheritedCtes: ReadonlyMap<string, RelationBinding>,
 ): SchemaColumn[] {
   if (isAstQueryNode(statement)) {
-    return analyzeAstQuery(statement, context, undefined, ctes).columns;
+    return analyzeAstQuery(statement, context, undefined, inheritedCtes).columns;
   }
+  const ctes = bindAstCtes(statement, context, inheritedCtes);
   if (statement.role === 'insert') {
     return analyzeAstInsert(statement, context, ctes);
   }
   if (statement.role === 'update') {
-    analyzeAstUpdate(statement, context, ctes);
+    return analyzeAstUpdate(statement, context, ctes);
   }
   if (statement.role === 'delete') {
-    analyzeAstDelete(statement, context, ctes);
+    return analyzeAstDelete(statement, context, ctes);
   }
   if (statement.role === 'merge') {
-    analyzeAstMerge(statement, context, ctes);
+    return analyzeAstMerge(statement, context, ctes);
   }
   if (statement.role === 'create') {
     const query = astChild(statement, 'expression');
@@ -1316,23 +1323,24 @@ function analyzeAstQueryUncached(
   parent: AstScope | undefined,
   inheritedCtes: ReadonlyMap<string, RelationBinding>,
 ): AstQueryResult {
+  const ctes = bindAstCtes(query, context, inheritedCtes);
   if (query.role === 'subquery') {
     const inner = astChild(query, 'this');
     return inner
-      ? analyzeAstQuery(inner, context, parent, inheritedCtes)
+      ? analyzeAstQuery(inner, context, parent, ctes)
       : { columns: [], open: true };
   }
   if (query.kind === 'values') {
-    return analyzeAstValuesQuery(query, context, parent, inheritedCtes);
+    return analyzeAstValuesQuery(query, context, parent, ctes);
   }
   if (query.role === 'set-operation') {
     const left = astChild(query, 'this');
     const right = astChild(query, 'expression');
     const leftResult = left
-      ? analyzeAstQuery(left, context, parent, inheritedCtes)
+      ? analyzeAstQuery(left, context, parent, ctes)
       : { columns: [], open: false };
     const rightResult = right
-      ? analyzeAstQuery(right, context, parent, inheritedCtes)
+      ? analyzeAstQuery(right, context, parent, ctes)
       : { columns: [], open: false };
     const leftColumns = leftResult.columns;
     const rightColumns = rightResult.columns;
@@ -1372,7 +1380,18 @@ function analyzeAstQueryUncached(
         ? schemaColumnWithDataType(column, commonType, definitions)
         : definitions.length > 0 ? { ...column, definitions } : column;
     });
-    return { columns, open: leftResult.open || rightResult.open };
+    const open = leftResult.open || rightResult.open;
+    // A set operation owns its output namespace; branch table qualifiers do
+    // not survive into ORDER BY on the combined result.
+    const outputScope = createAstMutationScope(query);
+    outputScope.depth = parent ? parent.depth + 1 : 0;
+    outputScope.relations.push({ name: '', aliases: [], columns, unresolved: open });
+    context.scopes.push(outputScope);
+    for (const key of ['order', 'limit', 'offset']) {
+      const clause = astChild(query, key);
+      if (clause) analyzeAstScopedExpression(clause, outputScope, ctes, context);
+    }
+    return { columns, open };
   }
   if (query.role !== 'select') return { columns: [], open: true };
 
@@ -1386,15 +1405,66 @@ function analyzeAstQueryUncached(
     parent,
   };
   context.scopes.push(scope);
+  const fromNode = astChild(query, 'from');
+  const firstRelation = fromNode ? astChild(fromNode, 'this') : undefined;
+  if (firstRelation) appendAstRelation(firstRelation, scope, ctes, context);
+  for (const join of astChildren(query, 'joins')) appendAstJoin(join, scope, ctes, context);
+  for (const lateral of astChildren(query, 'laterals')) appendAstRelation(lateral, scope, ctes, context);
+
+  const match = astChild(query, 'match');
+  if (match) scope.relations = [bindAstMatchRecognize(match, scope, ctes, context)];
+
+  const projections = astChildren(query, 'expressions');
+  for (const projection of projections) {
+    analyzeAstNestedQueries(projection, scope, ctes, context);
+  }
+  const outputColumns = deriveAstProjectionColumns(projections, scope, context);
+  if (context.validate) {
+    for (const projection of projections) validateAstExpression(projection, scope, ctes, context);
+  } else {
+    for (const projection of projections) collectAstReferences(projection, context);
+  }
+
+  for (const projection of projections) {
+    if (projection.alias) {
+      scope.projectionAliases.add(normalizeBareIdentifier(projection.alias, context.dialect));
+    }
+  }
+  for (const column of outputColumns) {
+    if (scope.projectionAliases.has(column.normalizedName)) {
+      scope.projectionColumns.set(column.normalizedName, column);
+    }
+  }
+
+  for (const [key, value] of Object.entries(query.args)) {
+    if (key === 'expressions' || astArgumentRole(query, key) !== 'expression') continue;
+    const clauses = isSqlAstNode(value) ? [value] : Array.isArray(value) ? value.filter(isSqlAstNode) : [];
+    for (const clause of clauses) {
+      const input = key === 'where' || key === 'windows' ? astInputScope(clause, scope, context) : scope;
+      analyzeAstScopedExpression(clause, input, ctes, context);
+    }
+  }
+  return {
+    columns: outputColumns,
+    scope,
+    open: projections.some((projection) => astProjectionHasOpenOutput(projection, scope, context)),
+  };
+}
+
+function bindAstCtes(
+  owner: SqlAstNode,
+  context: AstModelContext,
+  inheritedCtes: ReadonlyMap<string, RelationBinding>,
+): ReadonlyMap<string, RelationBinding> {
   const ctes = new Map(inheritedCtes);
   const localCteNames = new Set<string>();
-  const withNode = astChild(query, 'with');
+  const withNode = astChild(owner, 'with');
   for (const cte of withNode ? astChildren(withNode, 'expressions') : []) {
     if (cte.role !== 'cte') continue;
     const cteQuery = astChild(cte, 'this');
-    const cteResult = cteQuery
+    const cteResult = cteQuery && isAstQueryNode(cteQuery)
       ? analyzeAstQuery(cteQuery, context, undefined, ctes)
-      : { columns: [], open: false };
+      : { columns: cteQuery ? analyzeAstStatement(cteQuery, context, ctes) : [], open: false };
     let columns = cteResult.columns;
     const explicitColumns = cte.aliasColumns;
     if (explicitColumns.length > 0) {
@@ -1451,65 +1521,7 @@ function analyzeAstQueryUncached(
       }
     }
   }
-
-  const fromNode = astChild(query, 'from');
-  const firstRelation = fromNode ? astChild(fromNode, 'this') : undefined;
-  if (firstRelation) {
-    scope.relations.push(bindAstRelation(firstRelation, scope, ctes, context));
-  }
-  for (const join of astChildren(query, 'joins')) {
-    const relationNode = astChild(join, 'this');
-    if (!relationNode) continue;
-    const leftRelations = [...scope.relations];
-    const binding = bindAstRelation(relationNode, scope, ctes, context);
-    scope.relations.push(binding);
-    if (context.validate) validateAstUsing(join, leftRelations, binding, context);
-  }
-  for (const lateral of astChildren(query, 'laterals')) {
-    scope.relations.push(bindAstRelation(lateral, scope, ctes, context));
-  }
-
-  const projections = astChildren(query, 'expressions');
-  for (const projection of projections) {
-    analyzeAstNestedQueries(projection, scope, ctes, context);
-  }
-  const outputColumns = deriveAstProjectionColumns(projections, scope, context);
-  if (context.validate) {
-    for (const projection of projections) validateAstExpression(projection, scope, ctes, context);
-  } else {
-    for (const projection of projections) collectAstReferences(projection, context);
-  }
-
-  for (const projection of projections) {
-    if (projection.alias) {
-      scope.projectionAliases.add(normalizeBareIdentifier(projection.alias, context.dialect));
-    }
-  }
-  for (const column of outputColumns) {
-    if (scope.projectionAliases.has(column.normalizedName)) {
-      scope.projectionColumns.set(column.normalizedName, column);
-    }
-  }
-
-  if (context.validate) {
-    for (const join of astChildren(query, 'joins')) {
-      const on = astChild(join, 'on');
-      if (on) validateAstExpression(on, scope, ctes, context);
-    }
-    for (const key of ['where', 'group', 'having', 'qualify', 'order', 'sort', 'cluster'] as const) {
-      const clause = astChild(query, key);
-      if (clause) validateAstExpression(clause, scope, ctes, context);
-    }
-  } else {
-    for (const key of ['where', 'group', 'having', 'qualify', 'order', 'sort', 'cluster'] as const) {
-      const clause = astChild(query, key);
-      if (clause) collectAstReferences(clause, context);
-    }
-  }
-  return {
-    columns: outputColumns,
-    open: projections.some((projection) => astProjectionHasOpenOutput(projection, scope, context)),
-  };
+  return ctes;
 }
 
 function analyzeAstNestedQueries(
@@ -1522,7 +1534,7 @@ function analyzeAstNestedQueries(
     analyzeAstQuery(node, context, scope, ctes);
     return;
   }
-  forEachAstChild(node, (child) => analyzeAstNestedQueries(child, scope, ctes, context));
+  for (const child of astExpressionChildren(node)) analyzeAstNestedQueries(child, scope, ctes, context);
 }
 
 function astProjectionHasOpenOutput(
@@ -1530,9 +1542,8 @@ function astProjectionHasOpenOutput(
   scope: AstScope,
   context: AstModelContext,
 ): boolean {
-  if (overlapsAny({ start: projection.start, end: projection.end }, context.placeholderRanges)) {
-    return true;
-  }
+  const nameNode = astAliasIdentifier(projection) ?? projection;
+  if (astHasDynamicReference(nameNode, context)) return true;
   const expression = projection.role === 'alias' ? astChild(projection, 'this') ?? projection : projection;
   const qualifier = astProjectionWildcardQualifier(expression);
   if (qualifier === undefined) return false;
@@ -1558,6 +1569,244 @@ function astQueryStart(text: string, firstNodeStart: number): number {
 }
 
 function bindAstRelation(
+  relation: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): RelationBinding {
+  const version = astChild(relation, 'version');
+  if (version) analyzeAstScopedExpression(version, astInputScope(version, scope, context), ctes, context);
+  let binding = bindAstRelationSource(relation, scope, ctes, context);
+  const sample = astChild(relation, 'sample');
+  if (sample) {
+    const input = astInputScope(sample, scope, context, [binding]);
+    for (const child of astExpressionChildren(sample)) {
+      analyzeAstScopedExpression(astAsColumnReference(child), input, ctes, context);
+    }
+  }
+  for (const pivot of astChildren(relation, 'pivots')) binding = bindAstPivot(pivot, binding, scope, ctes, context);
+  return binding;
+}
+
+function bindAstPivot(
+  pivot: SqlAstNode,
+  binding: RelationBinding,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): RelationBinding {
+  const input = astInputScope(pivot, scope, context, [binding]);
+  const expressions = astChildren(pivot, 'expressions');
+  const fields = astChildren(pivot, 'fields');
+  const consumed = new Set<string>();
+  const consume = (node: SqlAstNode): void => {
+    analyzeAstScopedExpression(node, input, ctes, context);
+    for (const column of [node, ...collectAstNodes(node, (candidate) => candidate.role === 'column')]
+      .filter((candidate) => candidate.role === 'column')) {
+      const resolved = resolveAstColumnPath(input, astColumnPath(column), context.dialect);
+      if (resolved.rootColumn) consumed.add(resolved.rootColumn.normalizedName);
+    }
+  };
+  const generated: SchemaColumn[] = [];
+  if (pivot.args.unpivot === true) {
+    const outputs = expressions.flatMap(astTupleItems);
+    const sourceRows = fields.flatMap((field) => astChildren(field, 'expressions')).map((value) => (
+      astTupleItems(value.kind === 'pivotAlias' ? astChild(value, 'this') ?? value : value)
+    ));
+    for (const row of sourceRows) for (const value of row) consume(value);
+    for (const field of fields) {
+      const name = astChild(field, 'this');
+      if (name) generated.push(astGeneratedColumn(name.name, dataTypeFromFamily('string'), name, [], context));
+    }
+    outputs.forEach((output, index) => {
+      const values = sourceRows.flatMap((row) => row[index] ? [row[index]!] : []);
+      const dataType = commonAstDataType(values.map((value) => inferAstExpressionType(value, input, context)));
+      generated.push(astGeneratedColumn(output.name, dataType, output,
+        values.flatMap((value) => expressionDefinitions(value, input, context)), context));
+    });
+  } else {
+    for (const expression of expressions) consume(expression);
+    for (const field of fields) consume(field);
+    // sqlingo supplies dialect-specific output names, including multi-aggregate
+    // suffixes and explicit IN aliases. Their synthetic nodes have no source span.
+    const names = astChildren(pivot, 'columns');
+    const values = fields.flatMap((field) => astChildren(field, 'expressions'));
+    const aggregateColumns = deriveAstProjectionColumns(expressions, input, context);
+    names.forEach((name, index) => {
+      const aggregateIndex = index % Math.max(expressions.length, 1);
+      const expression = expressions[aggregateIndex];
+      const value = values[Math.floor(index / Math.max(expressions.length, 1))];
+      const declaration = value ? astAliasIdentifier(value) ?? value : pivot;
+      const dataType = aggregateColumns[aggregateIndex]?.dataType ?? UNKNOWN_DATA_TYPE;
+      generated.push(astGeneratedColumn(name.name, dataType, declaration,
+        expression ? expressionDefinitions(expression, input, context) : [], context));
+    });
+  }
+  const columns = [...binding.columns.filter((column) => !consumed.has(column.normalizedName)), ...generated];
+  return pivot.alias ? astDerivedBinding(pivot, columns, context, binding.unresolved)
+    : { ...binding, columns, kind: 'derived-table' };
+}
+
+function astTupleItems(node: SqlAstNode): readonly SqlAstNode[] {
+  return node.kind === 'tuple' ? astChildren(node, 'expressions') : [node];
+}
+
+function astGeneratedColumn(
+  name: string,
+  dataType: SqlDataType,
+  declaration: SqlAstNode,
+  origins: readonly SqlSymbolDefinition[],
+  context: AstModelContext,
+): SchemaColumn {
+  const selection = astProjectionSelection(declaration) ?? declaration;
+  const definitions = deduplicateDefinitions([
+    symbolDefinition('generator-column', name, '', declaration.start, declaration.end, selection),
+    ...origins,
+  ]);
+  if (declaration.name === name) {
+    appendSymbol(context, {
+      reference: selection,
+      kind: 'generator-column',
+      name,
+      dataType,
+      type: displaySqlDataType(dataType),
+      definitions: origins,
+    });
+  }
+  return renameVirtualColumn(name, virtualColumn(name, dataTypeFamily(dataType), displaySqlDataType(dataType), dataType), context.dialect, definitions);
+}
+
+function bindAstMatchRecognize(
+  match: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): RelationBinding {
+  const input = astInputScope(match, scope, context);
+  const partition = astChildren(match, 'partitionBy');
+  for (const column of partition) analyzeAstScopedExpression(column, input, ctes, context);
+  const order = astChild(match, 'order');
+  if (order) analyzeAstScopedExpression(order, input, ctes, context);
+  const definitions = astChildren(match, 'define');
+  const pattern = astChild(match, 'pattern');
+  // The parser represents the pattern grammar as a Var. Lex only that parsed
+  // payload, never the surrounding SQL, to discover even implicitly true variables.
+  const names = new Set(lexSql(pattern?.name ?? '', context.dialect)
+    .filter((token) => token.channel === 0 && /identifier/iu.test(token.symbolicName))
+    .map((token) => unquoteIdentifier(token.text)));
+  for (const definition of definitions) names.add(definition.alias);
+  const columns = input.relations.flatMap((relation) => relation.columns);
+  const variables: RelationBinding[] = [...names].filter(Boolean).map((name) => {
+    const definition = definitions.find((item) => normalizeBareIdentifier(item.alias, context.dialect)
+      === normalizeBareIdentifier(name, context.dialect));
+    const identifier = definition ? astAliasIdentifier(definition) : undefined;
+    return {
+      name,
+      aliases: [normalizeBareIdentifier(name, context.dialect)],
+      columns,
+      unresolved: input.relations.some((relation) => relation.unresolved),
+      qualifiedOnly: true,
+      kind: 'derived-table',
+      definitions: identifier ? [symbolDefinition('relation-alias', name, '', identifier.start, identifier.end)] : [],
+    };
+  });
+  const patternScope: AstScope = {
+    ...input, relations: [...variables, ...input.relations], localFunctions: rowPatternFunctions(context.dialect),
+  };
+  for (const definition of definitions) {
+    analyzeAstScopedExpression(definition, astInputScope(definition, patternScope, context), ctes, context);
+  }
+  const measures = astChildren(match, 'measures').flatMap((measure) => {
+    const expression = astChild(measure, 'this');
+    return expression ? [expression] : [];
+  });
+  for (const measure of measures) {
+    analyzeAstScopedExpression(measure, astInputScope(measure, patternScope, context), ctes, context);
+  }
+  const measureColumns = deriveAstProjectionColumns(measures, patternScope, context);
+  const allRows = astChild(match, 'rows')?.name.toLocaleUpperCase().startsWith('ALL ROWS') ?? false;
+  const partitionColumns = deriveAstProjectionColumns(partition, input, context);
+  const orderColumns = allRows && order ? deriveAstProjectionColumns(astChildren(order, 'expressions').flatMap((item) => {
+    const expression = astChild(item, 'this');
+    return expression ? [expression] : [];
+  }), input, context) : [];
+  const keys = new Set([...partitionColumns, ...orderColumns].map((column) => column.normalizedName));
+  const output = [
+    ...partitionColumns,
+    ...orderColumns.filter((column) => !partitionColumns.some((part) => part.normalizedName === column.normalizedName)),
+    ...measureColumns,
+    ...(allRows ? columns.filter((column) => !keys.has(column.normalizedName)) : []),
+  ];
+  return astDerivedBinding(match, output, context, input.relations.some((relation) => relation.unresolved));
+}
+
+function rowPatternFunctions(dialect: SqlDialect): ReadonlyMap<string, SqlFunctionDefinition> {
+  const navigation: SqlFunctionDefinition[] = ['first', 'last', 'prev', 'next'].map((name) => ({
+    name: name.toLocaleUpperCase(), aliases: [], kind: 'window', signatureSource: 'explicit',
+    signatures: [{ parameters: [{ type: 'ANY' }, { type: 'NUMBER', optional: true }], returns: { kind: 'argument', index: 0 } }],
+  }));
+  if (dialect === 'trino') {
+    for (const [name, type] of [['classifier', 'VARCHAR'], ['match_number', 'BIGINT']]) {
+      navigation.push({ name: name!.toLocaleUpperCase(), aliases: [], kind: 'window', signatureSource: 'explicit',
+        signatures: [{ parameters: [], returns: { kind: 'fixed', type: type! } }],
+      });
+    }
+  }
+  return new Map(navigation.map((definition) => [definition.name.toLocaleLowerCase(), definition]));
+}
+
+/** Capture visibility at a clause boundary, before subsequent relations/aliases exist. */
+function astInputScope(
+  node: SqlAstNode,
+  scope: AstScope,
+  context: AstModelContext,
+  relations: readonly RelationBinding[] = scope.relations,
+): AstScope {
+  const input: AstScope = {
+    ...scope,
+    start: node.start,
+    end: node.end,
+    depth: scope.depth + 1,
+    relations: [...relations],
+    projectionAliases: new Set(),
+    projectionColumns: new Map(),
+  };
+  context.scopes.push(input);
+  return input;
+}
+
+function astAsColumnReference(node: SqlAstNode): SqlAstNode {
+  return node.role === 'identifier' ? { ...node, role: 'column', kind: 'column', args: { this: node } } : node;
+}
+
+function appendAstRelation(
+  relation: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): RelationBinding {
+  const binding = bindAstRelation(relation, scope, ctes, context);
+  scope.relations.push(binding);
+  for (const join of astChildren(relation, 'joins')) appendAstJoin(join, scope, ctes, context);
+  return binding;
+}
+
+function appendAstJoin(
+  join: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): void {
+  const relation = astChild(join, 'this');
+  if (!relation) return;
+  const left = [...scope.relations];
+  const binding = appendAstRelation(relation, scope, ctes, context);
+  if (context.validate) validateAstUsing(join, left, binding, context);
+  const on = astChild(join, 'on');
+  if (on) analyzeAstScopedExpression(on, astInputScope(on, scope, context), ctes, context);
+}
+
+function bindAstRelationSource(
   relation: SqlAstNode,
   scope: AstScope,
   ctes: ReadonlyMap<string, RelationBinding>,
@@ -1705,6 +1954,8 @@ function bindAstExpansion(
   ctes: ReadonlyMap<string, RelationBinding>,
   context: AstModelContext,
 ): RelationBinding {
+  const windowTable = bindAstWindowTable(source, relation, scope, ctes, context);
+  if (windowTable) return windowTable;
   if (context.validate) validateAstExpression(source, scope, ctes, context);
   else collectAstReferences(source, context);
   const functionName = normalizeBareIdentifier(astFunctionName(source, context.text), context.dialect).replace(/^!/u, '');
@@ -1910,6 +2161,79 @@ function bindAstExpansion(
   return binding;
 }
 
+function bindAstWindowTable(
+  source: SqlAstNode,
+  relation: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): RelationBinding | undefined {
+  if (context.dialect !== 'flink') return undefined;
+  const call = astFunctionName(source, context.text).toLocaleLowerCase() === 'table'
+    ? astChildren(source, 'expressions')[0] : source;
+  if (!call || !['tumble', 'hop', 'cumulate', 'session'].includes(astFunctionName(call, context.text).toLocaleLowerCase())) {
+    return undefined;
+  }
+  const name = astFunctionName(call, context.text).toLocaleLowerCase();
+  const parameters = name === 'hop' ? ['data', 'timecol', 'slide', 'size', 'offset']
+    : name === 'cumulate' ? ['data', 'timecol', 'step', 'size', 'offset']
+      : name === 'session' ? ['data', 'timecol', 'gap'] : ['data', 'timecol', 'size', 'offset'];
+  const rawArgs = astChildren(call, 'expressions');
+  const args: Array<SqlAstNode | undefined> = [];
+  rawArgs.forEach((argument, index) => {
+    const slot = argument.kind === 'kwarg' ? parameters.indexOf(astChild(argument, 'this')?.name.toLocaleLowerCase() ?? '') : index;
+    if (slot < 0 || args[slot]) {
+      if (context.validate) appendAstIssue(context, argument, 'function-argument-count', `Invalid or duplicate ${name} argument.`);
+    } else args[slot] = argument.kind === 'kwarg' ? astChild(argument, 'expression') : argument;
+  });
+  const inputNode = args[0];
+  const inputScope = astInputScope(call, scope, context, []);
+  if (!inputNode || (inputNode.role !== 'table' && inputNode.role !== 'subquery')) return undefined;
+  const input = appendAstRelation(inputNode, inputScope, ctes, context);
+  for (const partition of astChildren(inputNode, 'partitionBy')) {
+    analyzeAstScopedExpression(partition, inputScope, ctes, context);
+  }
+  const descriptor = args[1];
+  const timeColumns = descriptor && astFunctionName(descriptor, context.text).toLocaleLowerCase() === 'descriptor'
+    ? astChildren(descriptor, 'expressions') : [];
+  for (const column of timeColumns) analyzeAstScopedExpression(column, inputScope, ctes, context);
+  for (const argument of args.slice(2)) {
+    if (!argument) continue;
+    analyzeAstScopedExpression(argument, inputScope, ctes, context);
+    const type = inferAstExpressionType(argument, inputScope, context);
+    if (context.validate && type.kind !== 'unknown' && !isIntervalDataType(type)) {
+      appendAstIssue(context, argument, 'function-argument-type', `${name} window sizes and offsets must be intervals.`);
+    }
+  }
+  const required = name === 'hop' || name === 'cumulate' ? 4 : 3;
+  if (context.validate && (Array.from({ length: required }, (_unused, index) => args[index]).some((arg) => !arg)
+    || rawArgs.length > parameters.length)) {
+    appendAstIssue(context, call, 'function-argument-count', `${name} expects ${required} required argument(s).`);
+  }
+  let timeType = timeColumns[0] ? inferAstExpressionType(timeColumns[0], inputScope, context) : UNKNOWN_DATA_TYPE;
+  if (context.validate && (timeColumns.length !== 1
+    || (timeType.kind !== 'unknown' && dataTypeFamily(timeType) !== 'time'))) {
+    appendAstIssue(context, descriptor ?? call, 'function-argument-type', `${name} expects a descriptor of one timestamp column.`);
+    timeType = UNKNOWN_DATA_TYPE;
+  }
+  const origins = timeColumns.flatMap((column) => expressionDefinitions(column, inputScope, context));
+  const columns = [...input.columns, ...['window_start', 'window_end', 'window_time'].map((name) => (
+    astGeneratedColumn(name, name === 'window_time' ? timeType : parseSqlDataType('TIMESTAMP(3)', context.dialect), call, origins, context)
+  ))];
+  for (const node of new Set([source, call, ...(descriptor ? [descriptor] : [])])) {
+    appendSymbol(context, {
+      reference: { start: node.nameStart, end: node.nameEnd },
+      kind: 'function',
+      name: astFunctionName(node, context.text),
+      dataType: { kind: 'struct', fields: columns, recordKind: 'row' },
+      functionCategory: 'builtin',
+      dialect: context.dialect,
+      definitions: [],
+    });
+  }
+  return astDerivedBinding(relation, columns, context, input.unresolved);
+}
+
 function astJsonTableColumns(schema: SqlAstNode, dialect: SqlDialect): SchemaColumn[] {
   return astChildren(schema, 'expressions').flatMap((definition) => {
     const nested = astChild(definition, 'nestedSchema');
@@ -1996,7 +2320,7 @@ function validateAstExpression(
   context: AstModelContext,
   environment: AstTypeEnvironment = EMPTY_AST_TYPE_ENVIRONMENT,
 ): void {
-  if (overlapsAny({ start: node.start, end: node.end }, context.placeholderRanges)) return;
+  if (astHasDynamicReference(node, context)) return;
   if (isAstQueryNode(node)) {
     analyzeAstQuery(node, context, scope, ctes);
     return;
@@ -2020,11 +2344,12 @@ function validateAstExpression(
       return;
     }
   }
-  if (node.role === 'function' || node.role === 'unnest') {
+  if ((node.role === 'function' || node.role === 'unnest')
+    && !overlapsAny({ start: node.nameStart, end: node.nameEnd }, context.placeholderRanges)) {
     const name = astFunctionName(node, context.text).replace(/^!/u, '');
     const normalized = normalizeQualifiedName(name, context.dialect);
     const category = context.udfs.has(normalized) ? 'udf' : 'builtin';
-    const definition = category === 'builtin' ? findAstFunctionDefinition(normalized, context) : undefined;
+    const definition = category === 'builtin' ? findAstFunctionDefinition(normalized, context, scope) : undefined;
     const knownFunction = context.functions.has(normalized) || Boolean(definition);
     const dataType = inferAstExpressionType(node, scope, context, environment);
     if (knownFunction) {
@@ -2059,7 +2384,7 @@ function validateAstExpression(
   }
   if (validateAstHigherOrderExpression(node, scope, ctes, context, environment)) return;
   if (node.kind === 'dot') validateAstNestedField(node, scope, context, environment);
-  forEachAstChild(node, (child) => validateAstExpression(child, scope, ctes, context, environment));
+  for (const child of astExpressionChildren(node)) validateAstExpression(child, scope, ctes, context, environment);
 }
 
 function validateAstColumn(node: SqlAstNode, scope: AstScope, context: AstModelContext): void {
@@ -2147,6 +2472,7 @@ function resolveAstColumnPath(
         : { status: 'found' };
     }
     const matches = current.relations.flatMap((binding) => {
+      if (binding.qualifiedOnly) return [];
       const column = findColumn(binding.columns, name, dialect);
       return column ? [{ binding, column }] : [];
     });
@@ -2173,7 +2499,7 @@ function resolveAstColumnPath(
           };
     }
     if (matches.length > 1) return { status: 'ambiguous', candidates: matches, relationPrefixLength: 0 };
-    if (current.relations.some((binding) => binding.unresolved)) return { status: 'unresolved' };
+    if (current.relations.some((binding) => binding.unresolved && !binding.qualifiedOnly)) return { status: 'unresolved' };
   }
   return parts.length > 1
     ? { status: 'missing-qualifier', qualifier: parts.slice(0, -1).join('.') }
@@ -2248,6 +2574,7 @@ function deriveAstProjectionColumns(
   const columns: SchemaColumn[] = [];
   for (const projection of projections) {
     const expression = projection.role === 'alias' ? astChild(projection, 'this') ?? projection : projection;
+    if (astHasDynamicReference(astAliasIdentifier(projection) ?? expression, context)) continue;
     const qualifier = astProjectionWildcardQualifier(expression);
     if (qualifier !== undefined) {
       const relations = qualifier
@@ -2273,7 +2600,9 @@ function deriveAstProjectionColumns(
       name,
       virtualColumn(name, dataTypeFamily(dataType), '', dataType),
       context.dialect,
-      [definition],
+      !aliasIdentifier && expression.role === 'column'
+        ? expressionDefinitions(expression, scope, context)
+        : [definition],
     );
     columns.push(output);
     if (aliasIdentifier) {
@@ -2296,6 +2625,10 @@ function inferAstExpressionType(
   context: AstModelContext,
   environment: AstTypeEnvironment = EMPTY_AST_TYPE_ENVIRONMENT,
 ): SqlDataType {
+  if (astHasDynamicReference(node, context)) return UNKNOWN_DATA_TYPE;
+  if (node.role === 'function' && overlapsAny({ start: node.nameStart, end: node.nameEnd }, context.placeholderRanges)) {
+    return UNKNOWN_DATA_TYPE;
+  }
   if (node.role === 'subquery') {
     const inner = astChild(node, 'this');
     const result = context.queryResults.get(node) ?? (inner ? context.queryResults.get(inner) : undefined);
@@ -2483,7 +2816,7 @@ function inferAstExpressionType(
   ].includes(node.kind)) {
     return dataTypeFromFamily('boolean');
   }
-  const definition = findAstFunctionDefinition(normalizedFunction, context);
+  const definition = findAstFunctionDefinition(normalizedFunction, context, scope);
   if (definition) {
     return inferAstFunctionDefinitionType(node, definition, scope, context, environment);
   }
@@ -2531,7 +2864,10 @@ interface AstFunctionSignatureResolution {
 function findAstFunctionDefinition(
   normalizedName: string,
   context: AstModelContext,
+  scope?: AstScope,
 ): SqlFunctionDefinition | undefined {
+  const local = scope?.localFunctions?.get(normalizedName);
+  if (local) return local;
   return context.functionDefinitions.get(normalizedName)
     ?? context.functionDefinitions.get(normalizedName.split('.').at(-1) ?? normalizedName);
 }
@@ -3067,36 +3403,21 @@ function analyzeAstInsert(
   const targetNode = astChild(insert, 'this');
   const targetTable = targetNode?.role === 'schema' ? astChild(targetNode, 'this') : targetNode;
   const directoryTarget = targetTable?.kind === 'directory';
+  const scope = createAstMutationScope(insert);
+  context.scopes.push(scope);
+  const binding = targetTable && !directoryTarget ? appendAstRelation(targetTable, scope, ctes, context) : undefined;
   const targetName = targetTable && !directoryTarget ? astTableName(targetTable) : '';
-  const target = targetName ? resolveSchemaTable(context.snapshot, targetName, context.dialect) : { status: 'missing' as const };
-  if (targetTable && target.status === 'found' && target.table) {
-    const binding: RelationBinding = {
-      name: target.table.name,
-      aliases: astRelationAliases(targetTable, targetName, context.dialect, false),
-      columns: target.table.columns,
-      unresolved: false,
-      kind: target.table.kind,
-      definitions: target.table.definitions,
-      targetDefinitions: target.table.definitions,
-    };
-    appendRelationReference(
-      targetTable,
-      targetName,
-      binding,
-      target.table.definitions ?? [],
-      context,
-      target.table.name,
-    );
-  }
-  if (context.validate && targetName && target.status !== 'found') {
-    appendAstIssue(context, targetTable ?? insert,
-      target.status === 'ambiguous' ? 'ambiguous-table' : 'unknown-table',
-      target.status === 'ambiguous' ? `Table reference ${targetName} is ambiguous in the configured schema.` : `Unknown table ${targetName}.`);
-  }
+  const target = binding && !binding.dynamic
+    ? resolveSchemaTable(context.snapshot, targetName, context.dialect)
+    : { status: 'missing' as const };
   const source = astChild(insert, 'expression');
   const sourceColumns = source ? analyzeAstQuery(source, context, undefined, ctes).columns : [];
-  if (directoryTarget) return sourceColumns;
-  if (!context.validate || target.status !== 'found' || !target.table) return sourceColumns;
+  const conflict = astChild(insert, 'conflict');
+  if (conflict) analyzeAstConflict(conflict, scope, source, ctes, context);
+  const returning = analyzeAstMutationClauses(insert, scope, ctes, context);
+  const resultColumns = astChild(insert, 'returning') ? returning : sourceColumns;
+  if (directoryTarget) return resultColumns;
+  if (!context.validate || target.status !== 'found' || !target.table) return resultColumns;
 
   const explicit = targetNode?.role === 'schema' ? astChildren(targetNode, 'expressions') : [];
   const staticPartitionColumns = targetTable
@@ -3152,7 +3473,7 @@ function analyzeAstInsert(
         `Cannot assign ${actual.typeFamily} value to ${expected.name} (${expected.type || expected.typeFamily}).`);
     }
   }
-  return sourceColumns;
+  return resultColumns;
 }
 
 function astStaticPartitionColumns(table: SqlAstNode, dialect: SqlDialect): string[] {
@@ -3169,52 +3490,58 @@ function analyzeAstUpdate(
   update: SqlAstNode,
   context: AstModelContext,
   ctes: ReadonlyMap<string, RelationBinding>,
-): void {
+): SchemaColumn[] {
   const table = astChild(update, 'this');
-  if (!table) return;
+  if (!table) return [];
   const scope = createAstMutationScope(update);
   context.scopes.push(scope);
-  scope.relations.push(bindAstRelation(table, scope, ctes, context));
+  const target = appendAstRelation(table, scope, ctes, context);
+  const targets = context.dialect === 'mysql'
+    ? scope.relations.filter((binding) => binding.kind === 'table' || binding.kind === 'view')
+    : [target];
+  const from = astChild(update, 'from');
+  const source = from ? astChild(from, 'this') : undefined;
+  if (source) appendAstRelation(source, scope, ctes, context);
+  for (const join of astChildren(update, 'joins')) appendAstJoin(join, scope, ctes, context);
+  const targetScope = { ...scope, relations: targets };
   for (const assignment of astChildren(update, 'expressions')) {
-    analyzeAstMutationAssignment(assignment, scope, scope, ctes, context);
+    analyzeAstMutationAssignment(assignment, targetScope, scope, ctes, context);
   }
-  const where = astChild(update, 'where');
-  if (where) analyzeAstScopedExpression(where, scope, ctes, context);
+  return analyzeAstMutationClauses(update, scope, ctes, context);
 }
 
 function analyzeAstDelete(
   deleteNode: SqlAstNode,
   context: AstModelContext,
   ctes: ReadonlyMap<string, RelationBinding>,
-): void {
+): SchemaColumn[] {
   const scope = createAstMutationScope(deleteNode);
   context.scopes.push(scope);
   const target = astChild(deleteNode, 'this');
-  if (target) scope.relations.push(bindAstRelation(target, scope, ctes, context));
-  for (const relation of [
-    ...astChildren(deleteNode, 'using'),
-    ...astChildren(deleteNode, 'tables'),
-  ]) {
-    if (relation !== target) scope.relations.push(bindAstRelation(relation, scope, ctes, context));
+  if (target) appendAstRelation(target, scope, ctes, context);
+  for (const relation of astChildren(deleteNode, 'using')) {
+    if (relation !== target) appendAstRelation(relation, scope, ctes, context);
   }
-  for (const key of ['where', 'returning', 'order', 'limit', 'cluster'] as const) {
-    const clause = astChild(deleteNode, key);
-    if (clause) analyzeAstScopedExpression(clause, scope, ctes, context);
+  for (const reference of astChildren(deleteNode, 'tables')) {
+    const name = astTableName(reference);
+    const binding = scope.relations.find((candidate) => bindingMatchesQualifier(candidate, name, context.dialect));
+    if (binding) appendRelationReference(reference, name, binding, binding.definitions ?? [], context);
+    else if (context.validate) appendAstIssue(context, reference, 'unknown-qualifier', `Unknown deletion target ${name}.`);
   }
+  return analyzeAstMutationClauses(deleteNode, scope, ctes, context);
 }
 
 function analyzeAstMerge(
   merge: SqlAstNode,
   context: AstModelContext,
   ctes: ReadonlyMap<string, RelationBinding>,
-): void {
+): SchemaColumn[] {
   const scope = createAstMutationScope(merge);
   context.scopes.push(scope);
   const targetNode = astChild(merge, 'this');
-  const targetBinding = targetNode ? bindAstRelation(targetNode, scope, ctes, context) : undefined;
-  if (targetBinding) scope.relations.push(targetBinding);
+  const targetBinding = targetNode ? appendAstRelation(targetNode, scope, ctes, context) : undefined;
   const sourceNode = astChild(merge, 'using');
-  if (sourceNode) scope.relations.push(bindAstRelation(sourceNode, scope, ctes, context));
+  if (sourceNode) appendAstRelation(sourceNode, scope, ctes, context);
 
   const on = astChild(merge, 'on');
   if (on) analyzeAstScopedExpression(on, scope, ctes, context);
@@ -3236,8 +3563,7 @@ function analyzeAstMerge(
       analyzeAstMergeInsert(action, targetScope, scope, ctes, context);
     }
   }
-  const returning = astChild(merge, 'returning');
-  if (returning) analyzeAstScopedExpression(returning, scope, ctes, context);
+  return analyzeAstMutationClauses(merge, scope, ctes, context);
 }
 
 function createAstMutationScope(node: SqlAstNode): AstScope {
@@ -3251,12 +3577,59 @@ function createAstMutationScope(node: SqlAstNode): AstScope {
   };
 }
 
+function analyzeAstMutationClauses(
+  node: SqlAstNode,
+  scope: AstScope,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): SchemaColumn[] {
+  for (const key of ['where', 'returning', 'order', 'limit', 'offset', 'cluster']) {
+    const clause = astChild(node, key);
+    if (clause) analyzeAstScopedExpression(clause, astInputScope(clause, scope, context), ctes, context);
+  }
+  const returning = astChild(node, 'returning');
+  return returning ? deriveAstProjectionColumns(astChildren(returning, 'expressions'), scope, context) : [];
+}
+
+function analyzeAstConflict(
+  conflict: SqlAstNode,
+  targetScope: AstScope,
+  source: SqlAstNode | undefined,
+  ctes: ReadonlyMap<string, RelationBinding>,
+  context: AstModelContext,
+): void {
+  for (const key of astChildren(conflict, 'conflictKeys')) {
+    const input = astInputScope(key, targetScope, context);
+    analyzeAstScopedExpression(astAsColumnReference(key), input, ctes, context);
+  }
+  const indexPredicate = astChild(conflict, 'indexPredicate');
+  if (indexPredicate) analyzeAstScopedExpression(indexPredicate, astInputScope(indexPredicate, targetScope, context), ctes, context);
+  const values = astInputScope(conflict, targetScope, context);
+  if (context.dialect === 'postgresql') {
+    const target = targetScope.relations[0];
+    if (target) values.relations.push({
+      ...target, name: 'excluded', aliases: ['excluded'], qualifiedOnly: true,
+    });
+  } else if (context.dialect === 'mysql' && source) {
+    const sourceScope = context.queryResults.get(source)?.scope;
+    values.relations.push(...(sourceScope?.relations ?? []).map((binding) => ({ ...binding, qualifiedOnly: true })));
+  }
+  for (const assignment of astChildren(conflict, 'expressions')) {
+    analyzeAstMutationAssignment(assignment, targetScope, values, ctes, context);
+  }
+  const predicate = astChild(conflict, 'where');
+  if (predicate) analyzeAstScopedExpression(predicate, values, ctes, context);
+}
+
 function analyzeAstScopedExpression(
   node: SqlAstNode,
   scope: AstScope,
   ctes: ReadonlyMap<string, RelationBinding>,
   context: AstModelContext,
 ): void {
+  // Scope construction must not depend on diagnostics being enabled. Otherwise
+  // completion inside a clause subquery sees the containing statement's tables.
+  analyzeAstNestedQueries(node, scope, ctes, context);
   if (context.validate) validateAstExpression(node, scope, ctes, context);
   else collectAstReferences(node, context);
 }
@@ -3271,8 +3644,8 @@ function analyzeAstMutationAssignment(
   const target = astChild(assignment, 'this');
   const value = astChild(assignment, 'expression');
   if (!target || !value) return;
-  analyzeAstScopedExpression(target, targetScope, ctes, context);
-  analyzeAstScopedExpression(value, valueScope, ctes, context);
+  analyzeAstScopedExpression(target, astInputScope(target, targetScope, context), ctes, context);
+  analyzeAstScopedExpression(value, astInputScope(value, valueScope, context), ctes, context);
   if (!context.validate || target.role !== 'column') return;
   const expected = resolveAstColumnPath(targetScope, astColumnPath(target), context.dialect).column;
   if (expected) validateAstStoreAssignment(expected, value, valueScope, context);
@@ -3289,8 +3662,8 @@ function analyzeAstMergeInsert(
   const valueTuple = astChild(insert, 'expression');
   const targets = targetTuple ? astChildren(targetTuple, 'expressions') : [];
   const values = valueTuple ? astChildren(valueTuple, 'expressions') : [];
-  for (const target of targets) analyzeAstScopedExpression(target, targetScope, ctes, context);
-  for (const value of values) analyzeAstScopedExpression(value, valueScope, ctes, context);
+  for (const target of targets) analyzeAstScopedExpression(target, astInputScope(target, targetScope, context), ctes, context);
+  for (const value of values) analyzeAstScopedExpression(value, astInputScope(value, valueScope, context), ctes, context);
   if (!context.validate) return;
   if (targets.length !== values.length) {
     appendAstIssue(context, valueTuple ?? insert, 'insert-column-count',
@@ -3368,12 +3741,12 @@ function deriveAstValuesColumns(node: SqlAstNode, context: AstModelContext, scop
 }
 
 function collectAstReferences(node: SqlAstNode, context: AstModelContext): void {
-  if (overlapsAny({ start: node.start, end: node.end }, context.placeholderRanges)) return;
+  if (astHasDynamicReference(node, context)) return;
   if (node.role === 'column') {
     context.references.push(astIdentifierReference(node));
     return;
   }
-  forEachAstChild(node, (child) => collectAstReferences(child, context));
+  for (const child of astExpressionChildren(node)) collectAstReferences(child, context);
 }
 
 function forEachAstChild(node: SqlAstNode, visit: (child: SqlAstNode) => void): void {
@@ -3415,6 +3788,12 @@ function astExpressionArguments(node: SqlAstNode): readonly SqlAstNode[] {
     seen.add(key);
     return true;
   });
+}
+
+/** A dynamic token makes that reference unknown, not its containing expression. */
+function astHasDynamicReference(node: SqlAstNode, context: AstModelContext): boolean {
+  return ['column', 'identifier', 'literal'].includes(node.role)
+    && overlapsAny(node, context.placeholderRanges);
 }
 
 function astSemanticArgumentStart(node: SqlAstNode): number {
@@ -3553,6 +3932,7 @@ function expressionDefinitions(
   scope: AstScope,
   context: AstModelContext,
 ): SqlSymbolDefinition[] {
+  if (astHasDynamicReference(node, context)) return [];
   if (node.role === 'column') {
     const resolution = resolveAstColumnPath(scope, astColumnPath(node), context.dialect);
     if (resolution.status === 'found') return [...(resolution.column?.definitions ?? [])];
@@ -3564,7 +3944,8 @@ function expressionDefinitions(
     const inner = astChild(node, 'this');
     return inner ? expressionDefinitions(inner, scope, context) : [];
   }
-  return [];
+  if (isAstQueryNode(node)) return context.queryResults.get(node)?.columns.flatMap((column) => column.definitions ?? []) ?? [];
+  return deduplicateDefinitions(astExpressionChildren(node).flatMap((child) => expressionDefinitions(child, scope, context)));
 }
 
 function astTableName(node: SqlAstNode): string {
@@ -3703,7 +4084,7 @@ function astDataTypeText(node: SqlAstNode): string {
   const nested = astChildren(node, 'expressions');
   const base = node.name || astPrimitiveString(node.args.this);
   if (nested.length === 0) return base;
-  const delimiter = base.toLocaleLowerCase() === 'row' ? ['(', ')'] : ['<', '>'];
+  const delimiter = ['array', 'map', 'struct', 'multiset'].includes(base.toLocaleLowerCase()) ? ['<', '>'] : ['(', ')'];
   return `${base}${delimiter[0]}${nested.map(astDataTypeText).join(',')}${delimiter[1]}`;
 }
 

@@ -34,6 +34,7 @@ import '@hdnax/sqlingo.js/trino';
 
 import { maskPlaceholders } from './patterns';
 import type { SqlDialect } from './sql';
+import { FlinkDialect } from './sqlFlinkDialect';
 
 export type SqlAstRole =
   | 'alias'
@@ -83,13 +84,13 @@ export interface SqlAstNode {
 
 export interface ParsedSqlAst {
   readonly statements: readonly SqlAstNode[];
-  readonly parserDialect: 'hive' | 'mysql' | 'postgres' | 'spark' | 'trino';
+  readonly parserDialect: 'flink' | 'hive' | 'mysql' | 'postgres' | 'spark' | 'trino';
 }
 
 const DIALECT_CANDIDATES: Record<SqlDialect, readonly ParsedSqlAst['parserDialect'][]> = {
   spark: ['spark'],
   hive: ['hive'],
-  flink: ['trino'],
+  flink: ['flink'],
   mysql: ['mysql'],
   postgresql: ['postgres'],
   trino: ['trino'],
@@ -124,7 +125,9 @@ function parseSqlAstInternal(
   if (/\bCREATE\s+[\p{L}_$]*\s*$/iu.test(masked)) return undefined;
   for (const parserDialect of DIALECT_CANDIDATES[dialect]) {
     try {
-      const statements = parse(maskSqlingoParserGaps(masked, parserDialect), { dialect: parserDialect });
+      const statements = parse(maskSqlingoParserGaps(masked, parserDialect), {
+        dialect: parserDialect === 'flink' ? FlinkDialect : parserDialect,
+      });
       if (!allowCommands && statements.some((statement) => statement instanceof CommandExpr)) continue;
       return {
         statements: statements.flatMap((statement) => (
@@ -160,6 +163,32 @@ export function astChild(node: SqlAstNode, key: string): SqlAstNode | undefined 
 export function astChildren(node: SqlAstNode, key: string): readonly SqlAstNode[] {
   const value = node.args[key];
   return Array.isArray(value) ? value.filter(isSqlAstNode) : [];
+}
+
+export type SqlAstArgumentRole = 'expression' | 'projection' | 'relation' | 'query' | 'declaration' | 'type';
+
+/** The meaning of an AST slot, independent of a parser's expression class. */
+export function astArgumentRole(node: SqlAstNode, key: string): SqlAstArgumentRole {
+  if (key === 'alias' || key === 'with' || key === 'pattern' || key === 'subsets') return 'declaration';
+  if (node.kind === 'kwarg' && key === 'this') return 'declaration';
+  if (key === 'to' || (key === 'kind' && astChild(node, key)?.role === 'data-type')) return 'type';
+  if (node.role === 'data-type' || node.role === 'schema') return 'type';
+  if (key === 'expressions' && ['select', 'returning', 'pivot'].includes(node.kind)) return 'projection';
+  if ((node.kind === 'matchRecognizeMeasure' && key === 'this')
+    || (node.kind === 'matchRecognize' && key === 'define')) return 'projection';
+  if (node.kind === 'window' && key === 'this' && astChild(node, key)?.role === 'identifier') return 'declaration';
+  if (['from', 'joins', 'laterals', 'pivots', 'match'].includes(key)) return 'relation';
+  if (node.role === 'subquery' && key === 'this') return 'query';
+  return 'expression';
+}
+
+/** Walk expression slots only; relation/query owners supply their own scopes. */
+export function astExpressionChildren(node: SqlAstNode): readonly SqlAstNode[] {
+  return Object.entries(node.args).flatMap(([key, value]) => {
+    const role = astArgumentRole(node, key);
+    if (role !== 'expression' && role !== 'projection' && role !== 'query') return [];
+    return isSqlAstNode(value) ? [value] : Array.isArray(value) ? value.filter(isSqlAstNode) : [];
+  });
 }
 
 export function walkSqlAst(node: SqlAstNode, visit: (node: SqlAstNode) => void): void {
@@ -358,7 +387,9 @@ function normalizeValue(value: unknown): SqlAstValue {
 }
 
 function collectValueSpans(value: SqlAstValue): Array<{ start: number; end: number }> {
-  if (isSqlAstNode(value)) return [{ start: value.start, end: value.end }];
+  // Metadata-less leaves (notably data types) have an empty range, not a
+  // source token at offset zero. Only real source spans can bound a parent.
+  if (isSqlAstNode(value)) return value.end > value.start ? [{ start: value.start, end: value.end }] : [];
   if (Array.isArray(value)) return value.flatMap(collectValueSpans);
   return [];
 }

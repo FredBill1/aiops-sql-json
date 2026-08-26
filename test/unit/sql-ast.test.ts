@@ -7,7 +7,7 @@ import { astFunctionName, parseSqlAst, walkSqlAst, type SqlAstNode } from '../..
 const expectedParser: Record<SqlDialect, string> = {
   spark: 'spark',
   hive: 'hive',
-  flink: 'trino',
+  flink: 'flink',
   mysql: 'mysql',
   postgresql: 'postgres',
   trino: 'trino',

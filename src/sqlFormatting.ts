@@ -441,6 +441,10 @@ function annotateValueDepth(value: SqlAstValue, depth: number, tokens: Formattin
 }
 
 function countsAsExpression(node: SqlAstNode, tokens: readonly FormattingToken[]): boolean {
+  // Clause/list wrappers describe placement, not expression nesting. In
+  // particular ORDER + ORDERED inside OVER must not inflate a CASE's depth.
+  if (['from', 'where', 'having', 'qualify', 'group', 'order', 'ordered', 'sort',
+    'cluster', 'distribute', 'limit', 'offset', 'tableAlias', 'windowSpec'].includes(node.kind)) return false;
   if (isLogicalNode(node) || arithmeticNodeParts(node, tokens) || isGroupingExpression(node, tokens)) return false;
   return node.role === 'function' || node.role === 'unnest' || node.role === 'subquery'
     || node.role === 'expression';

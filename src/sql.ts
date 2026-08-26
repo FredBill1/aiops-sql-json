@@ -13,6 +13,7 @@ import type { ParserRuleContext, Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
 import {
+  astArgumentRole,
   isSqlAstNode,
   parseSqlAst,
   type ParsedSqlAst,
@@ -111,7 +112,7 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
 
   const hasUnmaskedTemplate = /\$\{|\$[\p{L}_]/u.test(masked);
   const fallbackAst = !hasUnmaskedTemplate
-    && (errors.length > 0 || hasParenthesizedAliasCandidate(antlrTokens))
+    && (errors.length > 0 || parseTree !== undefined || hasParenthesizedAliasCandidate(antlrTokens))
     ? parseSqlAst(text, dialect, placeholders)
     : undefined;
   const structuralIssues = findStructuralIssues(antlrTokens, parseTree, fallbackAst);
@@ -356,7 +357,7 @@ function findStructuralIssues(
 
   appendCteStructuralIssues(significant, issues, seen, statementStarts);
   appendAlterStructuralIssues(significant, issues, seen);
-  if (parseTree) appendStatementSeparatorIssues(parseTree, issues, seen);
+  if (parseTree) appendStatementSeparatorIssues(parseTree, issues, seen, ast);
   if (ast) appendAstStructuralIssues(ast, significant, issues, seen);
   return [...issues, ...findCaseStructuralIssues(significant)];
 }
@@ -423,6 +424,7 @@ function appendStatementSeparatorIssues(
   root: ParserRuleContext,
   issues: StructuralSqlIssue[],
   seen: Set<string>,
+  ast: ParsedSqlAst | undefined,
 ): void {
   const children = ((root as unknown as { children?: readonly RootContextChild[] }).children ?? [])
     .filter((child) => child.symbol === undefined && child.start && child.stop
@@ -430,7 +432,10 @@ function appendStatementSeparatorIssues(
     .sort((left, right) => left.start!.start - right.start!.start);
   let previous: RootContextChild | undefined;
   for (const child of children) {
-    if (previous && previous.stop?.text !== ';' && child.start!.start > previous.stop!.stop) {
+    const sameStatement = previous && ast?.statements.some((statement) => (
+      statement.start <= previous!.stop!.stop && statement.end > child.start!.start
+    ));
+    if (previous && !sameStatement && previous.stop?.text !== ';' && child.start!.start > previous.stop!.stop) {
       appendStructuralIssue(issues, seen, child.start!, 'Expected a semicolon between SQL statements.');
     }
     if (!previous || child.stop!.stop >= previous.stop!.stop) previous = child;
@@ -448,7 +453,8 @@ function appendAstStructuralIssues(
       && parent.kind === 'anonymous'
       && parent.name.replace(/^!/u, '').toLocaleLowerCase() === 'struct';
     if (node.role === 'alias'
-      && !(parent?.role === 'select' && argument === 'expressions')
+      && !(parent && argument && astArgumentRole(parent, argument) === 'projection')
+      && !(node.kind === 'pivotAlias' && parent?.kind === 'in' && argument === 'expressions')
       && !rowConstructorField) {
       const asToken = tokens.find((token) => token.start >= node.start && token.stop < node.end
         && structuralTokenName(token) === 'AS');

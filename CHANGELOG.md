@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.0.20
+
+- Fixed Hover and Go to Definition disappearing inside nested expressions when placeholders appeared earlier in a statement. AST source ranges now distinguish missing metadata from valid offset zero, and dynamic references no longer suppress unaffected operands or sibling diagnostics.
+- Unified CTE and set-operation scopes across queries and DML, preserving lexical visibility, first-branch output names, merged types and source definitions, and output-only resolution for set-operation `ORDER BY`. Nested expression subqueries now retain their own completion scopes in completion-only mode.
+- Extended shared semantic analysis to named `WINDOW`, `DISTRIBUTE BY`, `TABLESAMPLE`, relation-owned joins, `PIVOT`, `UNPIVOT`, and `MATCH_RECOGNIZE`, including separate input/output scopes, generated-column types and origins, and scoped pattern variables.
+- Separated writable DML targets from expression sources for `UPDATE FROM`, MySQL joined updates, and `MERGE`; added conflict keys and assignments, scoped PostgreSQL `EXCLUDED`, `RETURNING` outputs, and alias-based `DELETE` target resolution.
+- Added a local Flink parser adapter for `FOR SYSTEM_TIME AS OF`, relation-valued `TABLE` arguments, `DESCRIPTOR`, and window table functions without changing parser dependency versions. Window functions now expose input and generated columns with types, source definitions, and argument diagnostics.
+- Fixed false structural diagnostics for valid `WITH` DML statements and `MATCH_RECOGNIZE` aliases while retaining checks for missing statement separators and invalid scalar aliases.
+- Fixed expression-depth accounting in formatting so clause wrappers, including ordering inside window expressions, do not unnecessarily expand enclosing `CASE` expressions.
+
 ## 0.0.19
 
 - Fixed cross-dialect expression type inference for window functions, `DISTINCT` and ordered aggregates, scalar subqueries, unary and bitwise operators, string predicates and concatenation, and date, timestamp, and interval arithmetic.

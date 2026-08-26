@@ -1919,6 +1919,108 @@ SELECT id, amount FROM local_orders;`,
     );
   });
 
+  for (const dialect of ['spark', 'hive', 'flink', 'mysql', 'postgresql', 'trino', 'impala', 'generic']) {
+    for (const fileExtension of ['sql', 'sql.json']) {
+      test(`keeps ${dialect} placeholder operands navigable in .${fileExtension} in both Schema modes`, async () => {
+        const config = vscode.workspace.getConfiguration('aiopsSqlJson');
+        const ddlPath = path.join(temporaryDirectory, `model-${dialect}-${fileExtension}-ddl.sql`);
+        const ddlText = 'CREATE TABLE provider_readings (id INT, amount DOUBLE);';
+        await fs.writeFile(ddlPath, ddlText, 'utf8');
+        const ddlUri = vscode.Uri.file(ddlPath);
+        await config.update('dialect', dialect, vscode.ConfigurationTarget.Global);
+        await config.update('schemaFiles', [ddlPath], vscode.ConfigurationTarget.Global);
+        await config.update('schemaValidation.enabled', true, vscode.ConfigurationTarget.Global);
+        const sql = "-- 😀 boundary\r\nWITH earlier AS (SELECT '$batch' AS marker, id FROM provider_readings)\r\n"
+          + 'SELECT COALESCE(CAST(r.amount AS DOUBLE), 0) AS parsed, r.amount AS direct_value, r.missing\r\n'
+          + 'FROM provider_readings r JOIN earlier e ON r.id = e.id';
+        const document = await openFile(
+          `model-${dialect}.${fileExtension}`,
+          fileExtension === 'sql' ? sql : JSON.stringify({ querySql: sql }),
+        );
+        for (const completionOnly of [false, true]) {
+          await config.update('schemaValidation.completionOnly', completionOnly, vscode.ConfigurationTarget.Global);
+          for (const needle of ['amount AS DOUBLE', 'amount AS direct_value']) {
+            const offset = document.getText().indexOf(needle);
+            const hovers = await fixture.waitForHovers(document, offset, (items) => (
+              items.some((hover) => /amount/iu.test(hoverText(hover)) && /double/iu.test(hoverText(hover)))
+            ));
+            assert.ok(hovers.length > 0);
+            const definitions = await executeDefinitions(document, offset, (items) => (
+              items.some((definition) => definitionUri(definition).toString() === ddlUri.toString())
+            ));
+            const definition = definitions.find((item) => definitionUri(item).toString() === ddlUri.toString())!;
+            const target = definitionSelection(definition);
+            assert.equal(target.start.character, ddlText.indexOf('amount'));
+            assert.equal(target.end.character - target.start.character, 'amount'.length);
+          }
+          const completion = await waitForCompletionItems(document, document.getText().indexOf('r.amount') + 3,
+            (items) => items.some((item) => completionLabel(item) === 'amount'));
+          assert.ok(completion.some((item) => completionLabel(item) === 'amount'));
+          const diagnostics = await waitForDiagnostics(document.uri, (items) => completionOnly
+            ? !items.some((item) => item.source?.includes('SQL schema'))
+            : items.some((item) => item.code === 'unknown-column'));
+          assert.equal(diagnostics.some((item) => item.code === 'unknown-column'), !completionOnly);
+        }
+      });
+    }
+  }
+
+  for (const modelCase of [
+    {
+      dialect: 'flink',
+      sql: "SELECT window_start FROM TABLE(TUMBLE(TABLE provider_readings, DESCRIPTOR(ts), INTERVAL '1' HOUR)) w",
+      needle: 'ts)',
+      expectedField: 'ts',
+      completion: 'window_start',
+    },
+    {
+      dialect: 'postgresql',
+      sql: 'UPDATE provider_readings r SET amount = a.delta FROM provider_adjustments a WHERE r.id = a.id RETURNING r.amount',
+      needle: 'delta FROM',
+      expectedField: 'delta',
+      completion: 'delta',
+    },
+    {
+      dialect: 'trino',
+      sql: "SELECT x FROM provider_readings PIVOT (SUM(amount) FOR label IN ('x')) p",
+      needle: 'amount)',
+      expectedField: 'amount',
+      completion: 'x',
+    },
+    {
+      dialect: 'trino',
+      sql: 'SELECT measured FROM provider_readings MATCH_RECOGNIZE (PARTITION BY label ORDER BY ts MEASURES A.amount AS measured PATTERN (A) DEFINE A AS A.amount > 0) mr',
+      needle: 'amount AS measured',
+      expectedField: 'amount',
+      completion: 'measured',
+    },
+  ]) {
+    for (const fileExtension of ['sql', 'sql.json']) {
+      test(`shares ${modelCase.dialect} ${modelCase.completion} model outputs with .${fileExtension} providers`, async () => {
+        const ddlPath = path.join(temporaryDirectory, `output-${modelCase.completion}-${fileExtension}-ddl.sql`);
+        const ddlText = 'CREATE TABLE provider_readings (id INT, label VARCHAR(30), amount DOUBLE, ts TIMESTAMP(3));\n'
+          + 'CREATE TABLE provider_adjustments (id INT, delta DOUBLE);';
+        await fs.writeFile(ddlPath, ddlText, 'utf8');
+        const config = vscode.workspace.getConfiguration('aiopsSqlJson');
+        await config.update('dialect', modelCase.dialect, vscode.ConfigurationTarget.Global);
+        await config.update('schemaFiles', [ddlPath], vscode.ConfigurationTarget.Global);
+        await config.update('schemaValidation.enabled', true, vscode.ConfigurationTarget.Global);
+        const document = await openFile(`output-${modelCase.completion}.${fileExtension}`,
+          fileExtension === 'sql' ? modelCase.sql : JSON.stringify({ querySql: modelCase.sql }));
+        const offset = document.getText().indexOf(modelCase.needle);
+        await fixture.waitForHovers(document, offset, (items) => items.some((hover) => hoverText(hover).includes(modelCase.expectedField)));
+        const definitions = await executeDefinitions(document, offset);
+        assert.ok(definitions.some((definition) => definitionUri(definition).toString() === vscode.Uri.file(ddlPath).toString()));
+        const completionOffset = document.getText().indexOf(modelCase.completion) + 1;
+        const items = await waitForCompletionItems(document, completionOffset,
+          (candidates) => candidates.some((item) => completionLabel(item) === modelCase.completion));
+        assert.ok(items.some((item) => completionLabel(item) === modelCase.completion));
+        const diagnostics = await waitForDiagnostics(document.uri, (items) => items.length === 0);
+        assert.equal(diagnostics.length, 0);
+      });
+    }
+  }
+
   for (const dialectCase of schemaIndexDialectCases()) {
     test(`rebuilds the ${dialectCase.dialect} index after concurrent cross-file DDL changes and duplicate churn`, async () => {
       const schemaDirectoryName = `schema-index-${dialectCase.dialect}`;
