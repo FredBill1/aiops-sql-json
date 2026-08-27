@@ -4,48 +4,652 @@
     "url": "https://spark.apache.org/docs/4.2.0/sql-ref-functions-builtin.html",
     "sha256": "f046860e86bc50b62ef81c3f947e1a90fb39e4a740c7c4f14449c9c7b0f692e9",
     "extraction": "spark",
-    "extractedFunctions": 469
+    "extractedFunctions": 469,
+    "pages": [
+      {
+        "url": "https://spark.apache.org/docs/4.2.0/sql-ref-functions-builtin.html",
+        "sha256": "f046860e86bc50b62ef81c3f947e1a90fb39e4a740c7c4f14449c9c7b0f692e9"
+      }
+    ],
+    "contracts": {
+      "complete": 5,
+      "partial": 43,
+      "name-only": 421
+    },
+    "contractsSha256": "53127e810b5a9347b414aaefb46b1c48015b10e427fa51b06bd7d112b0e9ec05"
   },
   "hive": {
     "version": "4.2.0",
     "url": "https://hive.apache.org/docs/latest/language/languagemanual-udf/",
-    "sha256": "faa24cc4b0f567ec4de599ecedc42d863035b5190869d06d94ebd973723ef8a2",
+    "sha256": "61f3b172f7ea479d713d81be2b63381229fb478878cd5c4ccc081405673ac46b",
     "extraction": "hive",
-    "extractedFunctions": 178
+    "extractedFunctions": 178,
+    "pages": [
+      {
+        "url": "https://hive.apache.org/docs/latest/language/hive-udfs/",
+        "sha256": "b5c395f8b37543083d36e58e8417825f5aac0430a083052779f3f4085ba1bd94"
+      },
+      {
+        "url": "https://hive.apache.org/docs/latest/language/languagemanual-udf/",
+        "sha256": "faa24cc4b0f567ec4de599ecedc42d863035b5190869d06d94ebd973723ef8a2"
+      },
+      {
+        "url": "https://hive.apache.org/docs/latest/language/languagemanual-windowingandanalytics/",
+        "sha256": "502bf16d5a2d6d4b80160295b5a1da3a3ec1d710507a621f3af3be8113a7acc0"
+      }
+    ],
+    "contracts": {
+      "complete": 105,
+      "partial": 49,
+      "name-only": 24
+    },
+    "contractsSha256": "225d0e480cc3709195b721d8622274521071cea82804438fa13be444d7a1e15c"
   },
   "flink": {
     "version": "2.3.0",
     "url": "https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/sql/functions/built-in-functions/",
     "sha256": "6c6a0ed83c8422a3b2b97e8b52a46cf5c128acd5fd8408fc52f571d72184db3c",
     "extraction": "flink",
-    "extractedFunctions": 208
+    "extractedFunctions": 208,
+    "pages": [
+      {
+        "url": "https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/sql/functions/built-in-functions/",
+        "sha256": "6c6a0ed83c8422a3b2b97e8b52a46cf5c128acd5fd8408fc52f571d72184db3c"
+      }
+    ],
+    "contracts": {
+      "complete": 8,
+      "partial": 21,
+      "name-only": 179
+    },
+    "contractsSha256": "57269d927adc54ce5be53ed281eb1f669c9aaac67d86c4e393703117a021fd83"
   },
   "mysql": {
     "version": "26.7.0",
     "url": "https://dev.mysql.com/doc/refman/26.7/en/built-in-function-reference.html",
-    "sha256": "4952a4ef0c1b58159a4f4f70ef826851c57ddf2e8cce155741d006f7cd767b3c",
+    "sha256": "8d6b1847a237596542d2aa25c7898d65867695b3f05bd13c1724f1d2d9eaf39c",
     "extraction": "mysql",
-    "extractedFunctions": 383
+    "extractedFunctions": 383,
+    "pages": [
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/aggregate-functions.html",
+        "sha256": "e546d73f3a18b07990ad7a1f6d2afab2c7e1e832c4278455280bc9dab41db8fc"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/bit-functions.html",
+        "sha256": "306e5244018756357be80a0605f3ac954f1cf2a23d024345ad6763c154f72d49"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/built-in-function-reference.html",
+        "sha256": "4d4f8a8ce72412e21fa11dc01383ea4379c191b9622ea7d1ec37e3d8b183f3be"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/cast-functions.html",
+        "sha256": "972aad327d4229f43f90f5c4c9c4b21563536886aeb6f4a553ea4af46a31184a"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/comparison-operators.html",
+        "sha256": "e22c813cc2f13ebbc01c217c858b71016af25d77b93c2e2d50207c6529b8e361"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/date-and-time-functions.html",
+        "sha256": "92cdcf3f11ed5ccd65adc74cb1d4a670d27c8518a81baa38af146b05b3969373"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/encryption-functions.html",
+        "sha256": "0e43f4d8cb55a1d0b0a2289b104d5cf3589607e664af7888566ad85ac3526fa3"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/flow-control-functions.html",
+        "sha256": "4903be6909fafda06f781b3feaf17403e770b2417b9642b1b7c569a714103fe2"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/fulltext-search.html",
+        "sha256": "e67681a975741aa7be86690954ec2c28d590ed9ce339e83908875eb5cec89d1f"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-format-conversion-functions.html",
+        "sha256": "55e2d9a8d0a64041996085aec1943e5bf54855e01c992767a71dd72f8656f66c"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-general-property-functions.html",
+        "sha256": "31ea6990ebfcabcb798db03307a2218a238500d7125aafd34e87807b31f2350c"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-geometrycollection-property-functions.html",
+        "sha256": "3b7b5202ac127e9ad16ece53c6825b85a8897f74ba0635b7a1daa1e1c1f6eb57"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-linestring-property-functions.html",
+        "sha256": "7f9f6838778eb8aed2ba3b6001e37efe5b07534348111df445475495794504df"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-mysql-specific-functions.html",
+        "sha256": "c0a2e40014adb06cda01884dd27bd95a29aca049e91e8bc1522b914ec33e07cf"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-point-property-functions.html",
+        "sha256": "a7bc52438deb82321eedcc9adf641cb53c5f97bddefdbdf235af91769a3a6ed2"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-polygon-property-functions.html",
+        "sha256": "163fe11de167efec5efc7afa347c4d2afd5c91da3c3579bda1696e6842cc6029"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-wkb-functions.html",
+        "sha256": "55a01c44f19dd67a45d2f3eb5d85fc932276f0c9ea466e129a84b06f40f5f398"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gis-wkt-functions.html",
+        "sha256": "c8e1513dcd726c4016d98b745e7f11e7da52c282d11b14692543ceacb0eeb2a6"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/group-replication-functions-for-communication-protocol.html",
+        "sha256": "ac807cf14ecf25d0e264f7f9b3fd74b4b3d6ba7a0434a44e3bf052b08838482b"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/group-replication-functions-for-maximum-consensus.html",
+        "sha256": "d6e84e965646cb858a74258d5eb3bc8b7b6d361b8867a2180790f27b4946174e"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/group-replication-functions-for-member-actions.html",
+        "sha256": "066e1596e5d83ea974d6321647fe8719c7b655aedf1a2e7aa8a47083f8da8171"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/group-replication-functions-for-mode.html",
+        "sha256": "baff957e74840162eb420f5be6cd688d5384e928f232df41ba4e44b0e77eecc2"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/group-replication-functions-for-new-primary.html",
+        "sha256": "2cbbb3ba7bf6e4500e968e4cdb7356053680f59741fdce212ddd65d41f93b062"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/gtid-functions.html",
+        "sha256": "297996e0b9dbca1315e39f9ea7014c243ffac33b6bfad2e1fa4aa92f23816d5e"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/information-functions.html",
+        "sha256": "7f226a83a243b6b62e9e2d50e6a0ade07a38bec1842de01cc9023972e81ef7a1"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/json-attribute-functions.html",
+        "sha256": "79f536396ece086852ae33491b7455ef18d2fb7c505367f32892dd40cecf7e09"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/json-creation-functions.html",
+        "sha256": "a0557c34cf241e1319f5b6266a255e241b7016b6bde6cf7023863acc6f67f42a"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/json-modification-functions.html",
+        "sha256": "01cc628413d15692349ff9f64808afa090c3e69bfcc877eae151b1b06680712f"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/json-search-functions.html",
+        "sha256": "49ff844e439f503a1100ddac3cc451d07a2aecaaee651a00b7b3a4ec640d6f9a"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/json-table-functions.html",
+        "sha256": "7c213831c19b83a8658fcd74412ee51524ff8e9922359e4fb1e88b588e44b875"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/json-utility-functions.html",
+        "sha256": "f31a218801c7995b295744c5e4d5a5b42436491309b2e07641c3732c8c1c97cb"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/json-validation-functions.html",
+        "sha256": "dce6a5b093d58a460dbc6285374acf30852148996b088d09fde6809ce68a2251"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/locking-functions.html",
+        "sha256": "da0ad48a67411ba70e7e1a421c7e57fcf53a7e7329a104629d38fbed46d66a8f"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/mathematical-functions.html",
+        "sha256": "66779494e2c38163a92e285fbe1ab5812e42c61ed64fdaab39209eccb6792c99"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/miscellaneous-functions.html",
+        "sha256": "fd245b4cc8ec01a6005c8803c710b840dedfd026e3f176e20494dd26678feb33"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/performance-schema-functions.html",
+        "sha256": "ddcf724c7aece469e595e578bcde6fbeb7832cb25717e8fefac9594b173ec648"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/regexp.html",
+        "sha256": "410ef254b43cc996695bb2147ea67bba5b5942d064d97890b67e3d5d74d06eb0"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/replication-functions-async-failover.html",
+        "sha256": "9b97dc90e3e8f65d3afd1bb38e1dc4a1972e23d93d14b0985d95acf6df9525dc"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/replication-functions-synchronization.html",
+        "sha256": "860386d1745896a98ea4f0ecabb011528cf87e04094fa9954ac3de830cdaba25"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/spatial-aggregate-functions.html",
+        "sha256": "fb9ad214e10ccee6f86aef8fb098d2ee22c95fa123ac33f3be4ab37b05dd185b"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/spatial-convenience-functions.html",
+        "sha256": "9dd9acb52c249fa190933b4ecc9072f68866d60a3b0e7babeac6883e96847862"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/spatial-geohash-functions.html",
+        "sha256": "de0bc74ba78eaac8fbf472305024e1cc57f2a49243f566e4d330cc29cf94f9ee"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/spatial-geojson-functions.html",
+        "sha256": "c4dc5b5527037ab727b72ae8dd83761adaec81c9bf5115e84a44e7c286986ad4"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/spatial-operator-functions.html",
+        "sha256": "42c7789432a87c62ab68cf84f82155b3251564b3054b26358c0ab683260c4834"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/spatial-relation-functions-mbr.html",
+        "sha256": "3b945bc146f3de76c7b68f8397ca2d4bd941b3faa548328b359c08b2be0f4d41"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/spatial-relation-functions-object-shapes.html",
+        "sha256": "6230583e248945a76943a430b91b942cabd1e092387450ffdbe1f0b815aaad9b"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/string-comparison-functions.html",
+        "sha256": "58996c5816db7f81cf573bb7a8970280f381e685e27699a31405988aec27bae3"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/string-functions.html",
+        "sha256": "e506afa8132c86e6144c171389e26116c29ed4684e4bd5f7d9bc41e306a5b07c"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/vector-functions.html",
+        "sha256": "224511cfe093b5658a4e9ced3aab2126b714aa24770efc53d84fd0aefd7f9c09"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/window-function-descriptions.html",
+        "sha256": "313f87e750a3936b449f9632688e4a3af600c80780ee611851b07b4490c54bca"
+      },
+      {
+        "url": "https://dev.mysql.com/doc/refman/26.7/en/xml-functions.html",
+        "sha256": "8e78eeab67372f4c0f8fbe23b2d70ad9501a4f65d45be98d6f5ac9fd5976d893"
+      }
+    ],
+    "contracts": {
+      "complete": 2,
+      "partial": 23,
+      "name-only": 358
+    },
+    "contractsSha256": "3d1bcbb67145d79665122a1e13ed4dfa651ea93080d83111d1cfcb66b53443ce"
   },
   "postgresql": {
     "version": "18.6",
     "url": "https://www.postgresql.org/docs/18/functions.html",
-    "sha256": "6377b838100407d16da0e15328c66d0685d04a67fb27e409509e2c0bb943fad4",
+    "sha256": "e9f217c8866d0480f35866707d3381f08f863a919ef75954a6d7e87f513daaa5",
     "extraction": "postgresql",
-    "extractedFunctions": 666
+    "extractedFunctions": 666,
+    "pages": [
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-admin.html",
+        "sha256": "e8e205f0165adc3fa85ce22540d12c1021f2660b8606358f5b003a9a305ba56e"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-aggregate.html",
+        "sha256": "a68e8a62b1cd9215bfa81b3ab530793eb84d876b67e9d9ac8a5daf26f97a1a29"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-array.html",
+        "sha256": "5f62a2b54945dd259fba8522f5d024c95c2da92091e22ff21e963de6d8b650f4"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-binarystring.html",
+        "sha256": "e50c6b5739cc9755285dc7afb5f4b29353f37475191a64974c36b6a8b2412e5c"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-bitstring.html",
+        "sha256": "2aa11be8aea042114c363e9744a625ac00bc9e42e2fe4b9b5dcaf54ff3126d47"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-comparison.html",
+        "sha256": "539b3b9aad4cbf58fac48a7c3be6fc2f1d04b580760d18e164b6acea6a2b53d2"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-comparisons.html",
+        "sha256": "f596e89d5c30a400249c1ba280c2c8c1a5c97337e9295db6a0f7b9d47945230d"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-conditional.html",
+        "sha256": "b99967ac0e8ed8c24ba627b743ee4c9025e0e162424d7c6547b5b733f5fa52cb"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-datetime.html",
+        "sha256": "077349b3e4e7783393c13080db6912ee1c8a4fee7e1535688241dbe59ad08a19"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-enum.html",
+        "sha256": "c91315c238c9a16c1c66353afb2a66ed2451e90dee1ebd3c76265a4625536437"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-event-triggers.html",
+        "sha256": "017d29a978f5a8c1aedf32c56cdb3f32fe03cbf75a471899853dbe5598012987"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-formatting.html",
+        "sha256": "77e777bfec6103baace4420ce5c2a90a8f4f2429804bd9634e5360a0de9a1f70"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-geometry.html",
+        "sha256": "80a3469d9d8acecfec54c643bcaae4cd07180e1f7114b9546889e4130c5cb3b1"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-info.html",
+        "sha256": "d97f15f20aac956ff0678eb5c9e4d237e6b17614419e0f4e2e963de62bac9256"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-json.html",
+        "sha256": "e7950fbd2aed4b70cd5ae8158847fb4f7ed324f17f6f9d6dfec499c63e4802c6"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-logical.html",
+        "sha256": "3e20709a974b50a924be67c031c3c048eb673fbc43434b29d65d8aaecc51e644"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-matching.html",
+        "sha256": "19dffdc50fa53bebf4c069666015dfc7445b161b38d78943b06b460495eb59cd"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-math.html",
+        "sha256": "df68594ce779158c1b6646535116e2a15fa807762c10776191e93f00c0e0c9f2"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-merge-support.html",
+        "sha256": "ce0aeff18d45a46d8bfe8f67b4e3c1399aebb6341884c9b253f2b45c9b1408f4"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-net.html",
+        "sha256": "8e28dabd653e38ee976fe75b7e65249264ab54ed6d106504a8666ce765acb2cd"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-range.html",
+        "sha256": "b5f7d440daf0f831e5146d283b1cf4823ebe0e9fdb8f8e82a581b2eb6bd21a35"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-sequence.html",
+        "sha256": "68d7cba5d554119cef695c4412bec6e7ee5a5ec991cfe2ed525272548ed87c4d"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-srf.html",
+        "sha256": "ca31e36eab6035b9afef1d7eae4f2d65de418c0cc62b4ea49a7042895fa9b8c5"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-statistics.html",
+        "sha256": "1a0cad75642575fa9bd1e5fee7fc39f85aa85f86b355ff538e54ff040a051aa8"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-string.html",
+        "sha256": "60552180c9a510cf3ceea14c1c2b707c6d01a001e75dc36c23f483378fbfcef6"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-subquery.html",
+        "sha256": "da1c08fdbd1714851953e0286657e8c35b265e0be4a60491d9c60688104112ed"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-textsearch.html",
+        "sha256": "9af217fbcf9f121d263de58bcdf5f0b5c9f6fd6c8dc15da43673a5ce69f82ff1"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-trigger.html",
+        "sha256": "7ee1c720d74c0df2a0d1c39b9f087a08fb307fea62708820217cf09483670cf7"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-uuid.html",
+        "sha256": "acfc1e275c132b57498080882ddb19e5227057897e7a4c6da8b604eb8d119d59"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-window.html",
+        "sha256": "a9280aed3f10368a2d33a5c835d45c047eeb5aac5b376e5b0a4797d3512f2ec0"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions-xml.html",
+        "sha256": "768b64ab6f29d29b2e0bf9e60d2ed4c2cd9ca6a0bc5389f8e4db7eba0554822a"
+      },
+      {
+        "url": "https://www.postgresql.org/docs/18/functions.html",
+        "sha256": "b2616e419613ce19b0f842b6cfc271c40e51013428c765f64c252bdf79790c55"
+      }
+    ],
+    "contracts": {
+      "complete": 206,
+      "partial": 227,
+      "name-only": 233
+    },
+    "contractsSha256": "ef27597dcf38d47d66f27b107b4dc6525df79addb685a805dc1b14f14a653330"
   },
   "trino": {
     "version": "483",
     "url": "https://trino.io/docs/current/functions/list.html",
-    "sha256": "ca0d9930855a79b57985c0092691c4f205140d224b4a48023cd66f9233dabc53",
+    "sha256": "f609ffbad83de27c7db20cc4f4e96d5fac9961f2487286ffe0c3f11971389817",
     "extraction": "trino",
-    "extractedFunctions": 435
+    "extractedFunctions": 435,
+    "pages": [
+      {
+        "url": "https://trino.io/docs/current/functions/aggregate.html",
+        "sha256": "e2adc0aa8d7657573af68beecd24714ccdfd12ea88783f81ca88d0bf583b3bb6"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/ai.html",
+        "sha256": "8e4a175d5b4bbf751eb1a4592316c32700069f85446d560cb82e51cbae8ff452"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/array.html",
+        "sha256": "9621b38e5634acd5263e1bfe1bb78cc966f59572583d300f5fc78ab6ffe83455"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/binary.html",
+        "sha256": "d83c332a7c4a416a23778c7d3522287c15a5b15601c8a152e2b62619d6e022f0"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/bitwise.html",
+        "sha256": "dc8fe4a37faffe2b18e53b3072c1223851dbc980a32cbe56f475441fdd577c17"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/color.html",
+        "sha256": "45177ce85340906357e46e91436764bcf1c0b7509e941ac2cdeb2b4aaa5ec434"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/comparison.html",
+        "sha256": "097b8528bae3d739cc02c7c684989b44627a888b29be61f01e096c21cc470d39"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/conditional.html",
+        "sha256": "2d235d216c9996b4620695df0b8e5912d63db8bd381ef2d4acb609e5b7fe4e77"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/conversion.html",
+        "sha256": "695dc48cb561edd43cbe208f9edb5fd2f8479c59a3f096ab5cac99f181ea3da9"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/datasketches.html",
+        "sha256": "4bb06f7f452bf6089f3bdeaf4c1c86193bd7c8bc2bfccf0300e9588688eae375"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/datetime.html",
+        "sha256": "a2512f804c8773196007234dd94596702478f2db288ba6048bfecda0ebeedc3e"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/decimal.html",
+        "sha256": "54f87dfaf338841db82a31234f1b4d21733edfc8c7953363911f62ada85360ef"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/geospatial.html",
+        "sha256": "f2bcf502272fb8fabf7d4a91ef202b3993aee21a49f90dc266e17b68a676199d"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/hyperloglog.html",
+        "sha256": "e1d2a6548715790c3c87ab18d13567bedd02a98213bff221d37ae2e14023ce39"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/ipaddress.html",
+        "sha256": "29ba6c8274c69317389d2701c1eab6208c41cc4efd729f6b922502dc6b2a108e"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/json.html",
+        "sha256": "bba9f89797eefaf622d759b9cde64c44e66620b9ac1cfd5795ff584db86210e1"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/lambda.html",
+        "sha256": "fe73bdb2a8fe3f20856b5b11b810116132c43c4969fb830ca0d41a6f7ca91367"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/list-by-topic.html",
+        "sha256": "8e7edad9cd5a66016bd9acf2b1761fca4a19cf0e6172ecd5f9713bacaa06f0a1"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/list.html",
+        "sha256": "ca0d9930855a79b57985c0092691c4f205140d224b4a48023cd66f9233dabc53"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/logical.html",
+        "sha256": "d752d385e3a404b1ccdde5a2d9d625455261b29e5c56d381696a1678e92e7d3a"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/map.html",
+        "sha256": "da6df60cd4196652621c9e9ee0f47921014132d5dcbce515b51298918085891d"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/math.html",
+        "sha256": "eed10750967c408393dd8ccfcf2f44dc716a35dafc4a653d00fa211d8e8f80d3"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/ml.html",
+        "sha256": "2d18d650fc34323b972e5ce56d61932dde51be73218aab3a914740f92bf03254"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/qdigest.html",
+        "sha256": "8afdaf6da5d19ff64c2449689b6e83fcda6e2a7bf23ad5bed44662d7f405837c"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/regexp.html",
+        "sha256": "db2d284a21e744f3839e6bc44cc0f5df8eddfbdb845f6a2bc28548a36aefff20"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/row.html",
+        "sha256": "281e3039a6ba885ef83701ed546feeaf30f5b3634127f43326ffc17cc04e3292"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/session.html",
+        "sha256": "50cc7be426494792ba9e1a6de7a98b5ae496f5966dc7f8b4a0b874c83f94f594"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/setdigest.html",
+        "sha256": "9864b9a5dd3ad568405bf9e9535ddf87003aec95b072272796c1777c71aa8853"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/string.html",
+        "sha256": "c74d7cc3f239db8184e4ec81a9a1df2ac0f8ef2880c8d2ffc5bfb0c60deeb484"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/system.html",
+        "sha256": "9cc30dd51fa223005908330d543624a48f40a77bfe3f79d45728f7a8aef1e9a0"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/table.html",
+        "sha256": "03fa6004e8d11d6e552e9bdd4e70bdabd5ac8f29c997735a03421e573637396a"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/tdigest.html",
+        "sha256": "cfe7b7538fae89f997ff38d1c4dad50c86676b10f16d5fa9bf22e1c51986770c"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/teradata.html",
+        "sha256": "e420d2306cc4db61da50f10c9af11ac42ca96b73876f3afee2a16ff352e92b04"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/url.html",
+        "sha256": "e8298634764394da105d7d2d0421371e11ea259dbdceb98fabde91c5f859a177"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/uuid.html",
+        "sha256": "c1e3053c5baa3449b565e5bee0e24624f4c951a89e782e06de8f57396fabe15d"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/variant.html",
+        "sha256": "9906376caad2d8065e4dfd62e7e1b36109dadabe140a4dddb1eb467bf8142831"
+      },
+      {
+        "url": "https://trino.io/docs/current/functions/window.html",
+        "sha256": "5bacba281853a16c02edd4128adc43eae945b6d39b9d2986030b9f3643d63762"
+      }
+    ],
+    "contracts": {
+      "complete": 81,
+      "partial": 250,
+      "name-only": 104
+    },
+    "contractsSha256": "65791016182f4466be7702e0b4dfff8e6f0cb6d45f3d0061f243474d5a8bc6b8"
   },
   "impala": {
     "version": "4.5.0",
     "url": "https://impala.apache.org/docs/build/html/topics/impala_functions.html",
-    "sha256": "88b325db44c1fea948dde1c0e07d5ebebe576061806633a524584d3a8b3cff1e",
+    "sha256": "6f57512576a3fceb3c178756f97c8d228cfcc28369b2deba40e4e613251a779a",
     "extraction": "impala",
-    "extractedFunctions": 191
+    "extractedFunctions": 191,
+    "pages": [
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_aggregate_functions.html",
+        "sha256": "6275d0bf016451cc2752496dd4e9e07f5721790461f774587c4af3f84270e63c"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_ai_functions.html",
+        "sha256": "dca9476579a01cd630d386bf2d7dc26b0b881be52f524a0c8f350b7e179ef99f"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_analytic_functions.html",
+        "sha256": "b858d0da0ed206f95693ee5fc9624fc9cb30f0902dda06909090d068396ba429"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_bit_functions.html",
+        "sha256": "1a1e43c58b9ad01ebb56a8f2d7ed8011398c35f3d2361a07f40a55f3dc03a1ca"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_conditional_functions.html",
+        "sha256": "576de9a5513d8d655e8e6687aef2aaf3b4f2f35a3c584e1172c57de2073d8a0c"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_conversion_functions.html",
+        "sha256": "ca192ebaa151883b42cbaf2b89efbbc8655212bc0156a1080f8cfd83e29615b8"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_datetime_functions.html",
+        "sha256": "684ea8c50e4ea3d8412cdf9879a8206f7c19203e5a5b7baedcc315a5d5acb3fe"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_functions.html",
+        "sha256": "88b325db44c1fea948dde1c0e07d5ebebe576061806633a524584d3a8b3cff1e"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_geospatial_functions.html",
+        "sha256": "2865ea05c6893eb285fd093a5ad08b137f3ac347fe27ee88d9fd6988cc91d086"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_math_functions.html",
+        "sha256": "7cd32f0743520d405334644878299db0c6dce13e7527cc08588d6da9f80bdc51"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_misc_functions.html",
+        "sha256": "2b722d94fb59eaf8cbda6974b41e79d142b54e45e271ecd47d0f87260ce4e15e"
+      },
+      {
+        "url": "https://impala.apache.org/docs/build/html/topics/impala_string_functions.html",
+        "sha256": "ff3859d021f35480379170031ecb959f9424959b485657ab9e67523dba99c695"
+      }
+    ],
+    "contracts": {
+      "complete": 117,
+      "partial": 8,
+      "name-only": 66
+    },
+    "contractsSha256": "06e316d6b6194d829502b57e65379207a9a85486452353d8ef8a4fc7aba021eb"
   }
 }

@@ -7,6 +7,10 @@
   "hive": {
     "version": "4.2.0",
     "url": "https://hive.apache.org/docs/latest/language/languagemanual-udf/",
+    "additionalUrls": [
+      "https://hive.apache.org/docs/latest/language/hive-udfs/",
+      "https://hive.apache.org/docs/latest/language/languagemanual-windowingandanalytics/"
+    ],
     "extractor": "hive"
   },
   "flink": {

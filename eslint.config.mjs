@@ -26,6 +26,7 @@ export default tseslint.config(
       globals: {
         console: 'readonly',
         fetch: 'readonly',
+        AbortSignal: 'readonly',
       },
     },
   },

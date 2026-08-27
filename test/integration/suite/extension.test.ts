@@ -820,6 +820,54 @@ suite('AIOps SQL JSON extension', () => {
     }
   });
 
+  for (const suffix of ['sql', 'sql.json']) {
+    test(`preserves nested Spark array return types with schema validation in .${suffix}`, async () => {
+      const configuration = vscode.workspace.getConfiguration('aiopsSqlJson');
+      await configuration.update('dialect', 'spark', vscode.ConfigurationTarget.Global);
+      await configuration.update('schemaValidation.enabled', true, vscode.ConfigurationTarget.Global);
+      await configuration.update('schemaValidation.completionOnly', false, vscode.ConfigurationTarget.Global);
+      await configuration.update('schemaFiles', [], vscode.ConfigurationTarget.Global);
+      const ddl = 'create table test_table (int_data array<int>);\n';
+      const invalid = `${ddl}select transform(false, x -> cast(x as string)) from test_table;`;
+      const valid = `${ddl}select transform(sort_array(int_data, false), x -> cast(x as string)) from test_table;`;
+      const content = (sql: string) => suffix === 'sql' ? sql : JSON.stringify({ querySql: sql });
+      const document = await openFile(`nested-function-types.${suffix}`, content(invalid));
+      await waitForDiagnostics(document.uri, (items) => items.some((item) => item.code === 'function-argument-type'));
+
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), content(valid));
+      assert.equal(await vscode.workspace.applyEdit(edit), true);
+      const diagnostics = await waitForDiagnostics(document.uri, (items) => !items.some((item) => item.source?.includes('SQL')));
+      assert.ok(!diagnostics.some((item) => item.source?.includes('SQL')));
+      const assertTypesAndNavigation = async () => {
+        for (const [name, expected] of [['sort_array', 'ARRAY<INT>'], ['transform', 'ARRAY<STRING>']] as const) {
+          const hovers = await fixture.waitForHovers(
+            document, document.getText().toLowerCase().indexOf(name) + 2,
+            (items) => items.some((hover) => hoverText(hover).toUpperCase().includes(expected)),
+            `${name} returns ${expected}`,
+          );
+          assert.ok(hovers.some((hover) => hoverText(hover).toUpperCase().includes(expected)));
+        }
+        const definitions = await executeDefinitions(document, document.getText().lastIndexOf('int_data'));
+        assert.equal(definitions.length, 1);
+        const selection = definitionSelection(definitions[0]!);
+        assert.equal(document.getText(selection), 'int_data');
+        assert.equal(document.offsetAt(selection.start), document.getText().indexOf('int_data'));
+      };
+      await assertTypesAndNavigation();
+
+      const templated = new vscode.WorkspaceEdit();
+      templated.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)),
+        content(valid.replace('select transform', 'select ${unrelated}, transform')));
+      assert.equal(await vscode.workspace.applyEdit(templated), true);
+      await applyDocumentFormatting(document, { tabSize: 2, insertSpaces: true });
+      assert.ok(document.getText().includes('${unrelated}'));
+      assert.match(document.getText(), /SORT_ARRAY\(\s*int_data,\s*false\s*\)/iu);
+      await waitForDiagnostics(document.uri, (items) => !items.some((item) => item.source?.includes('SQL')));
+      await assertTypesAndNavigation();
+    });
+  }
+
   test('indexes configured DDL for schema completion and strict diagnostics', async () => {
     const schemaDirectory = path.join(temporaryDirectory, 'schemas');
     await fs.mkdir(schemaDirectory, { recursive: true });

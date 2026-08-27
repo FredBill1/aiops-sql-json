@@ -1,0 +1,58 @@
+{
+  "spark": {
+    "previousFallback": 405,
+    "maximumFallback": 297,
+    "minimumReviewed": 138,
+    "minimumGenerated": 34,
+    "minimumDocumentedReturns": 48
+  },
+  "hive": {
+    "previousFallback": 161,
+    "maximumFallback": 26,
+    "minimumReviewed": 76,
+    "minimumGenerated": 109,
+    "minimumDocumentedReturns": 154
+  },
+  "flink": {
+    "previousFallback": 187,
+    "maximumFallback": 131,
+    "minimumReviewed": 72,
+    "minimumGenerated": 13,
+    "minimumDocumentedReturns": 29
+  },
+  "mysql": {
+    "previousFallback": 385,
+    "maximumFallback": 332,
+    "minimumReviewed": 51,
+    "minimumGenerated": 18,
+    "minimumDocumentedReturns": 25
+  },
+  "postgresql": {
+    "previousFallback": 644,
+    "maximumFallback": 236,
+    "minimumReviewed": 112,
+    "minimumGenerated": 343,
+    "minimumDocumentedReturns": 433
+  },
+  "trino": {
+    "previousFallback": 373,
+    "maximumFallback": 52,
+    "minimumReviewed": 111,
+    "minimumGenerated": 274,
+    "minimumDocumentedReturns": 331
+  },
+  "impala": {
+    "previousFallback": 238,
+    "maximumFallback": 86,
+    "minimumReviewed": 59,
+    "minimumGenerated": 103,
+    "minimumDocumentedReturns": 125
+  },
+  "generic": {
+    "previousFallback": 43,
+    "maximumFallback": 34,
+    "minimumReviewed": 25,
+    "minimumGenerated": 0,
+    "minimumDocumentedReturns": 0
+  }
+}

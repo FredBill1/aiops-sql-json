@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.0.21
+
+- Fixed schema-enabled SQL false positives caused by reordered Boolean/NULL arguments and parser-generated defaults. Function calls now retain their source arguments across dialect rewrites, including null-treatment window functions and Flink MAP constructors.
+- Unified function return inference and overload checking around dialect-specific contracts, correcting array, map, struct, JSON, binary, temporal, and set-returning results through nested calls, lambdas, CTEs, views, CTAS, INSERT, and UNION.
+- Kept speculative return inference useful for Hover without allowing it to produce unsupported type errors; known container shapes and genuine argument/reference errors remain checked.
+- Extended the official-documentation catalog updater with return contracts, overloads, source provenance, offline replay, and coverage guards for all seven dialects. Added regression and extension-host coverage for SQL and SQL JSON documents.
+
 ## 0.0.20
 
 - Fixed Hover and Go to Definition disappearing inside nested expressions when placeholders appeared earlier in a statement. AST source ranges now distinguish missing metadata from valid offset zero, and dynamic references no longer suppress unaffected operands or sibling diagnostics.

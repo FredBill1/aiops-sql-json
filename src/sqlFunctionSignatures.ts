@@ -1,4 +1,6 @@
 import type { SqlDialect } from './sql';
+import { PORTABLE_FUNCTION_CONTRACTS, reviewedFunctionSignatures } from './sqlFunctionContracts';
+import { GENERATED_FUNCTION_CONTRACTS } from './generated/sqlFunctionContracts';
 
 export type SqlFunctionKind = 'scalar' | 'aggregate' | 'window' | 'generator' | 'table';
 
@@ -22,9 +24,12 @@ export interface SqlFunctionParameter {
 }
 
 export type SqlFunctionReturnRule =
+  | { readonly kind: 'unknown' }
   | { readonly kind: 'fixed'; readonly type: string }
   | { readonly kind: 'argument'; readonly index: number }
   | { readonly kind: 'common'; readonly indexes?: readonly number[] }
+  | { readonly kind: 'alternating-results'; readonly start: number }
+  | { readonly kind: 'format-temporal'; readonly index: number }
   | { readonly kind: 'array'; readonly element: SqlFunctionReturnRule }
   | { readonly kind: 'multiset'; readonly element: SqlFunctionReturnRule }
   | { readonly kind: 'map'; readonly key: SqlFunctionReturnRule; readonly value: SqlFunctionReturnRule }
@@ -57,6 +62,8 @@ export type SqlFunctionReturnRule =
 export interface SqlFunctionSignature {
   readonly parameters: readonly SqlFunctionParameter[];
   readonly returns: SqlFunctionReturnRule;
+  /** A return-only contract must not claim complete knowledge of its inputs. */
+  readonly argumentValidation?: 'partial';
 }
 
 export interface SqlFunctionDefinition {
@@ -64,7 +71,10 @@ export interface SqlFunctionDefinition {
   readonly aliases: readonly string[];
   readonly kind: SqlFunctionKind;
   readonly signatures: readonly SqlFunctionSignature[];
-  readonly signatureSource: 'explicit' | 'fallback';
+  readonly signatureSource: 'explicit' | 'generated' | 'fallback';
+  /** Documentation alone does not establish all implicit conversions/overloads. */
+  readonly argumentValidation?: 'complete' | 'partial';
+  readonly documentation?: { readonly completeness: 'complete' | 'partial' | 'name-only'; readonly sources: readonly string[] };
 }
 
 export const SQL_FUNCTION_CATALOG_VERSIONS: Readonly<Record<SqlDialect, string>> = {
@@ -567,7 +577,12 @@ export function formatSqlFunctionSignature(
 function createDefinition(dialect: SqlDialect, rawName: string): SqlFunctionDefinition {
   const name = rawName.toLocaleLowerCase();
   const upper = rawName.toUpperCase();
-  const explicit = DIALECT_SIGNATURES[dialect]?.[name] ?? EXPLICIT_SIGNATURES[name];
+  const explicit = reviewedFunctionSignatures(dialect, name) ?? DIALECT_SIGNATURES[dialect]?.[name]
+    ?? PORTABLE_FUNCTION_CONTRACTS[name] ?? EXPLICIT_SIGNATURES[name];
+  const documented = GENERATED_FUNCTION_CONTRACTS[dialect]?.[upper];
+  const generated = documented?.overloads.some((overload) => overload.returns)
+    ? documented.overloads.map((overload) => signature(overload.parameters, overload.returns ?? { kind: 'unknown' }))
+    : undefined;
   const kind: SqlFunctionKind = GENERATOR_FUNCTIONS.has(upper)
     ? 'generator'
     : WINDOW_FUNCTIONS.has(upper)
@@ -579,8 +594,14 @@ function createDefinition(dialect: SqlDialect, rawName: string): SqlFunctionDefi
     name: rawName,
     aliases: [],
     kind,
-    signatures: explicit ?? [signature([ANY_VARIADIC], inferredReturnRule(dialect, upper))],
-    signatureSource: explicit ? 'explicit' : 'fallback',
+    signatures: explicit ?? generated ?? [signature([ANY_VARIADIC], inferredReturnRule(dialect, upper))],
+    signatureSource: explicit ? 'explicit' : generated ? 'generated' : 'fallback',
+    argumentValidation: explicit && !explicit.some((candidate) => candidate.argumentValidation === 'partial')
+      ? 'complete' : 'partial',
+    ...(documented ? { documentation: {
+      completeness: documented.completeness,
+      sources: [...new Set(documented.overloads.map((overload) => overload.source))],
+    } } : {}),
   };
 }
 
@@ -593,9 +614,8 @@ function inferredReturnRule(dialect: SqlDialect, name: string): SqlFunctionRetur
   if (STRING_RESULTS.has(name)) return FIXED(stringType(dialect));
   if (SAME_AS_FIRST.has(name)) return ARGUMENT();
   if (name === 'ARRAY_POSITIONS') return { kind: 'array', element: FIXED('BIGINT') };
-  if (name.startsWith('ARRAY_')) return ARGUMENT();
   if (ARRAY_RESULTS.has(name)) return { kind: 'array', element: ARGUMENT() };
-  if (MAP_RESULTS.has(name) || name.startsWith('MAP_')) return { kind: 'dynamic', display: 'MAP' };
+  if (MAP_RESULTS.has(name)) return { kind: 'dynamic', display: 'MAP' };
   if (AGGREGATE_FUNCTIONS.has(name) || WINDOW_FUNCTIONS.has(name)) return ARGUMENT();
   return COMMON;
 }
@@ -625,9 +645,12 @@ function signature(
 
 function returnRuleText(rule: SqlFunctionReturnRule): string {
   switch (rule.kind) {
+    case 'unknown': return 'UNKNOWN';
     case 'fixed': return rule.type;
     case 'argument': return `ARG${rule.index + 1}`;
     case 'common': return 'COMMON';
+    case 'alternating-results': return 'COMMON<RESULTS>';
+    case 'format-temporal': return 'DATE | TIME | DATETIME';
     case 'array': return `ARRAY<${returnRuleText(rule.element)}>`;
     case 'multiset': return `MULTISET<${returnRuleText(rule.element)}>`;
     case 'map': return `MAP<${returnRuleText(rule.key)}, ${returnRuleText(rule.value)}>`;

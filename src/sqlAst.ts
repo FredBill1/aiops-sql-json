@@ -34,7 +34,7 @@ import '@hdnax/sqlingo.js/trino';
 
 import { maskPlaceholders } from './patterns';
 import type { SqlDialect } from './sql';
-import { FlinkDialect } from './sqlFlinkDialect';
+import { SQL_AST_DIALECTS, sqlSourceCalls, sqlSourceTypeNames } from './sqlParserAdapters';
 
 export type SqlAstRole =
   | 'alias'
@@ -80,6 +80,8 @@ export interface SqlAstNode {
   readonly nameStart: number;
   readonly nameEnd: number;
   readonly args: Readonly<Record<string, SqlAstValue>>;
+  /** User-supplied arguments, before parser defaults and dialect rewrites. */
+  readonly call?: { readonly name: string; readonly arguments: readonly SqlAstNode[] };
 }
 
 export interface ParsedSqlAst {
@@ -126,7 +128,7 @@ function parseSqlAstInternal(
   for (const parserDialect of DIALECT_CANDIDATES[dialect]) {
     try {
       const statements = parse(maskSqlingoParserGaps(masked, parserDialect), {
-        dialect: parserDialect === 'flink' ? FlinkDialect : parserDialect,
+        dialect: SQL_AST_DIALECTS[parserDialect],
       });
       if (!allowCommands && statements.some((statement) => statement instanceof CommandExpr)) continue;
       return {
@@ -184,6 +186,7 @@ export function astArgumentRole(node: SqlAstNode, key: string): SqlAstArgumentRo
 
 /** Walk expression slots only; relation/query owners supply their own scopes. */
 export function astExpressionChildren(node: SqlAstNode): readonly SqlAstNode[] {
+  if (node.call) return node.call.arguments;
   return Object.entries(node.args).flatMap(([key, value]) => {
     const role = astArgumentRole(node, key);
     if (role !== 'expression' && role !== 'projection' && role !== 'query') return [];
@@ -211,6 +214,7 @@ export function isSqlAstNode(value: SqlAstValue | unknown): value is SqlAstNode 
 
 /** Returns the SQL spelling of a function call instead of the parser's class-specific AST key. */
 export function astFunctionName(node: SqlAstNode, text: string): string {
+  if (node.call) return node.call.name;
   const sourceName = text.slice(node.nameStart, node.nameEnd).trim();
   if (/^[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*$/u.test(sourceName)) {
     const normalizedSource = sourceName.replace(/\s+/gu, '');
@@ -221,13 +225,16 @@ export function astFunctionName(node: SqlAstNode, text: string): string {
   return AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
 }
 
-function normalizeExpression(expression: Expression): SqlAstNode {
+function normalizeExpression(expression: Expression, cache = new WeakMap<Expression, SqlAstNode>()): SqlAstNode {
+  const cached = cache.get(expression);
+  if (cached) return cached;
   const args: Record<string, SqlAstValue> = {};
   for (const [key, value] of Object.entries(expression.args)) {
-    const normalized = normalizeValue(value);
+    const normalized = normalizeValue(value, cache);
     if (normalized !== undefined) args[key] = normalized;
   }
-  const ownStart = numericMeta(expression.meta.start);
+  const sourceCall = sqlSourceCalls.get(expression);
+  const ownStart = sourceCall?.start ?? numericMeta(expression.meta.start);
   const ownEnd = numericMeta(expression.meta.end);
   const childSpans = Object.values(args).flatMap(collectValueSpans);
   const start = minimum([
@@ -238,43 +245,56 @@ function normalizeExpression(expression: Expression): SqlAstNode {
     ...(ownEnd === undefined ? [] : [ownEnd + 1]),
     ...childSpans.map((span) => span.end),
   ]) ?? start;
-  return {
+  const node: SqlAstNode = {
     role: expressionRole(expression),
     kind: expressionKind(expression),
-    name: expression.name,
+    name: sqlSourceTypeNames.get(expression) ?? expression.name,
     alias: expression.alias,
     aliasColumns: expression.aliasColumnNames,
     outputName: expression.outputName,
     start,
     end,
     ownStart,
-    nameStart: start,
-    nameEnd: end,
+    nameStart: sourceCall?.start ?? start,
+    nameEnd: sourceCall?.nameEnd ?? end,
     args,
+    ...(sourceCall ? { call: {
+      name: sourceCall.name, arguments: sourceCall.arguments.map((argument) => normalizeExpression(argument, cache)),
+    } } : {}),
   };
+  cache.set(expression, node);
+  return node;
 }
 
-function decorateNameSpans(node: SqlAstNode, text: string): SqlAstNode {
+function decorateNameSpans(node: SqlAstNode, text: string, cache = new WeakMap<SqlAstNode, SqlAstNode>()): SqlAstNode {
+  const cached = cache.get(node);
+  if (cached) return cached;
   const args = Object.fromEntries(Object.entries(node.args).map(([key, value]) => [
     key,
-    decorateValueNameSpans(value, text),
+    decorateValueNameSpans(value, text, cache),
   ]));
   const own = exactNodeNameSpan(node, text);
-  return {
+  const decorated: SqlAstNode = {
     ...node,
     args,
+    ...(node.call ? { call: {
+      name: node.call.name, arguments: node.call.arguments.map((argument) => decorateNameSpans(argument, text, cache)),
+    } } : {}),
     nameStart: own.start,
     nameEnd: own.end,
   };
+  cache.set(node, decorated);
+  return decorated;
 }
 
-function decorateValueNameSpans(value: SqlAstValue, text: string): SqlAstValue {
-  if (isSqlAstNode(value)) return decorateNameSpans(value, text);
-  if (Array.isArray(value)) return value.map((entry) => decorateValueNameSpans(entry, text));
+function decorateValueNameSpans(value: SqlAstValue, text: string, cache: WeakMap<SqlAstNode, SqlAstNode>): SqlAstValue {
+  if (isSqlAstNode(value)) return decorateNameSpans(value, text, cache);
+  if (Array.isArray(value)) return value.map((entry) => decorateValueNameSpans(entry, text, cache));
   return value;
 }
 
 function exactNodeNameSpan(node: SqlAstNode, text: string): { start: number; end: number } {
+  if (node.call) return { start: node.nameStart, end: node.nameEnd };
   if (node.role === 'identifier' || node.role === 'literal') {
     return { start: node.start, end: node.end };
   }
@@ -317,6 +337,7 @@ const AST_FUNCTION_NAMES: Readonly<Record<string, string>> = {
   cast: 'cast',
   chr: 'chr',
   dateDiff: 'date_diff',
+  decodeCase: 'decode',
   extract: 'extract',
   groupConcat: 'string_agg',
   jsonArrayAgg: 'json_agg',
@@ -374,11 +395,11 @@ function camelCaseToSqlName(value: string): string {
   return value.replace(/([a-z0-9])([A-Z])/gu, '$1_$2').toLocaleLowerCase();
 }
 
-function normalizeValue(value: unknown): SqlAstValue {
-  if (value instanceof Expression) return normalizeExpression(value);
+function normalizeValue(value: unknown, cache: WeakMap<Expression, SqlAstNode>): SqlAstValue {
+  if (value instanceof Expression) return normalizeExpression(value, cache);
   if (Array.isArray(value)) {
     return value.flatMap((entry): SqlAstValue[] => {
-      const normalized = normalizeValue(entry);
+      const normalized = normalizeValue(entry, cache);
       return normalized === undefined ? [] : [normalized];
     });
   }
