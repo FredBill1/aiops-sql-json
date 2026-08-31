@@ -24,7 +24,11 @@ export const sqlSourceTypeNames = new WeakMap<Expression, string>();
 function sourceAwareParser<P extends typeof Parser>(Base: P, nullTreatmentArgument = false): P {
   const Parent: typeof Parser = Base;
   return class SourceAwareParser extends Parent {
-    private readonly calls: { token?: Token; arguments?: Expression[] }[] = [];
+    private readonly calls: {
+      token?: Token;
+      openingParenthesis?: Token;
+      arguments?: Expression[];
+    }[] = [];
 
     override parseTypes(options: Parameters<Parser['parseTypes']>[0] = {}): Expression | undefined {
       const token = this.curr;
@@ -48,14 +52,26 @@ function sourceAwareParser<P extends typeof Parser>(Base: P, nullTreatmentArgume
     }
 
     override parseFunctionArgs(options: Parameters<Parser['parseFunctionArgs']>[0] = {}): Expression[] {
-      const args = super.parseFunctionArgs(options);
       const call = this.calls.at(-1);
-      if (call) call.arguments = [...args];
+      // Dialect-specific parsers may consume a leading argument themselves and
+      // invoke parseFunctionArgs only for the tail after a comma. Such a tail is
+      // not a complete source argument list; let the normalized AST expose the
+      // parser's dedicated slots instead.
+      const completeSourceList = call?.openingParenthesis === this.prev;
+      const args = super.parseFunctionArgs(options);
+      if (call && completeSourceList) call.arguments = [...args];
       return args;
     }
 
     override parseFunctionCall(options: Parameters<Parser['parseFunctionCall']>[0] = {}): Expression | undefined {
-      const call: { token?: Token; arguments?: Expression[] } = { token: this.curr };
+      const call: {
+        token?: Token;
+        openingParenthesis?: Token;
+        arguments?: Expression[];
+      } = {
+        token: this.curr,
+        openingParenthesis: this.next?.tokenType === TokenType.L_PAREN ? this.next : undefined,
+      };
       this.calls.push(call);
       try {
         const name = this.curr?.text.toUpperCase();

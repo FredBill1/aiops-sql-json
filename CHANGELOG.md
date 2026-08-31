@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.0.22
+
+- Fixed source-argument capture for dialect parsers that read function arguments in stages. Spark and Hive percentile aggregates no longer report false argument-count or argument-type diagnostics, and Spark interval/array return inference continues to use the aggregate input.
+
 ## 0.0.21
 
 - Fixed schema-enabled SQL false positives caused by reordered Boolean/NULL arguments and parser-generated defaults. Function calls now retain their source arguments across dialect rewrites, including null-treatment window functions and Flink MAP constructors.
