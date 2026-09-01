@@ -12,6 +12,7 @@ import type { CaretPosition, EntityContext, ParseError, Suggestions } from 'dt-s
 import type { ParserRuleContext, Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
+import { normalizeSqlParserGaps } from './sqlParserGaps';
 import {
   astArgumentRole,
   isSqlAstNode,
@@ -57,6 +58,12 @@ interface StructuralSqlIssue extends SqlIssue {
   contextEnd?: number;
 }
 
+interface StructuralScopeState {
+  readonly clauses: Set<string>;
+  joinHasOn?: boolean;
+  mergeNeedsOn: boolean;
+}
+
 export interface ParserLike {
   parse(input: string): ParserRuleContext;
   validate(input: string): ParseError[];
@@ -93,14 +100,16 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
 
   const parser = getSqlParser(dialect);
   const masked = maskPlaceholders(text, placeholders).text;
+  const parserNormalization = normalizeSqlParserGaps(masked, dialect);
+  const parserText = parserNormalization.text;
   let errors: ParseError[] = [];
   let antlrTokens: Token[] = [];
   let parseTree: ParserRuleContext | undefined;
   try {
-    errors = parser.validate(masked);
+    errors = parser.validate(parserText);
     antlrTokens = parser.getAllTokens(masked);
     if (errors.length === 0 && hasMultipleTopLevelStatementStarts(antlrTokens)) {
-      parseTree = parser.parse(masked);
+      parseTree = parser.parse(parserText);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -117,6 +126,7 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
     : undefined;
   const structuralIssues = findStructuralIssues(antlrTokens, parseTree, fallbackAst);
   const parserIssues = errors.length > 0 && fallbackAst && structuralIssues.length === 0
+    && !parserNormalization.hasMalformedSyntax
     ? []
     : errors.map((error) => parseErrorToIssue(text, error));
   const uncoveredStructuralIssues = structuralIssues
@@ -240,9 +250,11 @@ function findStructuralIssues(
   const queryStarts = new Set(['SELECT', 'WITH', 'VALUES', 'TABLE']);
   const statementStarts = new Set(['SELECT', 'WITH', 'VALUES', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'TABLE']);
   const terminators = new Set([';', ')']);
-  const clauseSeen = new Map<number, Set<string>>();
-  const joinHasOn = new Map<number, boolean>();
-  let parenthesisDepth = 0;
+  const structuralScopes: StructuralScopeState[] = [createStructuralScopeState()];
+  const joinBoundaries = new Set([
+    'WHERE', 'GROUP', 'HAVING', 'WINDOW', 'QUALIFY', 'ORDER', 'LIMIT', 'OFFSET',
+    'UNION', 'INTERSECT', 'EXCEPT', 'WHEN', 'SET', ';',
+  ]);
   let caseDepth = 0;
 
   for (let index = 0; index < significant.length; index += 1) {
@@ -255,8 +267,8 @@ function findStructuralIssues(
     const afterNextToken = significant[index + 2];
     const afterNext = afterNextToken ? structuralTokenName(afterNextToken) : undefined;
 
-    if (current === ')') parenthesisDepth = Math.max(parenthesisDepth - 1, 0);
-    const depth = parenthesisDepth;
+    if (current === ')' && structuralScopes.length > 1) structuralScopes.pop();
+    const structuralScope = structuralScopes.at(-1)!;
     const atBoundary = (value: string | undefined): boolean => value === undefined || expressionBoundaries.has(value);
 
     if (current === 'SELECT'
@@ -332,27 +344,42 @@ function findStructuralIssues(
       }
     }
 
-    const clauses = clauseSeen.get(depth) ?? new Set<string>();
-    clauseSeen.set(depth, clauses);
     if (current === ';') {
-      clauseSeen.clear();
-      joinHasOn.clear();
+      structuralScopes.splice(0, structuralScopes.length, createStructuralScopeState());
     } else if (current === 'SELECT' || current === 'VALUES') {
-      clauseSeen.set(depth, new Set());
+      structuralScope.clauses.clear();
+      structuralScope.joinHasOn = undefined;
     } else if (current === 'ORDER' && next === 'BY') {
-      if (clauses.has('ORDER BY')) appendStructuralIssue(issues, seen, token, 'ORDER BY appears more than once in the same query.');
-      clauses.add('ORDER BY');
+      if (structuralScope.clauses.has('ORDER BY')) {
+        appendStructuralIssue(issues, seen, token, 'ORDER BY appears more than once in the same query.');
+      }
+      structuralScope.clauses.add('ORDER BY');
     } else if (current === 'LIMIT') {
-      if (clauses.has('LIMIT')) appendStructuralIssue(issues, seen, token, 'LIMIT appears more than once in the same query.');
-      clauses.add('LIMIT');
+      if (structuralScope.clauses.has('LIMIT')) {
+        appendStructuralIssue(issues, seen, token, 'LIMIT appears more than once in the same query.');
+      }
+      structuralScope.clauses.add('LIMIT');
     }
-    if (current === 'JOIN') joinHasOn.set(depth, false);
+    if (current === 'MERGE') structuralScope.mergeNeedsOn = true;
+    if (joinBoundaries.has(current)) structuralScope.joinHasOn = undefined;
+    if (current === 'JOIN') structuralScope.joinHasOn = false;
     if (current === 'ON') {
-      if (joinHasOn.get(depth)) appendStructuralIssue(issues, seen, token, 'JOIN contains more than one ON clause.');
-      joinHasOn.set(depth, true);
+      const startsConflictClause = next === 'CONFLICT' || next === 'DUPLICATE';
+      if (startsConflictClause) {
+        structuralScope.joinHasOn = undefined;
+      } else if (structuralScope.joinHasOn === false) {
+        structuralScope.joinHasOn = true;
+      } else if (structuralScope.joinHasOn && structuralScope.mergeNeedsOn) {
+        structuralScope.joinHasOn = undefined;
+        structuralScope.mergeNeedsOn = false;
+      } else if (structuralScope.joinHasOn) {
+        appendStructuralIssue(issues, seen, token, 'JOIN contains more than one ON clause.');
+      } else if (structuralScope.mergeNeedsOn) {
+        structuralScope.mergeNeedsOn = false;
+      }
     }
 
-    if (current === '(') parenthesisDepth += 1;
+    if (current === '(') structuralScopes.push(createStructuralScopeState());
   }
 
   appendCteStructuralIssues(significant, issues, seen, statementStarts);
@@ -360,6 +387,10 @@ function findStructuralIssues(
   if (parseTree) appendStatementSeparatorIssues(parseTree, issues, seen, ast);
   if (ast) appendAstStructuralIssues(ast, significant, issues, seen);
   return [...issues, ...findCaseStructuralIssues(significant)];
+}
+
+function createStructuralScopeState(): StructuralScopeState {
+  return { clauses: new Set(), mergeNeedsOn: false };
 }
 
 function appendCteStructuralIssues(

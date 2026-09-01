@@ -34,6 +34,7 @@ import '@hdnax/sqlingo.js/trino';
 
 import { maskPlaceholders } from './patterns';
 import type { SqlDialect } from './sql';
+import { maskSqlParserGaps } from './sqlParserGaps';
 import { SQL_AST_DIALECTS, sqlSourceCalls, sqlSourceTypeNames } from './sqlParserAdapters';
 
 export type SqlAstRole =
@@ -127,7 +128,13 @@ function parseSqlAstInternal(
   if (/\bCREATE\s+[\p{L}_$]*\s*$/iu.test(masked)) return undefined;
   for (const parserDialect of DIALECT_CANDIDATES[dialect]) {
     try {
-      const statements = parse(maskSqlingoParserGaps(masked, parserDialect), {
+      const parserText = allowCommands
+        ? masked
+        : maskSqlParserGaps(masked, dialect === 'generic' ? dialect : parserDialect);
+      // The pinned Trino catalog predates standard SQL/JSON constructors. A normalized AST would
+      // expose them as unsupported anonymous calls, so retain the conservative no-model fallback.
+      if (dialect === 'trino' && parserText !== masked) continue;
+      const statements = parse(parserText, {
         dialect: SQL_AST_DIALECTS[parserDialect],
       });
       if (!allowCommands && statements.some((statement) => statement instanceof CommandExpr)) continue;
@@ -150,11 +157,6 @@ export function sqlingoCanParse(
   placeholders: readonly RegExp[] = [],
 ): boolean {
   return parseSqlAst(text, dialect, placeholders) !== undefined;
-}
-
-function maskSqlingoParserGaps(text: string, dialect: ParsedSqlAst['parserDialect']): string {
-  if (dialect !== 'mysql' || !/\bJSON_TABLE\b/iu.test(text)) return text;
-  return text.replace(/\bEXISTS(?=\s+PATH\b)/giu, (value) => ' '.repeat(value.length));
 }
 
 export function astChild(node: SqlAstNode, key: string): SqlAstNode | undefined {

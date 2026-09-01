@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.0.23
+
+- Fixed schema-validation false positives caused by `ORDER BY` and `ON` state leaking across sibling windows, named windows, ordered aggregates, pattern-recognition clauses, JOINs, and DML conflict handlers in every supported dialect. Added equal-length parser-gap normalization for valid SQL/JSON constructors, aggregates, query/value functions, PostgreSQL typed JSON literals, and MySQL `JSON_TABLE` handlers while retaining diagnostics for malformed modifiers.
+
 ## 0.0.22
 
 - Fixed source-argument capture for dialect parsers that read function arguments in stages. Spark and Hive percentile aggregates no longer report false argument-count or argument-type diagnostics, and Spark interval/array return inference continues to use the aggregate input.
