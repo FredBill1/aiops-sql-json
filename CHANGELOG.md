@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.0.24
+
+- Fixed comment formatting across all supported dialects by allowing safe removal of line-comment trailing whitespace and consistently handling MySQL `#` comments and CR/LF terminators. Formatting now maps lexer code-point offsets to UTF-16 source ranges, preserving emoji and other supplementary Unicode characters without changing string or block-comment contents. Added regression coverage for SQL and SQL JSON documents with schema validation disabled, enabled, and in completion-only mode.
+
 ## 0.0.23
 
 - Fixed schema-validation false positives caused by `ORDER BY` and `ON` state leaking across sibling windows, named windows, ordered aggregates, pattern-recognition clauses, JOINs, and DML conflict handlers in every supported dialect. Added equal-length parser-gap normalization for valid SQL/JSON constructors, aggregates, query/value functions, PostgreSQL typed JSON literals, and MySQL `JSON_TABLE` handlers while retaining diagnostics for malformed modifiers.

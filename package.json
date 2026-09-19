@@ -2,7 +2,7 @@
   "name": "aiops-sql-json",
   "displayName": "AIOps SQL JSON",
   "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
-  "version": "0.0.23",
+  "version": "0.0.24",
   "icon": "images/icon.png",
   "license": "MIT",
   "engines": {
@@ -369,7 +369,7 @@
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
-    "@types/node": "^20.19.9",
+    "@types/node": "^20.19.43",
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^8.39.0",
     "@typescript-eslint/parser": "^8.39.0",

@@ -182,13 +182,19 @@ export function lexSql(
   placeholders: readonly RegExp[] = [],
 ): SqlLexToken[] {
   const masked = maskPlaceholders(text, placeholders).text;
+  // ANTLR indexes Unicode code points; all public source ranges use UTF-16.
+  // Normalize bare CR only in the lexer input: original token spelling (including
+  // literal/comment contents) is always recovered from the unmodified source.
+  const lexerText = masked.replace(/\r(?!\n)/gu, '\n');
+  const offsets = [0];
+  for (const character of lexerText) offsets.push(offsets[offsets.length - 1]! + character.length);
   try {
-    return getSqlParser(dialect).getAllTokens(masked).flatMap((token) => (
+    return getSqlParser(dialect).getAllTokens(lexerText).flatMap((token) => (
       token.start >= 0 && token.stop >= token.start
         ? [{
-            start: token.start,
-            end: token.stop + 1,
-            text: text.slice(token.start, token.stop + 1),
+            start: offsets[token.start]!,
+            end: offsets[token.stop + 1]!,
+            text: text.slice(offsets[token.start], offsets[token.stop + 1]),
             symbolicName: getSymbolicName(token),
             channel: token.channel,
           }]

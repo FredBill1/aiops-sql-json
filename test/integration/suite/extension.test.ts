@@ -1,6 +1,5 @@
 import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
-import * as os from 'node:os';
 import * as path from 'node:path';
 
 import * as vscode from 'vscode';
@@ -17,7 +16,9 @@ suite('AIOps SQL JSON extension', () => {
   let fixture: IntegrationTestFixture;
 
   suiteSetup(async () => {
-    temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'aiops-sql-json-'));
+    const fixturesDirectory = process.env.AIOPS_SQL_JSON_TEST_FIXTURES;
+    assert.ok(fixturesDirectory, 'The integration runner must provide the test fixtures directory.');
+    temporaryDirectory = fixturesDirectory;
     const discoveredExtension = vscode.extensions.getExtension('fredbill1.aiops-sql-json');
     assert.ok(discoveredExtension, 'Extension must be discoverable in the extension host.');
     extension = discoveredExtension;
@@ -33,9 +34,7 @@ suite('AIOps SQL JSON extension', () => {
     await fixture.dispose();
   });
 
-  suiteTeardown(async () => {
-    await fs.rm(temporaryDirectory, { recursive: true, force: true });
-  });
+  // The runner removes fixtures after VS Code exits, when file watchers have released their handles.
 
   test('activates when a regular SQL file is opened first', async () => {
     assert.equal(extension.isActive, false, 'The extension must start inactive for this regression test.');
@@ -129,6 +128,55 @@ suite('AIOps SQL JSON extension', () => {
       'WHERE enabled = true AND dt = $date',
     ].join(eol)}${eol}`);
   });
+
+  for (const dialect of ['spark', 'hive', 'flink', 'mysql', 'postgresql', 'trino', 'impala', 'generic']) {
+    for (const fileExtension of ['sql', 'sql.json']) {
+      for (const mode of ['disabled', 'enabled', 'completionOnly']) {
+        test(`comment whitespace provider: ${dialect} .${fileExtension} schema=${mode}`, async () => {
+          const config = vscode.workspace.getConfiguration('aiopsSqlJson');
+          const ddlPath = path.join(temporaryDirectory, `comment-${dialect}-ddl.sql`);
+          await fs.writeFile(ddlPath, 'CREATE TABLE source_table (a INT, b INT);', 'utf8');
+          await config.update('dialect', dialect, vscode.ConfigurationTarget.Global);
+          await config.update('schemaFiles', [ddlPath], vscode.ConfigurationTarget.Global);
+          await config.update('schemaValidation.enabled', mode !== 'disabled', vscode.ConfigurationTarget.Global);
+          await config.update('schemaValidation.completionOnly', mode === 'completionOnly', vscode.ConfigurationTarget.Global);
+          if (mode !== 'disabled') {
+            await vscode.commands.executeCommand('aiopsSqlJson.rebuildSchemaIndex');
+          }
+
+          const missingEdits: string[] = [];
+          for (const [name, template] of [
+            ['reported', 'select max(a)\nfrom (select 1 as a, 2 as b) base\nhaving\n-- test{{ws}}\nmax(a) = 1'],
+            ['indexed-table', 'select max(a) from source_table having -- test{{ws}}\nmax(a) = 1'],
+          ]) {
+            const wrap = (sql: string) => fileExtension === 'sql' ? sql : JSON.stringify({ querySql: sql });
+            const clean = await openFile(
+              `comment-${dialect}-${mode}-${name}-clean.${fileExtension}`,
+              wrap(template!.replace('{{ws}}', '')),
+            );
+            await applyDocumentFormatting(clean, { tabSize: 2, insertSpaces: true });
+            const dirty = await openFile(
+              `comment-${dialect}-${mode}-${name}-dirty.${fileExtension}`,
+              wrap(template!.replace('{{ws}}', ' \t ')),
+            );
+            const edits = await vscode.commands.executeCommand<vscode.TextEdit[]>(
+              'vscode.executeFormatDocumentProvider', dirty.uri, { tabSize: 2, insertSpaces: true },
+            );
+            if (!edits?.length) {
+              missingEdits.push(name!);
+              continue;
+            }
+            const workspaceEdit = new vscode.WorkspaceEdit();
+            workspaceEdit.set(dirty.uri, edits);
+            assert.equal(await vscode.workspace.applyEdit(workspaceEdit), true);
+            assert.equal(dirty.getText(), clean.getText());
+          }
+          // Collect both failures so the first rejection does not hide the indexed-table case.
+          assert.deepEqual(missingEdits, [], 'Valid comment whitespace must not suppress formatting edits.');
+        });
+      }
+    }
+  }
 
   test('preserves a trailing line comment and adds the final document EOL', async () => {
     const document = await openFile('trailing-comment-format.sql', "select 'xx', 1;  -- hello");

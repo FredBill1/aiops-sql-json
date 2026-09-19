@@ -25,20 +25,22 @@ async function runIteration(iteration: number, runnerOptions: RunnerOptions): Pr
   const userDataDirectory = path.join(testWorkspaceRoot, 'user-data');
   const extensionsDirectory = path.join(testWorkspaceRoot, 'extensions');
   const workspaceFile = path.join(testWorkspaceRoot, 'integration.code-workspace');
-  await Promise.all([
-    fs.mkdir(firstWorkspaceFolder, { recursive: true }),
-    fs.mkdir(secondWorkspaceFolder, { recursive: true }),
-    fs.mkdir(userDataDirectory, { recursive: true }),
-    fs.mkdir(extensionsDirectory, { recursive: true }),
-  ]);
-  await fs.writeFile(workspaceFile, JSON.stringify({
-    folders: [
-      { name: 'First', path: firstWorkspaceFolder },
-      { name: 'Second', path: secondWorkspaceFolder },
-    ],
-  }), 'utf8');
-
+  const fixturesDirectory = path.join(testWorkspaceRoot, 'fixtures');
   try {
+    await Promise.all([
+      fs.mkdir(firstWorkspaceFolder, { recursive: true }),
+      fs.mkdir(secondWorkspaceFolder, { recursive: true }),
+      fs.mkdir(userDataDirectory, { recursive: true }),
+      fs.mkdir(extensionsDirectory, { recursive: true }),
+      fs.mkdir(fixturesDirectory),
+    ]);
+    await fs.writeFile(workspaceFile, JSON.stringify({
+      folders: [
+        { name: 'First', path: firstWorkspaceFolder },
+        { name: 'Second', path: secondWorkspaceFolder },
+      ],
+    }), 'utf8');
+
     console.log(
       `Starting integration test run ${iteration}/${runnerOptions.repeat}`
       + ` with VS Code ${runnerOptions.vscodeVersion ?? 'latest stable'}.`,
@@ -46,6 +48,7 @@ async function runIteration(iteration: number, runnerOptions: RunnerOptions): Pr
     const testOptions: TestOptions = {
       extensionDevelopmentPath,
       extensionTestsPath,
+      extensionTestsEnv: { AIOPS_SQL_JSON_TEST_FIXTURES: fixturesDirectory },
       launchArgs: [
         workspaceFile,
         '--disable-extensions',
@@ -58,7 +61,8 @@ async function runIteration(iteration: number, runnerOptions: RunnerOptions): Pr
     }
     await runTests(testOptions);
   } finally {
-    await fs.rm(testWorkspaceRoot, { recursive: true, force: true });
+    // VS Code subprocesses can briefly retain Windows file handles after the main process exits.
+    await fs.rm(testWorkspaceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }
 

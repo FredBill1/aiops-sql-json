@@ -374,7 +374,9 @@ function annotateComplexTypePunctuation(tokens: FormattingToken[]): void {
 
 function classifyToken(token: SqlLexToken, raw: string, upper: string): TokenKind {
   const name = token.symbolicName.toUpperCase();
-  if (raw.startsWith('--') || raw.startsWith('/*')) return 'comment';
+  if ((name.includes('COMMENT') && !name.startsWith('KW_')) || raw.startsWith('--') || raw.startsWith('/*')) {
+    return 'comment';
+  }
   if (DATA_TYPES.has(upper) || name.includes('DATA_TYPE')) return 'dataType';
   if (/(?:STRING|CHAR|TEXT|BINARY)_?(?:LITERAL|VALUE)?$/u.test(name) || /^['"`]/u.test(raw)) return 'string';
   if (/^(?:\d|\.\d)/u.test(raw) || name.includes('NUMBER') || name.includes('INTEGER')) return 'number';
@@ -493,7 +495,7 @@ function pairParentheses(
       : kind === 'structuralList'
         ? configuration.layoutMode === 'expanded'
           || countTopLevelItems(tokens, raw.open + 1, raw.close) > configuration.maxInlineItems
-          || innerTokens.some((token) => token.kind === 'comment' && token.raw.trimStart().startsWith('--'))
+          || innerTokens.some(isLineComment)
           || innerWidth + initialIndent + (structuralDepth + 1) * editor.tabSize
             > configuration.maxLineWidth
           || exceedsDepth
@@ -1214,9 +1216,7 @@ function pairCases(tokens: readonly FormattingToken[]): Map<number, CasePair> {
       ...raw,
       branchCount: countCaseBranches(tokens, raw),
       relativeExpressionDepth: Math.max(0, maxDepth - baseDepth),
-      hasLineComment: caseTokens.some((token) => (
-        token.kind === 'comment' && token.raw.trimStart().startsWith('--')
-      )),
+      hasLineComment: caseTokens.some(isLineComment),
     };
     result.set(raw.open, pair);
     result.set(raw.close, pair);
@@ -1425,7 +1425,7 @@ class SqlLayoutBuilder {
     const clauseTokens = this.tokens.slice(phraseIndex, end).filter((_, offset) => (
       !isInsideQuery(phraseIndex + offset)
     ));
-    if (clauseTokens.some((token) => token.kind === 'comment' && token.raw.trimStart().startsWith('--'))) {
+    if (clauseTokens.some(isLineComment)) {
       return true;
     }
     const depthTokens = this.tokens.slice(phraseIndex, end).filter((_, offset) => (
@@ -1667,7 +1667,7 @@ class SqlLayoutBuilder {
       this.finishLine(false);
     }
     this.appendRaw(token.raw, this.current.trim().length > 0);
-    if (token.raw.trimStart().startsWith('--')) {
+    if (isLineComment(token)) {
       const nextIndent = this.pendingListBreakIndent;
       this.pendingListBreakIndent = undefined;
       this.finishLine(true, nextIndent ?? this.indent);
@@ -1962,20 +1962,25 @@ function equivalenceTokens(
     const raw = masked.slice(token.start, token.end);
     const upper = raw.toUpperCase();
     const kind = classifyToken(token, raw, upper);
-    const comparableRaw = kind === 'comment' && raw.trimStart().startsWith('--')
-      ? raw.replace(/(?:\r\n|\r|\n)$/u, '')
-      : raw;
+    // Lexer token names may differ at EOF (for example PostgreSQL's bare --).
+    // Compare comment content, not that lexer detail; only line-comment suffix
+    // whitespace is insignificant. Block-comment contents remain exact.
+    if (kind === 'comment') return `comment:${isLineComment({ kind, raw }) ? raw.trimEnd() : raw}`;
     if (kind === 'keyword' && configuration.keywordCase !== 'preserve') return `${token.symbolicName}:${upper}`;
     if (kind === 'dataType' && configuration.dataTypeCase !== 'preserve') return `${token.symbolicName}:${upper}`;
     if (kind === 'word' && lexed[index + 1]?.text === '(' && configuration.functionCase !== 'preserve') {
       return `${token.symbolicName}:${upper}`;
     }
-    return `${token.symbolicName}:${comparableRaw}`;
+    return `${token.symbolicName}:${raw}`;
   });
 }
 
 function describeEquivalenceToken(value: string | undefined): string {
   return value === undefined ? '<end>' : JSON.stringify(value);
+}
+
+function isLineComment(token: Pick<FormattingToken, 'kind' | 'raw'>): boolean {
+  return token.kind === 'comment' && !token.raw.startsWith('/*');
 }
 
 function overlaps(leftStart: number, leftEnd: number, rightStart: number, rightEnd: number): boolean {
