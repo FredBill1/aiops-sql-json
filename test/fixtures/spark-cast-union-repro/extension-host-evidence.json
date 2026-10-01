@@ -1,0 +1,42 @@
+{
+  "vscodeVersion": "1.138.0",
+  "extensionVersion": "0.0.24",
+  "cases": [
+    {
+      "file": "ansi-union.sql",
+      "diagnostics": [
+        {
+          "code": "incompatible-type",
+          "source": "spark SQL schema",
+          "message": "Cannot assign string value to value (DOUBLE)."
+        }
+      ],
+      "definitions": [
+        "SELECT CAST(raw_value AS DOUBLE) AS value",
+        "SELECT CAST(raw_value AS DOUBLE) AS value"
+      ],
+      "hoverContainsDouble": true
+    },
+    {
+      "file": "star-except.sql",
+      "diagnostics": [
+        {
+          "code": "insert-column-count",
+          "source": "spark SQL schema",
+          "message": "INSERT writes 2 value(s) into 1 target column(s)."
+        },
+        {
+          "code": "incompatible-type",
+          "source": "spark SQL schema",
+          "message": "Cannot assign string value to value (DOUBLE)."
+        }
+      ],
+      "definitions": [
+        "SELECT * EXCEPT (raw_value), CAST(raw_value AS DOUBLE) AS value",
+        "SELECT * EXCEPT (raw_value), CAST(raw_value AS DOUBLE) AS value"
+      ],
+      "hoverContainsDouble": true
+    }
+  ],
+  "baselineDiagnostics": []
+}

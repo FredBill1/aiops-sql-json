@@ -1,0 +1,10 @@
+{
+  "folders": [{ "path": "." }],
+  "settings": {
+    "aiopsSqlJson.dialect": "spark",
+    "aiopsSqlJson.plainSql.enabled": true,
+    "aiopsSqlJson.schemaValidation.enabled": true,
+    "aiopsSqlJson.schemaValidation.completionOnly": false,
+    "aiopsSqlJson.schemaFiles": ["${workspaceFolder}/schema/*.sql"]
+  }
+}
