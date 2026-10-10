@@ -11,12 +11,16 @@ import {
   type SqlJsonRegion,
 } from './regions';
 import type { ProjectedJsonDocument } from './jsonService';
-import { analyzeSql, type SqlAnalysis } from './sql';
-import { analyzeSqlSemantics, type SchemaSnapshot } from './sqlSchemaCore';
+import type { SqlAnalysis } from './sqlTypes';
+import type { SqlSemanticIssue } from './sqlSchemaCore';
+import type { SqlService } from './sqlService';
+import { isSqlRequestCancelled, sqlDocumentSnapshot, sqlServiceFailureMessage } from './sqlServiceContext';
 
 export interface RegionAnalysis {
   region: SqlJsonRegion;
   sql: SqlAnalysis;
+  semantics: readonly SqlSemanticIssue[];
+  failure?: string;
 }
 
 export interface SqlJsonAnalysis {
@@ -28,9 +32,10 @@ export async function analyzeSqlJsonDocument(
   document: vscode.TextDocument,
   projected: ProjectedJsonDocument,
   configuration: ExtensionConfiguration,
-  schema?: SchemaSnapshot,
+  sqlService: SqlService,
+  schemaKey?: string,
 ): Promise<SqlJsonAnalysis> {
-  const regions = analyzeSqlJsonRegions(projected, configuration);
+  const regions = await analyzeSqlJsonRegions(document, projected, configuration, sqlService, schemaKey);
   const sqlRegions = regions.map((region) => region.region);
   const diagnostics = (
     await projected.service.doValidation(
@@ -75,7 +80,7 @@ export async function analyzeSqlJsonDocument(
   }
 
   for (const regionAnalysis of regions) {
-    appendSqlDiagnostics(document, projected, configuration, regionAnalysis, diagnostics, schema);
+    appendSqlDiagnostics(document, projected, configuration, regionAnalysis, diagnostics);
   }
   return { diagnostics, regions };
 }
@@ -109,22 +114,36 @@ function overlaps(leftStart: number, leftEnd: number, rightStart: number, rightE
   return leftStart < rightEnd && rightStart < leftEnd;
 }
 
-export function analyzeSqlJsonRegions(
+export async function analyzeSqlJsonRegions(
+  document: vscode.TextDocument,
   projected: ProjectedJsonDocument,
   configuration: ExtensionConfiguration,
-): RegionAnalysis[] {
-  return findSqlRegions(projected, configuration).map((region) => ({
-    region,
-    sql: analyzeSql(region.decoded.text, configuration.dialect, configuration.placeholderPatterns),
+  sqlService: SqlService,
+  schemaKey?: string,
+): Promise<RegionAnalysis[]> {
+  return Promise.all(findSqlRegions(projected, configuration).map(async (region): Promise<RegionAnalysis> => {
+    try {
+      const result = await sqlService.analyze(
+        sqlDocumentSnapshot(document, configuration, region.decoded.text, `region:${region.originalRange.start}`),
+        { schemaKey, udfs: configuration.udfs, validateSchema: shouldReportSchemaDiagnostics(configuration) },
+      );
+      return { region, ...result };
+    } catch (error) {
+      if (isSqlRequestCancelled(error)) throw error;
+      return { region, sql: { issues: [], tokens: [] }, semantics: [], failure: sqlServiceFailureMessage(error) };
+    }
   }));
 }
 
-export function analyzePlainSqlDocument(
+export async function analyzePlainSqlDocument(
   document: vscode.TextDocument,
   configuration: ExtensionConfiguration,
-  schema?: SchemaSnapshot,
-): { diagnostics: vscode.Diagnostic[]; sql: SqlAnalysis } {
-  const sql = analyzeSql(document.getText(), configuration.dialect, configuration.placeholderPatterns);
+  sqlService: SqlService,
+  schemaKey?: string,
+): Promise<{ diagnostics: vscode.Diagnostic[]; sql: SqlAnalysis }> {
+  const { sql, semantics } = await sqlService.analyze(sqlDocumentSnapshot(document, configuration), {
+    schemaKey, udfs: configuration.udfs, validateSchema: shouldReportSchemaDiagnostics(configuration),
+  });
   const diagnostics = sql.issues.map((issue) => createDiagnostic(
     document,
     { start: issue.start, end: issue.end },
@@ -132,14 +151,8 @@ export function analyzePlainSqlDocument(
     vscode.DiagnosticSeverity.Error,
     `${configuration.dialect} SQL`,
   ));
-  if (shouldReportSchemaDiagnostics(configuration) && schema) {
-    diagnostics.push(...analyzeSqlSemantics(
-      document.getText(),
-      configuration.dialect,
-      configuration.placeholderPatterns,
-      schema,
-      configuration.udfs,
-    ).map((issue) => createDiagnostic(
+  if (shouldReportSchemaDiagnostics(configuration)) {
+    diagnostics.push(...semantics.map((issue) => createDiagnostic(
       document,
       issue,
       issue.message,
@@ -166,9 +179,12 @@ function appendSqlDiagnostics(
   configuration: ExtensionConfiguration,
   regionAnalysis: RegionAnalysis,
   diagnostics: vscode.Diagnostic[],
-  schema?: SchemaSnapshot,
 ): void {
   const { region, sql } = regionAnalysis;
+  if (regionAnalysis.failure) {
+    diagnostics.push(createDiagnostic(document, region.originalRange, regionAnalysis.failure,
+      vscode.DiagnosticSeverity.Warning, 'AIOps SQL JSON', 'sql-analysis-incomplete'));
+  }
   for (const issue of sql.issues) {
     const spans = mapDecodedRange(region.decoded, issue.start, issue.end);
     const span = { start: spans[0]?.start ?? region.originalRange.start, end: spans.at(-1)?.end ?? region.originalRange.end };
@@ -181,14 +197,8 @@ function appendSqlDiagnostics(
     ));
   }
 
-  if (shouldReportSchemaDiagnostics(configuration) && schema) {
-    for (const issue of analyzeSqlSemantics(
-      region.decoded.text,
-      configuration.dialect,
-      configuration.placeholderPatterns,
-      schema,
-      configuration.udfs,
-    )) {
+  if (shouldReportSchemaDiagnostics(configuration)) {
+    for (const issue of regionAnalysis.semantics) {
       const spans = mapDecodedRange(region.decoded, issue.start, issue.end);
       const span = {
         start: spans[0]?.start ?? region.originalRange.start,

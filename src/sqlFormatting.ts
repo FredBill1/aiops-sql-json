@@ -316,7 +316,7 @@ function annotateFunctionCalls(tokens: FormattingToken[], statements: readonly S
     'and', 'between', 'case', 'exists', 'in', 'is', 'like', 'not', 'or', 'over', 'similar', 'xor',
   ]);
   const visit = (node: SqlAstNode): void => {
-    if ((node.role === 'function' || node.role === 'unnest') && !nonCallKinds.has(node.kind.toLocaleLowerCase())) {
+    if (node.source && !nonCallKinds.has(node.kind.toLocaleLowerCase())) {
       const nameIndices: number[] = [];
       for (let index = 0; index < tokens.length; index += 1) {
         const token = tokens[index]!;

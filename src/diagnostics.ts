@@ -4,6 +4,8 @@ import { analyzePlainSqlDocument, analyzeSqlJsonDocument } from './analysis';
 import { getExtensionConfiguration } from './config';
 import type { JsonServiceManager } from './jsonService';
 import type { SqlSchemaService } from './schemaService';
+import type { SqlService } from './sqlService';
+import { isSqlRequestCancelled, sqlServiceFailureMessage } from './sqlServiceContext';
 
 export class DiagnosticController implements vscode.Disposable {
   private readonly collection = vscode.languages.createDiagnosticCollection('aiops-sql-json');
@@ -17,6 +19,7 @@ export class DiagnosticController implements vscode.Disposable {
     private readonly jsonServices: JsonServiceManager,
     private readonly refreshSemanticTokens: () => void,
     private readonly schemas: SqlSchemaService,
+    private readonly sqlService: SqlService,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.schedule(document, 0)),
@@ -27,6 +30,7 @@ export class DiagnosticController implements vscode.Disposable {
           || event.affectsConfiguration('json.schemaDownload.enable')) {
           this.jsonServices.clear();
           this.schemas.clear();
+          this.sqlService.clear();
           this.refreshSemanticTokens();
           for (const document of vscode.workspace.textDocuments) {
             this.schedule(document, 0);
@@ -44,6 +48,14 @@ export class DiagnosticController implements vscode.Disposable {
           this.schedule(document, 0);
         }
       }),
+      this.sqlService.onDidRecover((event) => {
+        this.refreshSemanticTokens();
+        if (event.lane === 'analysis') {
+          for (const document of vscode.workspace.textDocuments) {
+            this.schedule(document, 0);
+          }
+        }
+      }),
     );
 
     for (const document of vscode.workspace.textDocuments) {
@@ -56,6 +68,7 @@ export class DiagnosticController implements vscode.Disposable {
       return;
     }
     const key = document.uri.toString();
+    this.sqlService.updateDocument(key, document.version);
     const request = (this.validationRequests.get(key) ?? 0) + 1;
     this.validationRequests.set(key, request);
     const existing = this.timers.get(key);
@@ -84,21 +97,51 @@ export class DiagnosticController implements vscode.Disposable {
       return;
     }
     const version = document.version;
+    const generation = this.sqlService.generation;
     const configuration = getExtensionConfiguration(document.uri);
     this.warnAboutConfiguration(configuration.placeholderIssues);
     const schema = await this.schemas.getSchema(document.uri, configuration);
+    if (this.disposed || document.isClosed || document.version !== version
+      || this.sqlService.generation !== generation
+      || this.validationRequests.get(document.uri.toString()) !== request) return;
 
     let diagnostics: vscode.Diagnostic[];
-    if (document.languageId === 'sql-json') {
-      const projected = this.jsonServices.createDocument(document, configuration);
-      diagnostics = (await analyzeSqlJsonDocument(document, projected, configuration, schema)).diagnostics;
-    } else if (document.languageId === 'sql' && configuration.plainSqlEnabled) {
-      diagnostics = analyzePlainSqlDocument(document, configuration, schema).diagnostics;
-    } else {
-      diagnostics = [];
+    const schemaKey = this.schemas.getSchemaKey(schema);
+    const schemaFailure = this.schemas.getSchemaFailure(schema);
+    const validationConfiguration = schemaFailure && !schemaKey
+      ? { ...configuration, schemaValidationCompletionOnly: true }
+      : configuration;
+    try {
+      if (document.languageId === 'sql-json') {
+        const projected = this.jsonServices.createDocument(document, configuration);
+        diagnostics = (await analyzeSqlJsonDocument(document, projected, validationConfiguration,
+          this.sqlService, schemaKey)).diagnostics;
+      } else if (document.languageId === 'sql' && configuration.plainSqlEnabled) {
+        diagnostics = (await analyzePlainSqlDocument(document, validationConfiguration,
+          this.sqlService, schemaKey)).diagnostics;
+      } else {
+        diagnostics = [];
+      }
+    } catch (error) {
+      if (isSqlRequestCancelled(error)) return;
+      const diagnostic = new vscode.Diagnostic(
+        new vscode.Range(document.positionAt(0), document.positionAt(Math.min(1, document.getText().length))),
+        sqlServiceFailureMessage(error), vscode.DiagnosticSeverity.Warning,
+      );
+      diagnostic.source = 'AIOps SQL JSON';
+      diagnostic.code = 'sql-analysis-incomplete';
+      diagnostics = [diagnostic];
+    }
+    if (schemaFailure) {
+      const diagnostic = new vscode.Diagnostic(new vscode.Range(0, 0, 0, 0),
+        `SQL Schema indexing could not complete. ${schemaFailure}`, vscode.DiagnosticSeverity.Warning);
+      diagnostic.source = 'AIOps SQL JSON';
+      diagnostic.code = 'sql-schema-incomplete';
+      diagnostics.push(diagnostic);
     }
 
     if (!this.disposed && !document.isClosed && document.version === version
+      && this.sqlService.generation === generation
       && this.validationRequests.get(document.uri.toString()) === request) {
       this.collection.set(document.uri, diagnostics);
     }
@@ -113,6 +156,7 @@ export class DiagnosticController implements vscode.Disposable {
     }
     this.validationRequests.delete(key);
     this.collection.delete(document.uri);
+    this.sqlService.clearDocument(key);
   }
 
   private warnAboutConfiguration(issues: readonly string[]): void {

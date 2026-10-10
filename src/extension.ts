@@ -1,3 +1,5 @@
+import { url as inspectorUrl } from 'node:inspector';
+
 import * as vscode from 'vscode';
 
 import { getExtensionConfiguration } from './config';
@@ -12,6 +14,8 @@ import { SqlSchemaService, type SchemaRebuildRequest } from './schemaService';
 import { SEMANTIC_TOKEN_LEGEND, SqlSemanticTokensProvider } from './semanticTokens';
 import { SqlCompletionProvider } from './sqlCompletion';
 import { SqlDefinitionProvider, SqlHoverProvider } from './sqlNavigation';
+import { SqlService } from './sqlService';
+import { resolveSqlDeadlinePolicy, serializeSqlWorkerMetadata, type SqlExtensionMode } from './sqlDeadlinePolicy';
 
 const SQL_JSON_SELECTOR: vscode.DocumentFilter[] = [
   { language: 'sql-json', scheme: 'file' },
@@ -28,15 +32,31 @@ const SQL_SELECTOR: vscode.DocumentFilter[] = [
 const REBUILD_SCHEMA_INDEX_COMMAND = 'aiopsSqlJson.rebuildSchemaIndex';
 
 export function activate(context: vscode.ExtensionContext): void {
+  const extensionMode: SqlExtensionMode = context.extensionMode === vscode.ExtensionMode.Development
+    ? 'development'
+    : context.extensionMode === vscode.ExtensionMode.Test ? 'test' : 'production';
+  const deadlinePolicy = resolveSqlDeadlinePolicy(
+    extensionMode, inspectorUrl(), process.env.AIOPS_SQL_JSON_ENFORCE_TIMEOUTS,
+  );
+  const output = vscode.window.createOutputChannel('AIOps SQL JSON');
+  output.appendLine(JSON.stringify({ event: 'deadline-policy', extensionMode, policy: deadlinePolicy }));
+  const sqlService = new SqlService({
+    analysisWorkerPath: context.asAbsolutePath('dist/sqlAnalysisWorker.js'),
+    lexicalWorkerPath: context.asAbsolutePath('dist/sqlLexicalWorker.js'),
+    deadlinePolicy,
+    onWorkerEvent: (event) => output.appendLine(serializeSqlWorkerMetadata(event)),
+  });
   const jsonServices = new JsonServiceManager();
   const editingContexts = new SqlEditingContextService(jsonServices);
-  const semanticTokens = new SqlSemanticTokensProvider(jsonServices);
-  const schemas = new SqlSchemaService();
-  const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh(), schemas);
+  const semanticTokens = new SqlSemanticTokensProvider(jsonServices, sqlService);
+  const schemas = new SqlSchemaService(sqlService);
+  const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh(), schemas, sqlService);
   const bracketDecorations = new SqlBracketDecorationController(editingContexts);
   const editingCommands = new SqlEditingCommands(editingContexts);
 
   context.subscriptions.push(
+    output,
+    sqlService,
     semanticTokens,
     schemas,
     diagnostics,
@@ -64,7 +84,14 @@ export function activate(context: vscode.ExtensionContext): void {
         },
         () => schemas.rebuild(requests),
       );
-      void vscode.window.showInformationMessage('AIOps SQL JSON: Schema index rebuilt.');
+      const snapshots = await Promise.all(requests.map((request) => schemas.getSchema(
+        request.resource, request.configuration, true,
+      )));
+      if (snapshots.some((snapshot) => schemas.getSchemaFailure(snapshot))) {
+        void vscode.window.showWarningMessage('AIOps SQL JSON: Schema index rebuild could not complete. See SQL diagnostics for details.');
+      } else {
+        void vscode.window.showInformationMessage('AIOps SQL JSON: Schema index rebuilt.');
+      }
     }),
     vscode.languages.registerDocumentSemanticTokensProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
@@ -79,7 +106,7 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.languages.registerCompletionItemProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlCompletionProvider(jsonServices, schemas),
+      new SqlCompletionProvider(jsonServices, schemas, sqlService),
       ' ',
       '.',
       '(',
@@ -88,15 +115,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.languages.registerHoverProvider(SQL_JSON_SELECTOR, new JsonHoverProvider(jsonServices)),
     vscode.languages.registerHoverProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlHoverProvider(jsonServices, schemas),
+      new SqlHoverProvider(jsonServices, schemas, sqlService),
     ),
     vscode.languages.registerDefinitionProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlDefinitionProvider(jsonServices, schemas),
+      new SqlDefinitionProvider(jsonServices, schemas, sqlService),
     ),
     vscode.languages.registerDocumentFormattingEditProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlDocumentFormattingProvider(jsonServices),
+      new SqlDocumentFormattingProvider(sqlService),
     ),
   );
 }

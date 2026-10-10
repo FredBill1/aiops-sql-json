@@ -1,4 +1,4 @@
-import { AnonymousExpr, ColumnExpr, IdentifierExpr, KwargExpr, TokenType, type Expression } from '@hdnax/sqlingo.js';
+import { AnonymousExpr, ColumnExpr, IdentifierExpr, KwargExpr, TokenType, type Expression, type Token } from '@hdnax/sqlingo.js';
 import { Trino } from '@hdnax/sqlingo.js/trino';
 
 /** Flink's additions to the shared SQL grammar, preserving the original tokens. */
@@ -11,15 +11,20 @@ class FlinkTokenizer extends Trino.Tokenizer {
 }
 
 class FlinkParser extends Trino.Parser {
+  /** The source-aware adapter supplies provenance without coupling this grammar to its registry. */
+  protected recordSourceConstructor(...source: [Expression, Token, readonly Expression[]]): void { void source; }
+
   override parseBracket(expression?: Expression): Expression | undefined {
     if (expression instanceof ColumnExpr && !expression.args.table
       && expression.args.this instanceof IdentifierExpr && !expression.args.this.args.quoted
       && expression.name.toUpperCase() === 'MAP' && this.match(TokenType.L_BRACKET)) {
+      const token = this.tokens[this.index - 2];
       const args = this.parseCsv(() => this.parseBracketKeyValue());
       if (!this.match(TokenType.R_BRACKET)) this.raiseError('Expected ]');
       if (args.length % 2 !== 0) this.raiseError('MAP requires key/value pairs');
       const map = new AnonymousExpr({ this: 'MAP', expressions: args });
       map.updatePositions(expression);
+      if (token) this.recordSourceConstructor(map, token, args);
       return super.parseBracket(map);
     }
     return super.parseBracket(expression);

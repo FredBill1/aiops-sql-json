@@ -12,6 +12,21 @@
         "${workspaceFolder}/dist/**/*.js"
       ],
       "preLaunchTask": "npm: build"
+    },
+    {
+      "name": "Run Extension (Production Deadlines)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/dist/**/*.js"
+      ],
+      "env": {
+        "AIOPS_SQL_JSON_ENFORCE_TIMEOUTS": "1"
+      },
+      "preLaunchTask": "npm: build"
     }
   ]
 }

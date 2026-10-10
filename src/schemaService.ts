@@ -1,4 +1,5 @@
 import * as os from 'node:os';
+import { createHash } from 'node:crypto';
 
 import * as vscode from 'vscode';
 
@@ -9,19 +10,23 @@ import {
   type SchemaPatternContext,
 } from './schemaPatterns';
 import { getResourceWorkspaceFolder } from './resourceContext';
-import { createSchemaSnapshot, parseDdlSchema, type SchemaIssue, type SchemaSnapshot } from './sqlSchemaCore';
+import type { SchemaIssue, SchemaSnapshot } from './sqlSchemaCore';
+import { SqlServiceError, type SqlService } from './sqlService';
+import { sqlServiceFailureMessage } from './sqlServiceContext';
 
 const EMPTY_SCHEMA: SchemaSnapshot = { tables: [], issues: [] };
 
 interface SchemaBuildResult {
   snapshot: SchemaSnapshot;
   sources?: readonly { uri: vscode.Uri; text: string }[];
+  failure?: string;
 }
 
 interface SchemaCacheEntry {
   generation: number;
   promise: Promise<SchemaBuildResult>;
   committed: boolean;
+  failure?: SqlServiceError;
 }
 
 export interface SchemaRebuildRequest {
@@ -43,9 +48,23 @@ export class SqlSchemaService implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private invalidationTimer: NodeJS.Timeout | undefined;
   private generation = 0;
+  private readonly schemaKeys = new WeakMap<SchemaSnapshot, string>();
+  private readonly schemaGenerations = new WeakMap<SchemaSnapshot, number>();
+  private readonly schemaFailures = new WeakMap<SchemaSnapshot, string>();
+  private readonly workerSchemaKeys = new Set<string>();
 
-  constructor() {
+  constructor(private readonly sqlService: SqlService) {
     this.disposables.push(
+      sqlService.onDidRecover((event) => {
+        if (event.lane !== 'analysis') return;
+        let invalidated = false;
+        for (const [key, entry] of this.cache) {
+          if (!entry.failure?.retryable) continue;
+          this.cache.delete(key);
+          invalidated = true;
+        }
+        if (invalidated) this.changedEmitter.fire();
+      }),
       vscode.workspace.onDidChangeTextDocument((event) => {
         if (this.schemaUris.has(event.document.uri.toString())) {
           this.invalidate();
@@ -61,6 +80,19 @@ export class SqlSchemaService implements vscode.Disposable {
       vscode.workspace.onDidRenameFiles(() => this.invalidate()),
       vscode.workspace.onDidChangeWorkspaceFolders(() => this.clear()),
     );
+  }
+
+  getSchemaKey(snapshot: SchemaSnapshot): string | undefined {
+    return this.schemaKeys.get(snapshot);
+  }
+
+  getSchemaFailure(snapshot: SchemaSnapshot): string | undefined {
+    return this.schemaFailures.get(snapshot);
+  }
+
+  isSchemaCurrent(snapshot: SchemaSnapshot): boolean {
+    return !this.schemaKeys.has(snapshot) || (!this.invalidationTimer
+      && this.schemaGenerations.get(snapshot) === this.generation);
   }
 
   async getSchema(
@@ -95,13 +127,17 @@ export class SqlSchemaService implements vscode.Disposable {
       udfs: configuration.udfs,
       schemaDiagnostics: !configuration.schemaValidationCompletionOnly,
     });
-    const existing = this.cache.get(key);
+    let existing = this.cache.get(key);
+    if (existing?.failure?.retryable && (existing.failure.retryAfter ?? 0) <= Date.now()) {
+      this.cache.delete(key);
+      existing = undefined;
+    }
     if (existing) {
       if (!waitForFresh && !existing.committed && this.lastGood.has(key)) {
         void this.resolveEntry(key, existing, configuration);
         return this.lastGood.get(key)!;
       }
-      return this.resolveEntry(key, existing, configuration);
+      return this.resolveForRequest(resource, configuration, key, existing, waitForFresh);
     }
     for (const pattern of resolved.patterns) {
       this.ensureWatchers(pattern);
@@ -109,7 +145,19 @@ export class SqlSchemaService implements vscode.Disposable {
     const fallback = this.lastGood.get(key) ?? EMPTY_SCHEMA;
     const entry: SchemaCacheEntry = {
       generation: this.generation,
-      promise: this.buildSchema(resolved.patterns, configuration, this.generation).catch(() => ({ snapshot: fallback })),
+      promise: this.buildSchema(resolved.patterns, configuration, this.generation).catch((error: unknown) => {
+        entry.failure = error instanceof SqlServiceError ? error : undefined;
+        // A failed build is distinct from a successfully indexed empty Schema.
+        const snapshot = { ...fallback };
+        const fallbackKey = this.schemaKeys.get(fallback);
+        if (fallbackKey) {
+          this.schemaKeys.set(snapshot, fallbackKey);
+          this.schemaGenerations.set(snapshot, this.schemaGenerations.get(fallback)!);
+        }
+        const failure = sqlServiceFailureMessage(error);
+        this.schemaFailures.set(snapshot, failure);
+        return { snapshot, failure };
+      }),
       committed: false,
     };
     this.cache.set(key, entry);
@@ -117,7 +165,7 @@ export class SqlSchemaService implements vscode.Disposable {
       void this.resolveEntry(key, entry, configuration);
       return fallback;
     }
-    return this.resolveEntry(key, entry, configuration);
+    return this.resolveForRequest(resource, configuration, key, entry, waitForFresh);
   }
 
   async rebuild(requests: readonly SchemaRebuildRequest[]): Promise<void> {
@@ -177,9 +225,37 @@ export class SqlSchemaService implements vscode.Disposable {
       }
       const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
       const text = openDocument?.getText() ?? new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
-      return { uri, text, parsed: parseDdlSchema(text, configuration.dialect, uri.toString()) };
+      return { uri, text };
     }));
-    const snapshot = createSchemaSnapshot(parsed.map((item) => item.parsed), configuration.udfs);
+    const key = JSON.stringify({
+      generation,
+      dialect: configuration.dialect,
+      udfs: configuration.udfs,
+      sources: parsed.map((item) => ({
+        uri: item.uri.toString(),
+        hash: createHash('sha256').update(item.text).digest('hex'),
+      })),
+    });
+    if (generation !== this.generation) throw new Error('SQL Schema generation was superseded.');
+    this.workerSchemaKeys.add(key);
+    let snapshot: SchemaSnapshot;
+    try {
+      snapshot = await this.sqlService.buildSchema(
+        key,
+        parsed.map((item) => ({ source: item.uri.toString(), text: item.text })),
+        configuration.dialect,
+        configuration.udfs,
+      );
+    } catch (error) {
+      this.releaseWorkerSchema(key);
+      throw error;
+    }
+    if (generation !== this.generation) {
+      this.releaseWorkerSchema(key);
+      throw new Error('SQL Schema generation was superseded.');
+    }
+    this.schemaKeys.set(snapshot, key);
+    this.schemaGenerations.set(snapshot, generation);
     return {
       snapshot,
       sources: parsed.map((item) => ({ uri: item.uri, text: item.text })),
@@ -197,7 +273,15 @@ export class SqlSchemaService implements vscode.Disposable {
     }
     if (!entry.committed) {
       entry.committed = true;
-      this.lastGood.set(key, result.snapshot);
+      if (!result.failure) {
+        const previous = this.lastGood.get(key);
+        this.lastGood.set(key, result.snapshot);
+        const previousKey = previous && this.schemaKeys.get(previous);
+        if (previousKey && previousKey !== this.schemaKeys.get(result.snapshot)
+          && ![...this.lastGood.values()].some((snapshot) => this.schemaKeys.get(snapshot) === previousKey)) {
+          this.releaseWorkerSchema(previousKey);
+        }
+      }
       if (result.sources) {
         for (const source of result.sources) {
           this.schemaUris.add(source.uri.toString());
@@ -209,6 +293,22 @@ export class SqlSchemaService implements vscode.Disposable {
       this.changedEmitter.fire();
     }
     return result.snapshot;
+  }
+
+  private async resolveForRequest(
+    resource: vscode.Uri,
+    configuration: ExtensionConfiguration,
+    key: string,
+    entry: SchemaCacheEntry,
+    waitForFresh: boolean,
+  ): Promise<SchemaSnapshot> {
+    const snapshot = await this.resolveEntry(key, entry, configuration);
+    // Navigation must not publish DDL ranges already invalidated during a build.
+    if (waitForFresh && (entry.generation !== this.generation || this.cache.get(key) !== entry
+      || this.invalidationTimer)) {
+      return this.getSchema(resource, configuration, true);
+    }
+    return snapshot;
   }
 
   private ensureWatchers(pattern: ResolvedSchemaPattern): void {
@@ -318,6 +418,8 @@ export class SqlSchemaService implements vscode.Disposable {
       this.invalidationTimer = undefined;
     }
     this.generation += 1;
+    for (const key of this.workerSchemaKeys) this.sqlService.releaseSchema(key);
+    this.workerSchemaKeys.clear();
     this.cache.clear();
     this.lastGood.clear();
     this.schemaUris.clear();
@@ -336,6 +438,15 @@ export class SqlSchemaService implements vscode.Disposable {
     }
     this.generation += 1;
     this.cache.clear();
+    const retained = new Set([...this.lastGood.values()].map((snapshot) => this.schemaKeys.get(snapshot)));
+    for (const key of this.workerSchemaKeys) {
+      if (!retained.has(key)) this.releaseWorkerSchema(key);
+    }
+  }
+
+  private releaseWorkerSchema(key: string): void {
+    this.workerSchemaKeys.delete(key);
+    this.sqlService.releaseSchema(key);
   }
 }
 

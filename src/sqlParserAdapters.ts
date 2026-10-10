@@ -1,5 +1,6 @@
 import {
-  BooleanExpr, DataTypeExpr, Expression, IgnoreNullsExpr, RespectNullsExpr, TokenType, WindowExpr,
+  BooleanExpr, BracketExpr, ColumnExpr, DataTypeExpr, Expression, FilterExpr, IdentifierExpr,
+  IgnoreNullsExpr, RespectNullsExpr, TokenType, WindowExpr, WithinGroupExpr,
   type Parser, type Token,
 } from '@hdnax/sqlingo.js';
 import { Hive } from '@hdnax/sqlingo.js/hive';
@@ -9,21 +10,36 @@ import { Spark } from '@hdnax/sqlingo.js/spark';
 import { Trino } from '@hdnax/sqlingo.js/trino';
 import { FlinkDialect } from './sqlFlinkDialect';
 
-export interface SqlSourceCall {
+export interface SqlSourceFunction {
+  readonly id: number;
   readonly name: string;
   readonly start: number;
   readonly nameEnd: number;
-  readonly arguments: readonly Expression[];
+  /** Absent when a dedicated grammar parsed only part of the source argument list. */
+  readonly arguments?: readonly Expression[];
 }
 
-/** Source arguments are not the rewritten expression's implementation slots. */
-export const sqlSourceCalls = new WeakMap<Expression, SqlSourceCall>();
-/** Keep scalar type spellings that the parser otherwise normalizes across dialects. */
-export const sqlSourceTypeNames = new WeakMap<Expression, string>();
+const SOURCE_ID = 'aiopsSqlJsonSourceId';
+const SOURCE_SESSION = 'aiopsSqlJsonSourceSession';
+const SOURCE_TYPE_NAME = 'aiopsSqlJsonSourceTypeName';
+let nextSourceId = 1;
+
+/** Parser copies preserve metadata; an external expression WeakMap would lose this provenance. */
+export function sqlSourceFunction(expression: Expression): SqlSourceFunction | undefined {
+  const id = expression.meta[SOURCE_ID];
+  const session = expression.meta[SOURCE_SESSION];
+  return typeof id === 'number' && session instanceof Map ? session.get(id) as SqlSourceFunction | undefined : undefined;
+}
+
+export function sqlSourceTypeName(expression: Expression): string | undefined {
+  const name = expression.meta[SOURCE_TYPE_NAME];
+  return typeof name === 'string' ? name : undefined;
+}
 
 function sourceAwareParser<P extends typeof Parser>(Base: P, nullTreatmentArgument = false): P {
   const Parent: typeof Parser = Base;
   return class SourceAwareParser extends Parent {
+    private readonly sourceSession = new Map<number, SqlSourceFunction>();
     private readonly calls: {
       token?: Token;
       openingParenthesis?: Token;
@@ -37,7 +53,7 @@ function sourceAwareParser<P extends typeof Parser>(Base: P, nullTreatmentArgume
       // A single token is a source type name, not a suffix-modified or nested
       // type (for example INT[], TIMESTAMP WITH TIME ZONE, or STRUCT<...>).
       if (result instanceof DataTypeExpr && token && this.index === index + 1) {
-        sqlSourceTypeNames.set(result, token.text);
+        result.meta[SOURCE_TYPE_NAME] = token.text;
       }
       return result;
     }
@@ -61,6 +77,45 @@ function sourceAwareParser<P extends typeof Parser>(Base: P, nullTreatmentArgume
       const args = super.parseFunctionArgs(options);
       if (call && completeSourceList) call.arguments = [...args];
       return args;
+    }
+
+    protected recordSourceConstructor(expression: Expression, token: Token, args: readonly Expression[]): void {
+      this.recordSource(expression, token, args);
+    }
+
+    private recordSource(expression: Expression, token: Token, args?: readonly Expression[]): void {
+      const id = nextSourceId++;
+      this.sourceSession.set(id, {
+        id, name: token.text, start: token.start, nameEnd: token.end + 1,
+        ...(args ? { arguments: [...args] } : {}),
+      });
+      expression.meta[SOURCE_ID] = id;
+      expression.meta[SOURCE_SESSION] = this.sourceSession;
+    }
+
+    override parseUnnest(options: Parameters<Parser['parseUnnest']>[0] = {}): ReturnType<Parser['parseUnnest']> {
+      const token = this.curr;
+      const result = super.parseUnnest(options);
+      if (result && token) this.recordSource(result, token, result.args.expressions?.filter(
+        (argument): argument is Expression => argument instanceof Expression,
+      ));
+      return result;
+    }
+
+    override parseBracket(expression?: Expression): Expression | undefined {
+      const constructor = expression instanceof ColumnExpr && !expression.args.table
+        && expression.args.this instanceof IdentifierExpr && !expression.args.this.args.quoted
+        && this.curr?.tokenType === TokenType.L_BRACKET ? Base.ARRAY_CONSTRUCTORS[expression.name.toUpperCase()] : undefined;
+      const token = constructor ? this.prev : undefined;
+      const result = super.parseBracket(expression);
+      if (constructor && token && result) {
+        let target = result;
+        while (target instanceof BracketExpr && target.args.this instanceof Expression) target = target.args.this;
+        if (target instanceof constructor && !sqlSourceFunction(target)) {
+          this.recordSource(target, token, target.args.expressions as Expression[] | undefined);
+        }
+      }
+      return result;
     }
 
     override parseFunctionCall(options: Parameters<Parser['parseFunctionCall']>[0] = {}): Expression | undefined {
@@ -92,14 +147,12 @@ function sourceAwareParser<P extends typeof Parser>(Base: P, nullTreatmentArgume
           options = { ...options, functions };
         }
         const result = super.parseFunctionCall(options);
-        if (result && call.token && call.arguments) {
+        if (result && call.token) {
           let target = result;
-          while ((target instanceof WindowExpr || target instanceof IgnoreNullsExpr || target instanceof RespectNullsExpr)
+          while ((target instanceof WindowExpr || target instanceof IgnoreNullsExpr || target instanceof RespectNullsExpr
+            || target instanceof FilterExpr || target instanceof WithinGroupExpr)
             && target.args.this instanceof Expression) target = target.args.this;
-          sqlSourceCalls.set(target, {
-            name: call.token.text, start: call.token.start, nameEnd: call.token.end + 1,
-            arguments: call.arguments,
-          });
+          this.recordSource(target, call.token, call.arguments);
         }
         return result;
       } finally {

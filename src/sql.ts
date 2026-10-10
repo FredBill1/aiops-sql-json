@@ -1,18 +1,14 @@
-import {
-  FlinkSQL,
-  GenericSQL,
-  HiveSQL,
-  ImpalaSQL,
-  MySQL,
-  PostgreSQL,
-  SparkSQL,
-  TrinoSQL,
-} from 'dt-sql-parser';
 import type { CaretPosition, EntityContext, ParseError, Suggestions } from 'dt-sql-parser';
 import type { ParserRuleContext, Token } from 'antlr4ng';
 
 import { maskPlaceholders } from './patterns';
+import type { SqlDialect } from './sqlDialect';
+import {
+  classifySqlTokens, getSqlTokenSymbolicName, readSqlLexerTokens, sqlCodePointOffsets, sqlTokenInUtf16,
+} from './sqlLexing';
+import { getSqlParser } from './sqlParserFactory';
 import { normalizeSqlParserGaps } from './sqlParserGaps';
+import type { SqlAnalysis, SqlIssue } from './sqlTypes';
 import {
   astArgumentRole,
   isSqlAstNode,
@@ -22,36 +18,10 @@ import {
   type SqlAstValue,
 } from './sqlAst';
 
-export const SQL_DIALECTS = [
-  'spark',
-  'hive',
-  'flink',
-  'mysql',
-  'postgresql',
-  'trino',
-  'impala',
-  'generic',
-] as const;
-
-export type SqlDialect = (typeof SQL_DIALECTS)[number];
-export type SqlTokenType = 'comment' | 'string' | 'keyword' | 'number' | 'operator' | 'function' | 'variable';
-
-export interface SqlIssue {
-  start: number;
-  end: number;
-  message: string;
-}
-
-export interface SqlToken {
-  start: number;
-  end: number;
-  type: SqlTokenType;
-}
-
-export interface SqlAnalysis {
-  issues: SqlIssue[];
-  tokens: SqlToken[];
-}
+export { SQL_DIALECTS, isSqlDialect, type SqlDialect } from './sqlDialect';
+export { lexSql, tokenizeSql } from './sqlLexing';
+export { getSqlParser, type ParserLike, type VocabularyLike } from './sqlParserFactory';
+export type { SqlAnalysis, SqlIssue, SqlLexToken, SqlToken, SqlTokenType } from './sqlTypes';
 
 interface StructuralSqlIssue extends SqlIssue {
   contextStart?: number;
@@ -64,35 +34,6 @@ interface StructuralScopeState {
   mergeNeedsOn: boolean;
 }
 
-export interface ParserLike {
-  parse(input: string): ParserRuleContext;
-  validate(input: string): ParseError[];
-  getAllTokens(input: string): Token[];
-  getSuggestionAtCaretPosition(input: string, caretPosition: CaretPosition): Suggestions | null;
-  getAllEntities(input: string, caretPosition?: CaretPosition): EntityContext[] | null;
-  createLexer(input: string): { vocabulary: VocabularyLike };
-}
-
-export interface VocabularyLike {
-  readonly maxTokenType: number;
-  getLiteralName(tokenType: number): string | null;
-  getSymbolicName(tokenType: number): string | null;
-}
-
-export interface SqlLexToken {
-  start: number;
-  end: number;
-  text: string;
-  symbolicName: string;
-  channel: number;
-}
-
-const parserCache = new Map<SqlDialect, ParserLike>();
-
-export function isSqlDialect(value: unknown): value is SqlDialect {
-  return typeof value === 'string' && (SQL_DIALECTS as readonly string[]).includes(value);
-}
-
 export function analyzeSql(text: string, dialect: SqlDialect, placeholders: readonly RegExp[]): SqlAnalysis {
   if (text.trim().length === 0) {
     return { issues: [], tokens: [] };
@@ -101,13 +42,13 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
   const parser = getSqlParser(dialect);
   const masked = maskPlaceholders(text, placeholders).text;
   const parserNormalization = normalizeSqlParserGaps(masked, dialect);
-  const parserText = parserNormalization.text;
+  const parserText = parserNormalization.text.replace(/\r(?!\n)/gu, '\n');
   let errors: ParseError[] = [];
   let antlrTokens: Token[] = [];
   let parseTree: ParserRuleContext | undefined;
   try {
     errors = parser.validate(parserText);
-    antlrTokens = parser.getAllTokens(masked);
+    antlrTokens = readSqlLexerTokens(masked, dialect);
     if (errors.length === 0 && hasMultipleTopLevelStatementStarts(antlrTokens)) {
       parseTree = parser.parse(parserText);
     }
@@ -124,25 +65,16 @@ export function analyzeSql(text: string, dialect: SqlDialect, placeholders: read
     && (errors.length > 0 || parseTree !== undefined || hasParenthesizedAliasCandidate(antlrTokens))
     ? parseSqlAst(text, dialect, placeholders)
     : undefined;
-  const structuralIssues = findStructuralIssues(antlrTokens, parseTree, fallbackAst);
+  const structuralIssues = findStructuralIssues(antlrTokens, parseTree, fallbackAst, sqlCodePointOffsets(parserText));
   const parserIssues = errors.length > 0 && fallbackAst && structuralIssues.length === 0
     && !parserNormalization.hasMalformedSyntax
     ? []
-    : errors.map((error) => parseErrorToIssue(text, error));
+    : errors.map((error) => parseErrorToIssue(text, parserText, error));
   const uncoveredStructuralIssues = structuralIssues
     .filter((issue) => !parserIssues.some((parserIssue) => parserIssueCoversStructuralIssue(parserIssue, issue)))
     .map(stripStructuralContext);
   const issues = deduplicateIssues([...parserIssues, ...uncoveredStructuralIssues]);
-  const tokens = antlrTokens.flatMap((token, index) => {
-    if (token.start < 0 || token.stop < token.start) {
-      return [];
-    }
-    const symbolicName = getSymbolicName(token);
-    const type = classifyToken(symbolicName, token.text ?? text.slice(token.start, token.stop + 1), antlrTokens, index);
-    return type ? [{ start: token.start, end: token.stop + 1, type }] : [];
-  });
-
-  return { issues, tokens };
+  return { issues, tokens: classifySqlTokens(antlrTokens) };
 }
 
 export function getSqlSuggestions(
@@ -176,35 +108,6 @@ export function getSqlEntities(
   }
 }
 
-export function lexSql(
-  text: string,
-  dialect: SqlDialect,
-  placeholders: readonly RegExp[] = [],
-): SqlLexToken[] {
-  const masked = maskPlaceholders(text, placeholders).text;
-  // ANTLR indexes Unicode code points; all public source ranges use UTF-16.
-  // Normalize bare CR only in the lexer input: original token spelling (including
-  // literal/comment contents) is always recovered from the unmodified source.
-  const lexerText = masked.replace(/\r(?!\n)/gu, '\n');
-  const offsets = [0];
-  for (const character of lexerText) offsets.push(offsets[offsets.length - 1]! + character.length);
-  try {
-    return getSqlParser(dialect).getAllTokens(lexerText).flatMap((token) => (
-      token.start >= 0 && token.stop >= token.start
-        ? [{
-            start: offsets[token.start]!,
-            end: offsets[token.stop + 1]!,
-            text: text.slice(offsets[token.start], offsets[token.stop + 1]),
-            symbolicName: getSymbolicName(token),
-            channel: token.channel,
-          }]
-        : []
-    ));
-  } catch {
-    return [];
-  }
-}
-
 export function offsetToCaret(text: string, offset: number): CaretPosition {
   const safeOffset = Math.min(Math.max(offset, 0), text.length);
   let lineNumber = 1;
@@ -231,6 +134,7 @@ function findStructuralIssues(
   tokens: readonly Token[],
   parseTree?: ParserRuleContext,
   ast?: ParsedSqlAst,
+  parseTreeOffsets?: readonly number[],
 ): StructuralSqlIssue[] {
   const significant = tokens.filter((token) => token.channel === 0 && token.start >= 0 && token.stop >= token.start);
   const issues: StructuralSqlIssue[] = [];
@@ -390,7 +294,7 @@ function findStructuralIssues(
 
   appendCteStructuralIssues(significant, issues, seen, statementStarts);
   appendAlterStructuralIssues(significant, issues, seen);
-  if (parseTree) appendStatementSeparatorIssues(parseTree, issues, seen, ast);
+  if (parseTree) appendStatementSeparatorIssues(parseTree, issues, seen, ast, parseTreeOffsets);
   if (ast) appendAstStructuralIssues(ast, significant, issues, seen);
   return [...issues, ...findCaseStructuralIssues(significant)];
 }
@@ -462,8 +366,14 @@ function appendStatementSeparatorIssues(
   issues: StructuralSqlIssue[],
   seen: Set<string>,
   ast: ParsedSqlAst | undefined,
+  offsets: readonly number[] | undefined,
 ): void {
   const children = ((root as unknown as { children?: readonly RootContextChild[] }).children ?? [])
+    .map((child) => ({
+      symbol: child.symbol,
+      start: child.start && sqlTokenInUtf16(child.start, offsets),
+      stop: child.stop && sqlTokenInUtf16(child.stop, offsets),
+    }))
     .filter((child) => child.symbol === undefined && child.start && child.stop
       && child.start.start >= 0 && child.stop.stop >= child.start.start)
     .sort((left, right) => left.start!.start - right.start!.start);
@@ -709,7 +619,7 @@ function hasParenthesizedAliasCandidate(tokens: readonly Token[]): boolean {
 
 function structuralTokenName(token: Token | undefined): string {
   if (!token) return '';
-  const symbolicName = getSymbolicName(token).toUpperCase();
+  const symbolicName = getSqlTokenSymbolicName(token).toUpperCase();
   if (symbolicName.startsWith('KW_')) {
     return symbolicName.slice(3);
   }
@@ -766,30 +676,22 @@ export function lineColumnToOffset(text: string, oneBasedLine: number, oneBasedC
   return Math.min(offset + Math.max(oneBasedColumn - 1, 0), text.length);
 }
 
-export function getSqlParser(dialect: SqlDialect): ParserLike {
-  const existing = parserCache.get(dialect);
-  if (existing) {
-    return existing;
+function parserColumnToOffset(text: string, oneBasedLine: number, oneBasedColumn: number): number {
+  let offset = lineColumnToOffset(text, oneBasedLine, 1);
+  for (let column = 1; column < oneBasedColumn && offset < text.length; column += 1) {
+    if (text[offset] === '\r' || text[offset] === '\n') break;
+    offset += (text.codePointAt(offset) ?? 0) > 0xffff ? 2 : 1;
   }
-
-  let parser: ParserLike;
-  switch (dialect) {
-    case 'spark': parser = new SparkSQL(); break;
-    case 'hive': parser = new HiveSQL(); break;
-    case 'flink': parser = new FlinkSQL(); break;
-    case 'mysql': parser = new MySQL(); break;
-    case 'postgresql': parser = new PostgreSQL(); break;
-    case 'trino': parser = new TrinoSQL(); break;
-    case 'impala': parser = new ImpalaSQL(); break;
-    case 'generic': parser = new GenericSQL(); break;
-  }
-  parserCache.set(dialect, parser);
-  return parser;
+  return offset;
 }
 
-function parseErrorToIssue(text: string, error: ParseError): SqlIssue {
-  const start = lineColumnToOffset(text, error.startLine, error.startColumn);
-  let end = lineColumnToOffset(text, error.endLine, error.endColumn);
+function parseErrorToIssue(text: string, parserText: string, error: ParseError): SqlIssue {
+  const start = parserColumnToOffset(parserText, error.startLine, error.startColumn);
+  // DT's listener reports a code-point start column, then adds token.text.length
+  // (UTF-16) to derive the end column. Convert the start before adding that width.
+  let end = error.endLine === error.startLine
+    ? Math.min(start + Math.max(error.endColumn - error.startColumn, 0), text.length)
+    : parserColumnToOffset(parserText, error.endLine, error.endColumn);
   if (end <= start) {
     end = Math.min(start + 1, text.length);
   }
@@ -806,43 +708,4 @@ function deduplicateIssues(issues: readonly SqlIssue[]): SqlIssue[] {
     seen.add(key);
     return true;
   });
-}
-
-function getSymbolicName(token: Token): string {
-  const vocabulary = (token.tokenSource as { vocabulary?: VocabularyLike } | null)?.vocabulary;
-  return vocabulary?.getSymbolicName(token.type) ?? '';
-}
-
-function classifyToken(
-  symbolicName: string,
-  text: string,
-  tokens: readonly Token[],
-  tokenIndex: number,
-): SqlTokenType | undefined {
-  const name = symbolicName.toUpperCase();
-  if (name.includes('COMMENT')) {
-    return 'comment';
-  }
-  if (name.startsWith('KW_')) {
-    return 'keyword';
-  }
-  if (/(?:STRING|CHAR|TEXT|BINARY)_?(?:LITERAL|VALUE)?$/u.test(name) || /^'.*'$/su.test(text)) {
-    return 'string';
-  }
-  if (/(?:NUMBER|NUMERIC|INTEGER|DECIMAL|FLOAT|DOUBLE|REAL|BIGINT|SMALLINT|TINYINT|HEX|DIGIT)(?:_LITERAL|_VALUE)?$/u.test(name)
-    || /^\d/u.test(text)) {
-    return 'number';
-  }
-  if (isOperatorName(name) || /^(?:<>|!=|==|<=|>=|=>|[-+*/%=<>|&^~])$/u.test(text)) {
-    return 'operator';
-  }
-  if (name.includes('IDENTIFIER') || name === 'ID' || /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(text)) {
-    const next = tokens.slice(tokenIndex + 1).find((candidate) => candidate.channel === 0);
-    return next?.text === '(' ? 'function' : 'variable';
-  }
-  return undefined;
-}
-
-function isOperatorName(name: string): boolean {
-  return /^(?:EQ|NSEQ|NEQJ?|LT|LTE|GT|GTE|PLUS|MINUS|ASTERISK|SLASH|PERCENT|AMPERSAND|PIPE|CONCAT|CARET|TILDE)$/u.test(name);
 }

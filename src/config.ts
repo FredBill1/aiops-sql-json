@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 
 import { compileGlobs, compilePlaceholderPatterns } from './patterns';
 import { getConfigurationResource } from './resourceContext';
-import { isSqlDialect, type SqlDialect } from './sql';
+import { isSqlDialect, type SqlDialect } from './sqlDialect';
 
 export const DEFAULT_SCHEMA_FILE_GLOBS = ['${workspaceFolder}/schema/*.sql'];
 

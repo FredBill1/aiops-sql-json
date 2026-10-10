@@ -114,6 +114,49 @@ suite('AIOps SQL JSON extension', () => {
     assert.ok(tokens && tokens.data.length > 0, 'Embedded SQL should produce semantic tokens.');
   });
 
+  for (const fileExtension of ['sql', 'sql.json']) {
+    test(`keeps another SQL document editable while analyzing a generated megabyte .${fileExtension} query`, async () => {
+      const configuration = vscode.workspace.getConfiguration('aiopsSqlJson');
+      await configuration.update('dialect', 'spark', vscode.ConfigurationTarget.Global);
+      await configuration.update('plainSql.enabled', true, vscode.ConfigurationTarget.Global);
+      await configuration.update('schemaValidation.enabled', false, vscode.ConfigurationTarget.Global);
+
+      const shortDocument = await openFile(`responsive-${fileExtension}.sql`, 'SELEC 1;');
+      await waitForDiagnostics(shortDocument.uri, (items) => items.some((item) => item.source === 'spark SQL'));
+      const sql = `SELECT payload FROM (SELECT TRIM('${'A'.repeat(1_000_000)}😀') AS payload) generated_rows`;
+      const content = fileExtension === 'sql' ? sql : JSON.stringify({ trainSql: sql });
+      const largeDocument = await openFile(`generated-megabyte.${fileExtension}`, content);
+      const pendingLargeAnalysis = Promise.all([
+        waitForDiagnostics(largeDocument.uri, (items) => items.length === 0),
+        vscode.commands.executeCommand<vscode.SemanticTokens>(
+          'vscode.provideDocumentSemanticTokens', largeDocument.uri,
+        ),
+      ]);
+
+      const [[diagnostics, tokens]] = await Promise.all([
+        pendingLargeAnalysis,
+        (async () => {
+          const initialVersion = shortDocument.version;
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(shortDocument.uri,
+            new vscode.Range(shortDocument.positionAt(0), shortDocument.positionAt(shortDocument.getText().length)),
+            'SELECT 2;');
+          assert.equal(await vscode.workspace.applyEdit(edit), true, 'A separate SQL document must accept edits.');
+          assert.ok(shortDocument.version > initialVersion);
+          assert.equal(shortDocument.getText(), 'SELECT 2;');
+          await waitForDiagnostics(shortDocument.uri, (items) => items.length === 0);
+        })(),
+      ]);
+      assert.equal(diagnostics.length, 0, 'The complete generated query must validate successfully.');
+      assert.ok(tokens && tokens.data.length > 0, 'Large SQL must retain semantic highlighting.');
+      let largestTokenLength = 0;
+      for (let index = 2; index < tokens.data.length; index += 5) {
+        largestTokenLength = Math.max(largestTokenLength, tokens.data[index]!);
+      }
+      assert.ok(largestTokenLength >= 1_000_004, 'The entire Unicode string literal must remain highlighted.');
+    });
+  }
+
   test('formats regular SQL through the VS Code document-formatting provider', async () => {
     const document = await openFile(
       'format-provider.sql',
@@ -1386,10 +1429,13 @@ CREATE VIEW sales.order_ids AS SELECT OrderId FROM sales.orders;`,
       const document = await openFile(fileName, sql);
       const items = await completionItemsAtEnd(
         document,
-        (candidates) => candidates.some((item) => completionLabel(item) === label),
+        (candidates) => candidates.some((item) => completionLabel(item) === label
+          && item.kind === vscode.CompletionItemKind.Class && String(item.detail).includes(qualifiedName)),
         `${label} relation for ${sql}`,
       );
-      const completion = items.find((item) => completionLabel(item) === label);
+      // VS Code also offers a word completion with the same label from the local DDL.
+      const completion = items.find((item) => completionLabel(item) === label
+        && item.kind === vscode.CompletionItemKind.Class && String(item.detail).includes(qualifiedName));
       assert.ok(completion);
       assert.equal(completion.kind, vscode.CompletionItemKind.Class);
       assert.equal(completion.filterText ?? label, filterText);
@@ -1723,7 +1769,7 @@ SELECT id, amount FROM local_orders;`,
     );
     assert.ok(!relativePattern.some((item) => item.code === 'unknown-table'));
 
-    await fs.rm(schemaDirectory, { recursive: true, force: true });
+    await fs.rm(schemaDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     const deleted = await waitForDiagnostics(
       document.uri,
       (items) => items.some((item) => item.code === 'unknown-table'),

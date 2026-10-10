@@ -4,19 +4,17 @@ import { getExtensionConfiguration } from './config';
 import type { JsonServiceManager } from './jsonService';
 import type { SqlSchemaService } from './schemaService';
 import { getSqlDocumentContext, type SqlDocumentContext } from './sqlDocumentContext';
-import {
-  CURRENT_SQL_DOCUMENT_SOURCE,
-  formatSqlDataType,
-  getSqlSymbolAtOffset,
-  type SchemaColumn,
-  type SqlSymbolDefinition,
-  type SqlSymbolResolution,
-} from './sqlSchemaCore';
+import type { SchemaColumn, SqlSymbolDefinition, SqlSymbolResolution } from './sqlSchemaCore';
+import type { SqlService } from './sqlService';
+import { sqlDocumentSnapshot } from './sqlServiceContext';
+
+const CURRENT_SQL_DOCUMENT_SOURCE = 'aiops-sql-current:';
 
 export class SqlHoverProvider implements vscode.HoverProvider {
   constructor(
     private readonly jsonServices: JsonServiceManager,
     private readonly schemas: SqlSchemaService,
+    private readonly sqlService: SqlService,
   ) {}
 
   async provideHover(
@@ -28,19 +26,22 @@ export class SqlHoverProvider implements vscode.HoverProvider {
     if (document.languageId === 'sql' && !configuration.plainSqlEnabled) return undefined;
     const context = getSqlDocumentContext(document, position, this.jsonServices, configuration);
     if (!context) return undefined;
-    const snapshot = await this.schemas.getSchema(document.uri, configuration, false);
-    if (token.isCancellationRequested) return undefined;
-    const symbol = getSqlSymbolAtOffset(
-      context.sqlText,
-      context.sqlOffset,
-      configuration.dialect,
-      configuration.placeholderPatterns,
-      snapshot,
-      configuration.udfs,
-    );
-    if (!symbol) return undefined;
-    const contents = renderSqlHover(symbol);
-    return new vscode.Hover(contents, context.toDocumentRange(symbol.reference.start, symbol.reference.end));
+    const version = document.version;
+    const generation = this.sqlService.generation;
+    const snapshotRequest = sqlDocumentSnapshot(document, configuration, context.sqlText, context.regionKey);
+    try {
+      const snapshot = await this.schemas.getSchema(document.uri, configuration, false);
+      if (token.isCancellationRequested || document.isClosed || document.version !== version
+        || this.sqlService.generation !== generation) return undefined;
+      const symbol = await this.sqlService.symbol(snapshotRequest, context.sqlOffset,
+        { schemaKey: this.schemas.getSchemaKey(snapshot), udfs: configuration.udfs }, token);
+      if (!symbol || document.isClosed || document.version !== version || token.isCancellationRequested
+        || this.sqlService.generation !== generation) return undefined;
+      const contents = renderSqlHover(symbol);
+      return new vscode.Hover(contents, context.toDocumentRange(symbol.reference.start, symbol.reference.end));
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -48,6 +49,7 @@ export class SqlDefinitionProvider implements vscode.DefinitionProvider {
   constructor(
     private readonly jsonServices: JsonServiceManager,
     private readonly schemas: SqlSchemaService,
+    private readonly sqlService: SqlService,
   ) {}
 
   async provideDefinition(
@@ -59,27 +61,32 @@ export class SqlDefinitionProvider implements vscode.DefinitionProvider {
     if (document.languageId === 'sql' && !configuration.plainSqlEnabled) return undefined;
     const context = getSqlDocumentContext(document, position, this.jsonServices, configuration);
     if (!context) return undefined;
-    const snapshot = await this.schemas.getSchema(document.uri, configuration, true);
-    if (token.isCancellationRequested) return undefined;
-    const symbol = getSqlSymbolAtOffset(
-      context.sqlText,
-      context.sqlOffset,
-      configuration.dialect,
-      configuration.placeholderPatterns,
-      snapshot,
-      configuration.udfs,
-    );
-    if (!symbol || symbol.definitions.length === 0) return undefined;
-    const originSelectionRange = context.toDocumentRange(symbol.reference.start, symbol.reference.end);
-    const candidates = await Promise.all(symbol.definitions.map((definition) => definitionLink(
-      definition,
-      document,
-      context,
-      originSelectionRange,
-    )));
-    if (token.isCancellationRequested) return undefined;
-    const links = deduplicateLinks(candidates.filter((link): link is vscode.DefinitionLink => Boolean(link)));
-    return links.length > 0 ? links : undefined;
+    const version = document.version;
+    const generation = this.sqlService.generation;
+    const snapshotRequest = sqlDocumentSnapshot(document, configuration, context.sqlText, context.regionKey);
+    try {
+      const snapshot = await this.schemas.getSchema(document.uri, configuration, true);
+      if (token.isCancellationRequested || document.isClosed || document.version !== version
+        || this.sqlService.generation !== generation || !this.schemas.isSchemaCurrent(snapshot)) return undefined;
+      const symbol = await this.sqlService.symbol(snapshotRequest, context.sqlOffset,
+        { schemaKey: this.schemas.getSchemaKey(snapshot), udfs: configuration.udfs }, token);
+      if (!symbol || symbol.definitions.length === 0 || document.isClosed || document.version !== version
+        || token.isCancellationRequested || this.sqlService.generation !== generation
+        || !this.schemas.isSchemaCurrent(snapshot)) return undefined;
+      const originSelectionRange = context.toDocumentRange(symbol.reference.start, symbol.reference.end);
+      const candidates = await Promise.all(symbol.definitions.map((definition) => definitionLink(
+        definition,
+        document,
+        context,
+        originSelectionRange,
+      )));
+      if (token.isCancellationRequested || document.isClosed || document.version !== version
+        || this.sqlService.generation !== generation || !this.schemas.isSchemaCurrent(snapshot)) return undefined;
+      const links = deduplicateLinks(candidates.filter((link): link is vscode.DefinitionLink => Boolean(link)));
+      return links.length > 0 ? links : undefined;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -111,7 +118,7 @@ function symbolSignature(symbol: SqlSymbolResolution): string {
     if (omitted > 0) lines.push(`  -- … ${omitted} more field${omitted === 1 ? '' : 's'}`);
     return `${symbol.relation.kind} ${symbol.qualifiedName ?? symbol.relation.name} (\n${lines.join(',\n')}\n)`;
   }
-  const type = symbol.dataType ? formatSqlDataType(symbol.dataType, 4, 20) : symbol.type || 'UNKNOWN';
+  const type = symbol.type || 'UNKNOWN';
   if (symbol.functionCategory) {
     const category = symbol.functionCategory === 'udf' ? 'configured UDF' : `${symbol.dialect ?? 'SQL'} built-in function`;
     if (symbol.functionSignatures?.length) {
@@ -128,7 +135,7 @@ function symbolSignature(symbol: SqlSymbolResolution): string {
 }
 
 function columnType(column: SchemaColumn): string {
-  return column.dataType ? formatSqlDataType(column.dataType, 4, 20) : column.type || column.typeFamily.toUpperCase();
+  return column.type || column.typeFamily.toUpperCase();
 }
 
 function sourceLabel(definition: SqlSymbolDefinition): string {

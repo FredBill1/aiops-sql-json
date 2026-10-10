@@ -8,7 +8,10 @@ out-test/**
 coverage/**
 catalog/**
 scripts/**
-dist/*.map
+dist/**
+!dist/extension.js
+!dist/sqlAnalysisWorker.js
+!dist/sqlLexicalWorker.js
 *.vsix
 tsconfig*.json
 esbuild.mjs

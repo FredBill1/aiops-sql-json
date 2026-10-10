@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.0.25
+
+- Fixed freezes caused by large string literals in Spark SQL. Function source names and ranges are captured during parsing, including parser copies and rewritten calls, without searching expression text with a regular expression.
+- Moved SQL diagnostics, completion, navigation, Schema indexing, and formatting into a reusable worker service with cancellation, bounded caches, version checks, and worker recovery after timeouts. Semantic highlighting uses an independent lexer worker without invoking the SQL parser.
+- Added regressions using generated large literals, Unicode ranges, and worker lifecycle scenarios. Local downloaded SQL is excluded from the extension package.
+- Fixed SQL workers being terminated while paused during F5 debugging. Inspected development hosts allow debugger pauses, while installed extensions and integration tests retain their deadlines. Added a development launch configuration for enforcing production deadlines.
+- Added recovery for temporary worker failures and metadata-only worker lifecycle output, without recording SQL text, file paths, or exception messages.
+
 ## 0.0.24
 
 - Fixed comment formatting across all supported dialects by allowing safe removal of line-comment trailing whitespace and consistently handling MySQL `#` comments and CR/LF terminators. Formatting now maps lexer code-point offsets to UTF-16 source ranges, preserving emoji and other supplementary Unicode characters without changing string or block-comment contents. Added regression coverage for SQL and SQL JSON documents with schema validation disabled, enabled, and in completion-only mode.

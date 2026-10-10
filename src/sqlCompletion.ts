@@ -3,22 +3,14 @@ import * as vscode from 'vscode';
 import { getExtensionConfiguration } from './config';
 import type { JsonServiceManager } from './jsonService';
 import type { SqlSchemaService } from './schemaService';
-import { getSqlSuggestions } from './sql';
-import { getSqlCatalog } from './sqlCatalog';
 import { formatSqlFunctionSignature } from './sqlFunctionSignatures';
 import { getSqlDocumentContext } from './sqlDocumentContext';
-import {
-  collectSqlFieldNames,
-  getSqlSchemaAtOffset,
-  getSqlScopeInfo,
-  type RelationBinding,
-  type SchemaSnapshot,
-  type SchemaTable,
-} from './sqlSchemaCore';
+import type { RelationBinding, SchemaTable } from './sqlSchemaCore';
+import type { SqlService } from './sqlService';
+import type { SqlCompletionResult } from './sqlWorkerProtocol';
+import { sqlDocumentSnapshot } from './sqlServiceContext';
 
 interface CompletionContext {
-  sqlText: string;
-  sqlOffset: number;
   allFieldNames: readonly string[];
   toDocumentRange: (start: number, end: number) => vscode.Range;
 }
@@ -27,6 +19,7 @@ export class SqlCompletionProvider implements vscode.CompletionItemProvider {
   constructor(
     private readonly jsonServices: JsonServiceManager,
     private readonly schemas: SqlSchemaService,
+    private readonly sqlService: SqlService,
   ) {}
 
   async provideCompletionItems(
@@ -40,20 +33,29 @@ export class SqlCompletionProvider implements vscode.CompletionItemProvider {
     }
     const documentContext = getSqlDocumentContext(document, position, this.jsonServices, configuration);
     if (!documentContext) return undefined;
-    const context: CompletionContext = {
-      sqlText: documentContext.sqlText,
-      sqlOffset: documentContext.sqlOffset,
-      allFieldNames: deduplicateFields(documentContext.allSqlTexts.flatMap((text) => (
-        collectSqlFieldNames(text, configuration.dialect, configuration.placeholderPatterns)
-      ))),
-      toDocumentRange: documentContext.toDocumentRange,
-    };
-    const snapshot = await this.schemas.getSchema(document.uri, configuration);
-    if (token.isCancellationRequested) {
+    const version = document.version;
+    const generation = this.sqlService.generation;
+    try {
+      const snapshot = sqlDocumentSnapshot(document, configuration, documentContext.sqlText, documentContext.regionKey);
+      const schema = await this.schemas.getSchema(document.uri, configuration);
+      if (token.isCancellationRequested || document.isClosed || document.version !== version
+        || this.sqlService.generation !== generation) return undefined;
+      const result = await this.sqlService.completion(snapshot, documentContext.sqlOffset, {
+        allSqlTexts: documentContext.allSqlTexts,
+        schemaKey: this.schemas.getSchemaKey(schema),
+        udfs: configuration.udfs,
+      }, token);
+      if (token.isCancellationRequested || document.isClosed || document.version !== version
+        || this.sqlService.generation !== generation) return undefined;
+      const context: CompletionContext = {
+        allFieldNames: result.fields,
+        toDocumentRange: documentContext.toDocumentRange,
+      };
+      const completion = buildCompletionItems(context, configuration, result);
+      return new vscode.CompletionList(completion.items, completion.prefix.length === 0);
+    } catch {
       return undefined;
     }
-    const completion = buildCompletionItems(context, configuration, snapshot);
-    return new vscode.CompletionList(completion.items, completion.prefix.length === 0);
   }
 
 }
@@ -61,28 +63,24 @@ export class SqlCompletionProvider implements vscode.CompletionItemProvider {
 function buildCompletionItems(
   context: CompletionContext,
   configuration: ReturnType<typeof getExtensionConfiguration>,
-  snapshot: SchemaSnapshot,
+  result: SqlCompletionResult,
 ): { items: vscode.CompletionItem[]; prefix: string } {
-  const word = wordAt(context.sqlText, context.sqlOffset);
-  const prefix = context.sqlText.slice(word.start, context.sqlOffset);
-  const casingPrefix = prefix || previousWordInStatement(context.sqlText, word.start);
+  const { word, prefix, casingPrefix } = result.context;
   const range = context.toDocumentRange(word.start, word.end);
-  const suggestions = getSqlSuggestions(
-    context.sqlText,
-    context.sqlOffset,
-    configuration.dialect,
-    configuration.placeholderPatterns,
-  );
-  const catalog = getSqlCatalog(configuration.dialect);
-  const syntaxTypes = new Set(suggestions?.syntax.map((item) => item.syntaxContextType.toString()) ?? []);
+  const catalog = result.catalog;
+  const functionByName = new Map(catalog.functionDefinitions.flatMap((definition) => [
+    [definition.name.toLocaleLowerCase(), definition] as const,
+    ...definition.aliases.map((alias) => [alias.toLocaleLowerCase(), definition] as const),
+  ]));
+  const syntaxTypes = new Set(result.syntaxTypes);
   const relationContext = syntaxTypes.has('table') || syntaxTypes.has('view');
   const expressionContext = !relationContext && (
     syntaxTypes.has('column')
     || syntaxTypes.has('function')
-    || looksLikeExpressionContext(context.sqlText, context.sqlOffset)
+    || result.context.expressionContext
   );
   const items: vscode.CompletionItem[] = [];
-  const contextualKeywords = suggestions?.keywords ?? [];
+  const contextualKeywords = result.keywords;
   const keywordCandidates = prefix.length > 0
     ? deduplicateFields([...contextualKeywords, ...catalog.keywords])
     : contextualKeywords;
@@ -107,7 +105,7 @@ function buildCompletionItems(
       const cased = applyTypedCase(functionName, casingPrefix);
       const item = new vscode.CompletionItem(cased, vscode.CompletionItemKind.Function);
       item.range = range;
-      const definition = catalog.functionByName.get(functionName.toLocaleLowerCase());
+      const definition = functionByName.get(functionName.toLocaleLowerCase());
       if (udfSet.has(functionName.toLocaleLowerCase())) {
         item.detail = 'User-defined SQL function';
       } else if (definition?.signatures[0]) {
@@ -120,7 +118,7 @@ function buildCompletionItems(
         item.detail = `${configuration.dialect} ${catalog.version} SQL function`;
       }
       item.sortText = `1-${functionName}`;
-      item.insertText = nextNonWhitespace(context.sqlText, word.end) === '('
+      item.insertText = result.context.nextCharacter === '('
         ? cased
         : new vscode.SnippetString(`${escapeSnippet(cased)}($0)`);
       items.push(item);
@@ -128,7 +126,7 @@ function buildCompletionItems(
   }
 
   if (configuration.schemaValidationEnabled) {
-    appendSchemaItems(items, context, configuration, snapshot, expressionContext, relationContext, prefix, range);
+    appendSchemaItems(items, context, result, expressionContext, relationContext, prefix, range);
   } else if (expressionContext) {
     for (const field of context.allFieldNames) {
       if (!matchesPrefix(field, prefix)) continue;
@@ -146,23 +144,15 @@ function buildCompletionItems(
 function appendSchemaItems(
   items: vscode.CompletionItem[],
   context: CompletionContext,
-  configuration: ReturnType<typeof getExtensionConfiguration>,
-  snapshot: SchemaSnapshot,
+  result: SqlCompletionResult,
   expressionContext: boolean,
   relationContext: boolean,
   prefix: string,
   range: vscode.Range,
 ): void {
-  const effectiveSnapshot = getSqlSchemaAtOffset(
-    context.sqlText,
-    context.sqlOffset,
-    configuration.dialect,
-    configuration.placeholderPatterns,
-    snapshot,
-    configuration.udfs,
-  );
+  const effectiveSnapshot = result.schema;
   if (relationContext) {
-    const qualifier = qualifierBefore(context.sqlText, context.sqlOffset);
+    const qualifier = result.context.qualifier;
     for (const table of effectiveSnapshot.tables) {
       const completion = relationCompletion(table, prefix, qualifier);
       if (!completion) continue;
@@ -178,15 +168,8 @@ function appendSchemaItems(
   if (!expressionContext) {
     return;
   }
-  const scope = getSqlScopeInfo(
-    context.sqlText,
-    context.sqlOffset,
-    configuration.dialect,
-    configuration.placeholderPatterns,
-    snapshot,
-    configuration.udfs,
-  );
-  const qualifier = qualifierBefore(context.sqlText, context.sqlOffset);
+  const scope = result.scope;
+  const qualifier = result.context.qualifier;
   const relations = qualifier
     ? scope.relations.filter((relation) => relationMatches(relation, qualifier))
     : scope.relations;
@@ -314,37 +297,9 @@ function unquoteCompletionIdentifier(value: string): string {
   return trimmed;
 }
 
-function wordAt(text: string, offset: number): { start: number; end: number } {
-  let start = Math.min(Math.max(offset, 0), text.length);
-  let end = start;
-  while (start > 0 && /[\p{L}\p{N}_$]/u.test(text[start - 1] ?? '')) start -= 1;
-  while (end < text.length && /[\p{L}\p{N}_$]/u.test(text[end] ?? '')) end += 1;
-  return { start, end };
-}
-
-function qualifierBefore(text: string, offset: number): string | undefined {
-  let cursor = offset;
-  while (cursor > 0 && /[\p{L}\p{N}_$]/u.test(text[cursor - 1] ?? '')) cursor -= 1;
-  if (text[cursor - 1] !== '.') return undefined;
-  cursor -= 1;
-  let start = cursor;
-  while (start > 0 && isQualifierCharacter(text[start - 1] ?? '')) start -= 1;
-  return text.slice(start, cursor);
-}
-
-function isQualifierCharacter(character: string): boolean {
-  return /[\p{L}\p{N}_$]/u.test(character) || '.`"[]'.includes(character);
-}
-
 function relationMatches(relation: RelationBinding, qualifier: string): boolean {
   const lower = qualifier.toLocaleLowerCase();
   return relation.aliases.some((alias) => alias.toLocaleLowerCase() === lower || alias.split('.').at(-1) === lower);
-}
-
-function looksLikeExpressionContext(text: string, offset: number): boolean {
-  const before = text.slice(0, offset).toUpperCase();
-  const lastClause = /\b(SELECT|WHERE|HAVING|ON|SET|VALUES|GROUP\s+BY|ORDER\s+BY)\b[^;]*$/u.exec(before);
-  return Boolean(lastClause);
 }
 
 function applyTypedCase(candidate: string, prefix: string): string {
@@ -353,18 +308,8 @@ function applyTypedCase(candidate: string, prefix: string): string {
   return firstLetter === firstLetter.toLocaleLowerCase() ? candidate.toLocaleLowerCase() : candidate.toUpperCase();
 }
 
-function previousWordInStatement(text: string, offset: number): string {
-  const statementStart = text.lastIndexOf(';', Math.max(0, offset - 1)) + 1;
-  const words = text.slice(statementStart, offset).match(/[\p{L}_$][\p{L}\p{N}_$]*/gu);
-  return words?.at(-1) ?? '';
-}
-
 function matchesPrefix(candidate: string, prefix: string): boolean {
   return prefix.length === 0 || candidate.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase());
-}
-
-function nextNonWhitespace(text: string, offset: number): string | undefined {
-  return /\S/u.exec(text.slice(offset))?.[0];
 }
 
 function escapeSnippet(value: string): string {

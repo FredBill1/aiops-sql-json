@@ -59,6 +59,18 @@ describe('source call arguments', () => {
     expect(parseSqlAst('SELECT first_value(s, false, false) OVER (ORDER BY n) FROM t', dialect)).toBeUndefined();
   });
 
+  it('attaches source arguments to the function inside FILTER and WITHIN GROUP wrappers', () => {
+    const sql = 'SELECT max(n) FILTER (WHERE missing > 0) OVER (), percentile_cont(0.5) WITHIN GROUP (ORDER BY missing) FROM t';
+    const ast = parseSqlAst(sql, 'postgresql')!;
+    const nodes: SqlAstNode[] = [];
+    walkSqlAst(ast.statements[0]!, (node) => nodes.push(node));
+    expect(nodes.filter((node) => node.source).map((node) => node.source!.name)).toEqual(['max', 'percentile_cont']);
+    expect(nodes.filter((node) => ['filter', 'withinGroup', 'window'].includes(node.kind)).every((node) => !node.call && !node.source)).toBe(true);
+    const snapshot = createSchemaSnapshot([parseDdlSchema('CREATE TABLE t (n INT);', 'postgresql', 'file:///wrappers.sql')]);
+    const issues = analyzeSqlSemantics(sql, 'postgresql', [], snapshot, []);
+    expect(issues.filter((issue) => issue.code === 'unknown-column').map((issue) => sql.slice(issue.start, issue.end))).toEqual(['missing', 'missing']);
+  });
+
   it('distinguishes Flink MAP constructors from quoted or qualified columns', () => {
     expect(functions("SELECT MAP['a', false]", 'flink').some((node) => node.name === 'MAP')).toBe(true);
     for (const sql of ['SELECT t.MAP[1] FROM t', 'SELECT `MAP`[1] FROM t']) {

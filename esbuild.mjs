@@ -3,9 +3,13 @@ import process from 'node:process';
 
 const watch = process.argv.includes('--watch');
 const context = await esbuild.context({
-  entryPoints: ['src/extension.ts'],
+  entryPoints: {
+    extension: 'src/extension.ts',
+    sqlAnalysisWorker: 'src/sqlAnalysisWorker.ts',
+    sqlLexicalWorker: 'src/sqlLexicalWorker.ts',
+  },
   bundle: true,
-  outfile: 'dist/extension.js',
+  outdir: 'dist',
   external: ['vscode'],
   format: 'cjs',
   platform: 'node',

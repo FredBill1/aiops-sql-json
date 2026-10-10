@@ -1201,6 +1201,7 @@ interface AstModelContext {
   readonly issues: SqlSemanticIssue[];
   readonly symbols: SqlSymbolResolution[];
   readonly queryResults: Map<SqlAstNode, AstQueryResult>;
+  readonly sourceCalls: Map<number, Set<AstScope | undefined>>;
 }
 
 interface AstColumnResolution {
@@ -1302,6 +1303,7 @@ function createAstModelContext(
     issues: [],
     symbols: [],
     queryResults: new Map(),
+    sourceCalls: new Map(),
   };
 }
 
@@ -2329,6 +2331,12 @@ function validateAstExpression(
   environment: AstTypeEnvironment = EMPTY_AST_TYPE_ENVIRONMENT,
 ): void {
   if (astHasDynamicReference(node, context)) return;
+  if (node.source) {
+    const scopes = context.sourceCalls.get(node.source.id) ?? new Set<AstScope | undefined>();
+    if (scopes.has(scope)) return;
+    scopes.add(scope);
+    context.sourceCalls.set(node.source.id, scopes);
+  }
   const lambdaReference = astLambdaColumnReference(node, environment);
   if (lambdaReference) {
     validateAstExpression(lambdaReference, scope, ctes, context, environment);
@@ -2357,7 +2365,7 @@ function validateAstExpression(
       return;
     }
   }
-  if ((node.call || node.role === 'function' || node.role === 'unnest')
+  if (node.source
     && !overlapsAny({ start: node.nameStart, end: node.nameEnd }, context.placeholderRanges)) {
     const name = astFunctionName(node, context.text).replace(/^!/u, '');
     const normalized = normalizeQualifiedName(name, context.dialect);

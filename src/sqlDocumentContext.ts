@@ -11,6 +11,7 @@ import {
 } from './regions';
 
 export interface SqlDocumentContext {
+  regionKey: string;
   sqlText: string;
   sqlOffset: number;
   allSqlTexts: readonly string[];
@@ -26,6 +27,7 @@ export function getSqlDocumentContext(
   if (document.languageId === 'sql') {
     const text = document.getText();
     return {
+      regionKey: 'document',
       sqlText: text,
       sqlOffset: document.offsetAt(position),
       allSqlTexts: [text],
@@ -43,6 +45,7 @@ export function getSqlDocumentContext(
   const region = findSqlRegionAtProjectedOffset(regions, projectedOffset);
   if (!region) return undefined;
   return {
+    regionKey: `region:${region.originalRange.start}`,
     sqlText: region.decoded.text,
     sqlOffset: decodedOffsetAtOriginalOffset(region.decoded, originalOffset),
     allSqlTexts: regions.map((candidate) => candidate.decoded.text),

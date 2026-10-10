@@ -20,6 +20,7 @@ A VS Code extension for AIOps Spark job configurations. It lets strings in `*.sq
 - Warns when unindented continuation lines concatenate SQL words or when `--` comments cross physical lines.
 - Formats regular SQL and complete SQL JSON documents with dialect-aware, token-preserving layout rules.
 - Formats JSON structure while preserving non-SQL multiline string contents exactly, and places every recognized SQL block on the line after its opening double quote.
+- Runs SQL analysis and formatting in a background worker, with a separate lexer worker for highlighting. Requests are shared for the current document version and cancelled after edits. If a parser exceeds its time limit, the worker is restarted and diagnostics report that analysis is incomplete. Temporary worker startup and communication failures can recover for the same document version.
 
 ## Installation
 
@@ -33,6 +34,12 @@ npm run build
 ```
 
 Press `F5` to launch a new VS Code window with the development version installed.
+
+The **Run Extension** launch configuration allows SQL workers to remain paused in the debugger. When the development extension host has an active inspector, startup and execution deadlines are disabled; continuing the debugger lets the pending SQL request finish. Document edits and cancellation still discard stale work, and worker memory limits remain enabled. Installed extensions and integration tests always enforce deadlines.
+
+Use **Run Extension (Production Deadlines)** to exercise the normal startup, analysis, and formatting limits while developing. Its `AIOPS_SQL_JSON_ENFORCE_TIMEOUTS=1` environment variable forces deadline enforcement even when the debugger is attached. Both launch configurations retain worker source maps and breakpoints.
+
+The **AIOps SQL JSON** Output channel records the selected deadline policy and worker lifecycle metadata such as lane, epoch, phase, operation, elapsed time, and error code. SQL text, document paths, and exception messages are excluded.
 
 ## Multiline strings and SQL
 

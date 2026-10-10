@@ -35,7 +35,7 @@ import '@hdnax/sqlingo.js/trino';
 import { maskPlaceholders } from './patterns';
 import type { SqlDialect } from './sql';
 import { maskSqlParserGaps } from './sqlParserGaps';
-import { SQL_AST_DIALECTS, sqlSourceCalls, sqlSourceTypeNames } from './sqlParserAdapters';
+import { SQL_AST_DIALECTS, sqlSourceFunction, sqlSourceTypeName } from './sqlParserAdapters';
 
 export type SqlAstRole =
   | 'alias'
@@ -80,6 +80,8 @@ export interface SqlAstNode {
   /** Exact source range of the node's own name (for example a function name). */
   readonly nameStart: number;
   readonly nameEnd: number;
+  /** A real source invocation; absent for nodes synthesized by dialect rewrites. */
+  readonly source?: { readonly id: number; readonly name: string; readonly start: number; readonly end: number };
   readonly args: Readonly<Record<string, SqlAstValue>>;
   /** User-supplied arguments, before parser defaults and dialect rewrites. */
   readonly call?: { readonly name: string; readonly arguments: readonly SqlAstNode[] };
@@ -138,10 +140,9 @@ function parseSqlAstInternal(
         dialect: SQL_AST_DIALECTS[parserDialect],
       });
       if (!allowCommands && statements.some((statement) => statement instanceof CommandExpr)) continue;
+      const normalization = createNormalizationContext();
       return {
-        statements: statements.flatMap((statement) => (
-          statement ? [decorateNameSpans(normalizeExpression(statement), masked)] : []
-        )),
+        statements: statements.flatMap((statement) => statement ? [normalizeExpression(statement, normalization)] : []),
         parserDialect,
       };
     } catch {
@@ -216,27 +217,32 @@ export function isSqlAstNode(value: SqlAstValue | unknown): value is SqlAstNode 
 
 /** Returns the SQL spelling of a function call instead of the parser's class-specific AST key. */
 export function astFunctionName(node: SqlAstNode, text: string): string {
-  if (node.call) return node.call.name;
-  const sourceName = text.slice(node.nameStart, node.nameEnd).trim();
-  if (/^[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*$/u.test(sourceName)) {
-    const normalizedSource = sourceName.replace(/\s+/gu, '');
-    const leaf = normalizedSource.split('.').at(-1)?.toLocaleLowerCase() ?? '';
-    if (node.ownStart !== undefined || astFunctionSourceNames(node).has(leaf)) return normalizedSource;
-  }
+  // Retain the existing API while source spelling now comes solely from parser provenance.
+  void text;
+  if (node.source) return node.source.name;
   if (node.kind === 'anonymous' && node.name) return node.name.replace(/^!/u, '');
   return AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
 }
 
-function normalizeExpression(expression: Expression, cache = new WeakMap<Expression, SqlAstNode>()): SqlAstNode {
-  const cached = cache.get(expression);
+interface NormalizationContext {
+  readonly nodes: WeakMap<Expression, SqlAstNode>;
+  readonly sourceArguments: Map<number, readonly SqlAstNode[]>;
+}
+
+function createNormalizationContext(): NormalizationContext {
+  return { nodes: new WeakMap(), sourceArguments: new Map() };
+}
+
+function normalizeExpression(expression: Expression, context: NormalizationContext): SqlAstNode {
+  const cached = context.nodes.get(expression);
   if (cached) return cached;
   const args: Record<string, SqlAstValue> = {};
   for (const [key, value] of Object.entries(expression.args)) {
-    const normalized = normalizeValue(value, cache);
+    const normalized = normalizeValue(value, context);
     if (normalized !== undefined) args[key] = normalized;
   }
-  const sourceCall = sqlSourceCalls.get(expression);
-  const ownStart = sourceCall?.start ?? numericMeta(expression.meta.start);
+  const source = sqlSourceFunction(expression);
+  const ownStart = source?.start ?? numericMeta(expression.meta.start);
   const ownEnd = numericMeta(expression.meta.end);
   const childSpans = Object.values(args).flatMap(collectValueSpans);
   const start = minimum([
@@ -244,91 +250,39 @@ function normalizeExpression(expression: Expression, cache = new WeakMap<Express
     ...childSpans.map((span) => span.start),
   ]) ?? 0;
   const end = maximum([
+    ...(source ? [source.nameEnd] : []),
     ...(ownEnd === undefined ? [] : [ownEnd + 1]),
     ...childSpans.map((span) => span.end),
   ]) ?? start;
+  const role = expressionRole(expression);
+  let sourceArguments: readonly SqlAstNode[] | undefined;
+  if (source?.arguments) {
+    sourceArguments = context.sourceArguments.get(source.id);
+    if (!sourceArguments) {
+      sourceArguments = source.arguments.map((argument) => normalizeExpression(argument, context));
+      context.sourceArguments.set(source.id, sourceArguments);
+    }
+  }
   const node: SqlAstNode = {
-    role: expressionRole(expression),
+    role,
     kind: expressionKind(expression),
-    name: sqlSourceTypeNames.get(expression) ?? expression.name,
+    name: sqlSourceTypeName(expression) ?? expression.name,
     alias: expression.alias,
     aliasColumns: expression.aliasColumnNames,
     outputName: expression.outputName,
     start,
     end,
     ownStart,
-    nameStart: sourceCall?.start ?? start,
-    nameEnd: sourceCall?.nameEnd ?? end,
+    nameStart: source?.start ?? start,
+    nameEnd: source?.nameEnd ?? (role === 'function' || role === 'unnest' ? start : end),
+    ...(source ? { source: { id: source.id, name: source.name, start: source.start, end: source.nameEnd } } : {}),
     args,
-    ...(sourceCall ? { call: {
-      name: sourceCall.name, arguments: sourceCall.arguments.map((argument) => normalizeExpression(argument, cache)),
+    ...(sourceArguments ? { call: {
+      name: source!.name, arguments: sourceArguments,
     } } : {}),
   };
-  cache.set(expression, node);
+  context.nodes.set(expression, node);
   return node;
-}
-
-function decorateNameSpans(node: SqlAstNode, text: string, cache = new WeakMap<SqlAstNode, SqlAstNode>()): SqlAstNode {
-  const cached = cache.get(node);
-  if (cached) return cached;
-  const args = Object.fromEntries(Object.entries(node.args).map(([key, value]) => [
-    key,
-    decorateValueNameSpans(value, text, cache),
-  ]));
-  const own = exactNodeNameSpan(node, text);
-  const decorated: SqlAstNode = {
-    ...node,
-    args,
-    ...(node.call ? { call: {
-      name: node.call.name, arguments: node.call.arguments.map((argument) => decorateNameSpans(argument, text, cache)),
-    } } : {}),
-    nameStart: own.start,
-    nameEnd: own.end,
-  };
-  cache.set(node, decorated);
-  return decorated;
-}
-
-function decorateValueNameSpans(value: SqlAstValue, text: string, cache: WeakMap<SqlAstNode, SqlAstNode>): SqlAstValue {
-  if (isSqlAstNode(value)) return decorateNameSpans(value, text, cache);
-  if (Array.isArray(value)) return value.map((entry) => decorateValueNameSpans(entry, text, cache));
-  return value;
-}
-
-function exactNodeNameSpan(node: SqlAstNode, text: string): { start: number; end: number } {
-  if (node.call) return { start: node.nameStart, end: node.nameEnd };
-  if (node.role === 'identifier' || node.role === 'literal') {
-    return { start: node.start, end: node.end };
-  }
-  if (node.role !== 'function' && node.role !== 'unnest') {
-    return { start: node.start, end: node.end };
-  }
-  const childStarts = Object.values(node.args).flatMap(collectValueOwnStarts);
-  const before = childStarts.length > 0 ? Math.min(...childStarts) : node.end;
-  const searchStart = Math.max(0, Math.min(node.start, before) - 160);
-  const searchEnd = Math.min(text.length, Math.max(before, node.end) + 2);
-  const segment = text.slice(searchStart, searchEnd);
-  const matcher = /[\p{L}_$][\p{L}\p{N}_$]*(?:\s*\.\s*[\p{L}_$][\p{L}\p{N}_$]*)*(?=\s*\()/giu;
-  let best: RegExpExecArray | undefined;
-  const allowedNames = astFunctionSourceNames(node);
-  for (const match of segment.matchAll(matcher)) {
-    const absolute = searchStart + match.index;
-    if (node.ownStart !== undefined) {
-      if (absolute === node.ownStart) best = match;
-      continue;
-    }
-    if (absolute >= before) continue;
-    const leaf = match[0].replace(/\s+/gu, '').split('.').at(-1)?.toLocaleLowerCase() ?? '';
-    if (allowedNames.has(leaf)) best = match;
-  }
-  if (!best) {
-    const fallbackName = node.kind === 'anonymous'
-      ? node.name.replace(/^!/u, '')
-      : AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
-    return { start: node.start, end: Math.min(node.end, node.start + fallbackName.length) };
-  }
-  const start = searchStart + best.index;
-  return { start, end: start + best[0].length };
 }
 
 const AST_FUNCTION_NAMES: Readonly<Record<string, string>> = {
@@ -355,53 +309,15 @@ const AST_FUNCTION_NAMES: Readonly<Record<string, string>> = {
   xmlTable: 'xmltable',
 };
 
-const AST_FUNCTION_SOURCE_ALIASES: Readonly<Record<string, readonly string[]>> = {
-  arrayFilter: ['filter'],
-  approxQuantile: ['approx_percentile', 'percentile_approx'],
-  argMax: ['max_by'],
-  argMin: ['min_by'],
-  cast: ['cast', 'convert', 'from_utc_timestamp', 'to_utc_timestamp'],
-  chr: ['char', 'chr'],
-  dateDiff: ['date_diff', 'datediff', 'to_days'],
-  extract: ['date_part', 'extract'],
-  groupConcat: ['group_concat', 'listagg', 'string_agg'],
-  jsonArrayAgg: ['json_agg', 'json_arrayagg'],
-  jsonExtract: ['json_extract', 'json_query'],
-  jsonObjectAgg: [
-    'json_object_agg',
-    'json_objectagg',
-    'jsonb_object_agg',
-  ],
-  quantile: ['percentile'],
-  regexpSplit: ['regexp_split', 'split'],
-  strPosition: ['position'],
-  substring: ['substr', 'substring'],
-  tsOrDsAdd: ['date_add', 'dateadd'],
-  tsOrDsDiff: ['date_diff', 'datediff'],
-  xmlElement: ['xmlelement'],
-  xmlTable: ['xmltable'],
-};
-
-function astFunctionSourceNames(node: SqlAstNode): ReadonlySet<string> {
-  if (node.kind === 'anonymous' && node.name) {
-    return new Set([node.name.replace(/^!/u, '').toLocaleLowerCase()]);
-  }
-  const canonical = AST_FUNCTION_NAMES[node.kind] ?? camelCaseToSqlName(node.kind);
-  return new Set([
-    canonical.toLocaleLowerCase(),
-    ...(AST_FUNCTION_SOURCE_ALIASES[node.kind] ?? []),
-  ]);
-}
-
 function camelCaseToSqlName(value: string): string {
   return value.replace(/([a-z0-9])([A-Z])/gu, '$1_$2').toLocaleLowerCase();
 }
 
-function normalizeValue(value: unknown, cache: WeakMap<Expression, SqlAstNode>): SqlAstValue {
-  if (value instanceof Expression) return normalizeExpression(value, cache);
+function normalizeValue(value: unknown, context: NormalizationContext): SqlAstValue {
+  if (value instanceof Expression) return normalizeExpression(value, context);
   if (Array.isArray(value)) {
     return value.flatMap((entry): SqlAstValue[] => {
-      const normalized = normalizeValue(entry, cache);
+      const normalized = normalizeValue(entry, context);
       return normalized === undefined ? [] : [normalized];
     });
   }
@@ -414,17 +330,6 @@ function collectValueSpans(value: SqlAstValue): Array<{ start: number; end: numb
   // source token at offset zero. Only real source spans can bound a parent.
   if (isSqlAstNode(value)) return value.end > value.start ? [{ start: value.start, end: value.end }] : [];
   if (Array.isArray(value)) return value.flatMap(collectValueSpans);
-  return [];
-}
-
-function collectValueOwnStarts(value: SqlAstValue): number[] {
-  if (isSqlAstNode(value)) {
-    return [
-      ...(value.ownStart === undefined ? [] : [value.ownStart]),
-      ...Object.values(value.args).flatMap(collectValueOwnStarts),
-    ];
-  }
-  if (Array.isArray(value)) return value.flatMap(collectValueOwnStarts);
   return [];
 }
 

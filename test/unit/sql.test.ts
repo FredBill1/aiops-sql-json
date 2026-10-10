@@ -102,4 +102,25 @@ describe('SQL analysis', () => {
     expect(lineColumnToOffset('a\r\nbc\nd', 2, 2)).toBe(4);
     expect(lineColumnToOffset('a\r\nbc\nd', 3, 1)).toBe(6);
   });
+
+  it.each(SQL_DIALECTS)('maps DT syntax errors after astral characters to UTF-16 for %s', (dialect) => {
+    const sql = "SELECT '😀𠮷', column_name + FROM source_table";
+    const issues = analyzeSql(sql, dialect, []).issues;
+    const token = dialect === 'mysql' ? 'source_table' : dialect === 'postgresql' ? '+' : 'FROM';
+    const issue = issues.find((candidate) => candidate.message.includes(`'${token}'`));
+    expect(issue).toMatchObject({ start: sql.indexOf(token), end: sql.indexOf(token) + token.length });
+  });
+
+  it.each(['\n', '\r\n', '\r'])('maps syntax errors on Unicode lines with %j line breaks', (eol) => {
+    const sql = `SELECT '😀'${eol}, '𠮷😀', value + FROM source_table`;
+    const from = analyzeSql(sql, 'spark', []).issues.find((issue) => issue.message.includes("'FROM'"));
+    expect(from).toMatchObject({ start: sql.indexOf('FROM'), end: sql.indexOf('FROM') + 4 });
+  });
+
+  it('uses masked parser columns while preserving original placeholder source offsets', () => {
+    const sql = "SELECT '${😀}', value + FROM source_table";
+    const placeholders = compilePlaceholderPatterns(['\\$\\{[^}]+\\}']).patterns;
+    const from = analyzeSql(sql, 'spark', placeholders).issues.find((issue) => issue.message.includes("'FROM'"));
+    expect(from).toMatchObject({ start: sql.indexOf('FROM'), end: sql.indexOf('FROM') + 4 });
+  });
 });
