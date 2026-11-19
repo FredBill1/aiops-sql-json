@@ -2,7 +2,7 @@
   "name": "aiops-sql-json",
   "displayName": "AIOps SQL JSON",
   "description": "Edit, validate, and highlight multiline SQL in .sql.json files.",
-  "version": "0.0.25",
+  "version": "0.0.26",
   "icon": "images/icon.png",
   "license": "MIT",
   "engines": {
@@ -84,6 +84,11 @@
         "command": "aiopsSqlJson.rebuildSchemaIndex",
         "title": "AIOps SQL JSON: Force Rebuild Schema Index",
         "enablement": "config.aiopsSqlJson.schemaValidation.enabled"
+      },
+      {
+        "command": "aiopsSqlJson.forceReparse",
+        "title": "AIOps SQL JSON: Force Reparse SQL",
+        "enablement": "editorLangId == sql-json || (editorLangId == sql && config.aiopsSqlJson.plainSql.enabled)"
       }
     ],
     "keybindings": [
@@ -156,6 +161,29 @@
           "default": true,
           "scope": "resource",
           "markdownDescription": "Whether this extension provides completion, syntax validation, and semantic highlighting for regular `.sql` files."
+        },
+        "aiopsSqlJson.analysis.slowNotificationMs": {
+          "type": "integer",
+          "default": 2000,
+          "minimum": 1,
+          "maximum": 2147483647,
+          "scope": "resource",
+          "markdownDescription": "Milliseconds of SQL parsing or Schema indexing before VS Code shows a progress notification with a Cancel button. Work continues until it finishes or is cancelled."
+        },
+        "aiopsSqlJson.analysis.maxWorkers": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["auto"]
+            },
+            {
+              "type": "integer",
+              "minimum": 1
+            }
+          ],
+          "default": "auto",
+          "scope": "machine",
+          "markdownDescription": "Maximum number of simultaneous SQL analysis and Schema indexing workers on the extension host. `auto` uses the host's CPU and memory. A positive integer sets the limit directly. Changes take effect without reloading."
         },
         "aiopsSqlJson.schemaValidation.enabled": {
           "type": "boolean",

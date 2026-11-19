@@ -13,30 +13,22 @@ import {
 import type { ProjectedJsonDocument } from './jsonService';
 import type { SqlAnalysis } from './sqlTypes';
 import type { SqlSemanticIssue } from './sqlSchemaCore';
-import type { SqlService } from './sqlService';
+import type { SqlParseRequest, SqlService } from './sqlService';
 import { isSqlRequestCancelled, sqlDocumentSnapshot, sqlServiceFailureMessage } from './sqlServiceContext';
 
-export interface RegionAnalysis {
+interface RegionAnalysis {
   region: SqlJsonRegion;
   sql: SqlAnalysis;
   semantics: readonly SqlSemanticIssue[];
   failure?: string;
 }
 
-export interface SqlJsonAnalysis {
-  diagnostics: vscode.Diagnostic[];
-  regions: RegionAnalysis[];
-}
-
-export async function analyzeSqlJsonDocument(
+export async function validateJsonDocument(
   document: vscode.TextDocument,
   projected: ProjectedJsonDocument,
   configuration: ExtensionConfiguration,
-  sqlService: SqlService,
-  schemaKey?: string,
-): Promise<SqlJsonAnalysis> {
-  const regions = await analyzeSqlJsonRegions(document, projected, configuration, sqlService, schemaKey);
-  const sqlRegions = regions.map((region) => region.region);
+  sqlRegions: readonly SqlJsonRegion[],
+): Promise<vscode.Diagnostic[]> {
   const diagnostics = (
     await projected.service.doValidation(
       projected.textDocument,
@@ -79,10 +71,7 @@ export async function analyzeSqlJsonDocument(
     ));
   }
 
-  for (const regionAnalysis of regions) {
-    appendSqlDiagnostics(document, projected, configuration, regionAnalysis, diagnostics);
-  }
-  return { diagnostics, regions };
+  return diagnostics;
 }
 
 function shouldSuppressJsonDiagnostic(
@@ -117,33 +106,43 @@ function overlaps(leftStart: number, leftEnd: number, rightStart: number, rightE
 export async function analyzeSqlJsonRegions(
   document: vscode.TextDocument,
   projected: ProjectedJsonDocument,
+  regions: readonly SqlJsonRegion[],
   configuration: ExtensionConfiguration,
   sqlService: SqlService,
+  request: SqlParseRequest,
   schemaKey?: string,
-): Promise<RegionAnalysis[]> {
-  return Promise.all(findSqlRegions(projected, configuration).map(async (region): Promise<RegionAnalysis> => {
+): Promise<{ diagnostics: vscode.Diagnostic[]; failed: boolean }> {
+  const diagnostics: vscode.Diagnostic[] = [];
+  let failed = false;
+  for (const region of regions) {
     try {
       const result = await sqlService.analyze(
         sqlDocumentSnapshot(document, configuration, region.decoded.text, `region:${region.originalRange.start}`),
         { schemaKey, udfs: configuration.udfs, validateSchema: shouldReportSchemaDiagnostics(configuration) },
+        request,
       );
-      return { region, ...result };
+      appendSqlDiagnostics(document, projected, configuration, { region, ...result }, diagnostics);
     } catch (error) {
       if (isSqlRequestCancelled(error)) throw error;
-      return { region, sql: { issues: [], tokens: [] }, semantics: [], failure: sqlServiceFailureMessage(error) };
+      failed = true;
+      appendSqlDiagnostics(document, projected, configuration, {
+        region, sql: { issues: [], tokens: [] }, semantics: [], failure: sqlServiceFailureMessage(error),
+      }, diagnostics);
     }
-  }));
+  }
+  return { diagnostics, failed };
 }
 
 export async function analyzePlainSqlDocument(
   document: vscode.TextDocument,
   configuration: ExtensionConfiguration,
   sqlService: SqlService,
+  request: SqlParseRequest,
   schemaKey?: string,
-): Promise<{ diagnostics: vscode.Diagnostic[]; sql: SqlAnalysis }> {
+): Promise<vscode.Diagnostic[]> {
   const { sql, semantics } = await sqlService.analyze(sqlDocumentSnapshot(document, configuration), {
     schemaKey, udfs: configuration.udfs, validateSchema: shouldReportSchemaDiagnostics(configuration),
-  });
+  }, request);
   const diagnostics = sql.issues.map((issue) => createDiagnostic(
     document,
     { start: issue.start, end: issue.end },
@@ -161,10 +160,10 @@ export async function analyzePlainSqlDocument(
       issue.code,
     )));
   }
-  return { diagnostics, sql };
+  return diagnostics;
 }
 
-function findSqlRegions(
+export function findSqlRegions(
   projected: ProjectedJsonDocument,
   configuration: ExtensionConfiguration,
 ): SqlJsonRegion[] {

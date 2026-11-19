@@ -59,6 +59,9 @@ suite('AIOps SQL JSON extension', () => {
     const completionOnly = extension.packageJSON.contributes.configuration.properties[
       'aiopsSqlJson.schemaValidation.completionOnly'
     ] as { default?: boolean; scope?: string };
+    const maxWorkers = extension.packageJSON.contributes.configuration.properties[
+      'aiopsSqlJson.analysis.maxWorkers'
+    ] as { default?: string; scope?: string; oneOf: unknown[] };
     const formatWidth = extension.packageJSON.contributes.configuration.properties[
       'aiopsSqlJson.format.maxLineWidth'
     ] as { default?: number; minimum?: number };
@@ -80,6 +83,9 @@ suite('AIOps SQL JSON extension', () => {
     assert.deepEqual(schemaFiles.default, ['${workspaceFolder}/schema/*.sql']);
     assert.equal(completionOnly.default, false);
     assert.equal(completionOnly.scope, 'resource');
+    assert.equal(maxWorkers.default, 'auto');
+    assert.equal(maxWorkers.scope, 'machine');
+    assert.deepEqual(maxWorkers.oneOf, [{ type: 'string', enum: ['auto'] }, { type: 'integer', minimum: 1 }]);
     assert.equal(formatWidth.default, 120);
     assert.equal(formatWidth.minimum, 20);
     assert.equal(formatDepth.default, 4);
@@ -112,6 +118,57 @@ suite('AIOps SQL JSON extension', () => {
       document.uri,
     );
     assert.ok(tokens && tokens.data.length > 0, 'Embedded SQL should produce semantic tokens.');
+  });
+
+  test('force reparses every SQL region in an unchanged active document', async () => {
+    const document = await openFile('force-reparse.sql.json', '{"firstSql":"SELEC 1;","secondSql":"SELEC 2;"}');
+    const isSqlIssue = (diagnostic: vscode.Diagnostic): boolean => diagnostic.source === 'spark SQL';
+    const before = await waitForDiagnostics(document.uri, (items) => items.filter(isSqlIssue).length >= 2);
+    const version = document.version;
+    let subscription: vscode.Disposable | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    const refreshed = new Promise<void>((resolve, reject) => {
+      subscription = vscode.languages.onDidChangeDiagnostics((event) => {
+        if (event.uris.some((uri) => uri.toString() === document.uri.toString())
+          && vscode.languages.getDiagnostics(document.uri).filter(isSqlIssue).length === before.filter(isSqlIssue).length) resolve();
+      });
+      timeout = setTimeout(() => reject(new Error('Force Reparse SQL did not publish diagnostics.')), 10_000);
+    });
+    try {
+      await Promise.all([vscode.commands.executeCommand('aiopsSqlJson.forceReparse'), refreshed]);
+      assert.equal(document.version, version);
+    } finally {
+      subscription?.dispose();
+      clearTimeout(timeout);
+    }
+  });
+
+  test('opens progress and grows the worker pool during a busy SQL parse', async () => {
+    const configuration = vscode.workspace.getConfiguration('aiopsSqlJson');
+    await configuration.update('analysis.maxWorkers', 1, vscode.ConfigurationTarget.Global);
+    await configuration.update('placeholderPatterns', ['^(a+)+$'], vscode.ConfigurationTarget.Global);
+    const healthy = await openFile('worker-probe.sql', 'SELEC 1;');
+    await waitForDiagnostics(healthy.uri, (items) => items.some((item) => item.source === 'spark SQL'));
+    const blocked = await openFile('worker-busy.sql', `${'a'.repeat(60)}!`);
+    const ping = 'aiopsSqlJson.integrationProbe';
+    const registration = vscode.commands.registerCommand(ping, () => 'responsive');
+    const replace = (document: vscode.TextDocument, text: string): Thenable<boolean> => {
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), text);
+      return vscode.workspace.applyEdit(edit);
+    };
+    try {
+      await vscode.commands.executeCommand('aiopsSqlJson.showAnalysisProgress');
+      await vscode.commands.executeCommand('aiopsSqlJson.showAnalysisProgress');
+      assert.equal(await vscode.commands.executeCommand(ping), 'responsive');
+      assert.equal(await replace(healthy, 'SELECT 1;'), true);
+      await configuration.update('analysis.maxWorkers', 2, vscode.ConfigurationTarget.Global);
+      await waitForDiagnostics(healthy.uri, (items) => items.length === 0);
+    } finally {
+      registration.dispose();
+      await replace(blocked, 'SELECT 2;');
+      await vscode.commands.executeCommand('notifications.hideList');
+    }
   });
 
   for (const fileExtension of ['sql', 'sql.json']) {
@@ -2463,6 +2520,8 @@ function managedConfigurations(): ManagedConfiguration[] {
     ['aiopsSqlJson', 'plainSql.enabled'],
     ['aiopsSqlJson', 'multilineStrings.allowAll'],
     ['aiopsSqlJson', 'placeholders.allowEverywhere'],
+    ['aiopsSqlJson', 'placeholderPatterns'],
+    ['aiopsSqlJson', 'analysis.maxWorkers'],
     ['aiopsSqlJson', 'keyPatterns'],
     ['aiopsSqlJson', 'schemaValidation.enabled'],
     ['aiopsSqlJson', 'schemaValidation.completionOnly'],

@@ -1,7 +1,7 @@
 import type * as vscode from 'vscode';
 
 import type { ExtensionConfiguration } from './config';
-import { SqlServiceError } from './sqlService';
+import { SqlServiceError, type SqlCancellationToken } from './sqlService';
 import type { SqlDocumentSnapshot } from './sqlWorkerProtocol';
 
 export function sqlDocumentSnapshot(
@@ -22,6 +22,16 @@ export function sqlDocumentSnapshot(
 
 export function isSqlRequestCancelled(error: unknown): boolean {
   return error instanceof SqlServiceError && (error.code === 'cancelled' || error.code === 'stale');
+}
+
+export function waitForSqlRequest<T>(pending: Promise<T>, token: SqlCancellationToken): Promise<T> {
+  let subscription: { dispose(): void } | undefined;
+  const cancelled = new Promise<never>((_, reject) => {
+    const cancel = (): void => reject(new SqlServiceError('cancelled', 'SQL request was cancelled.'));
+    subscription = token.onCancellationRequested(cancel);
+    if (token.isCancellationRequested) cancel();
+  });
+  return Promise.race([cancelled, pending]).finally(() => subscription?.dispose());
 }
 
 export function sqlServiceFailureMessage(error: unknown): string {

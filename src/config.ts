@@ -3,8 +3,33 @@ import * as vscode from 'vscode';
 import { compileGlobs, compilePlaceholderPatterns } from './patterns';
 import { getConfigurationResource } from './resourceContext';
 import { isSqlDialect, type SqlDialect } from './sqlDialect';
+import { resolveSqlWorkerLimit } from './sqlWorkerLimit';
 
 export const DEFAULT_SCHEMA_FILE_GLOBS = ['${workspaceFolder}/schema/*.sql'];
+export const SQL_SLOW_NOTIFICATION_SETTING = 'aiopsSqlJson.analysis.slowNotificationMs';
+export const SQL_MAX_WORKERS_SETTING = 'aiopsSqlJson.analysis.maxWorkers';
+const DEFAULT_SLOW_NOTIFICATION_MS = 2_000;
+
+export function getSqlWorkerLimit(): ReturnType<typeof resolveSqlWorkerLimit> {
+  return resolveSqlWorkerLimit(vscode.workspace.getConfiguration().get<unknown>(SQL_MAX_WORKERS_SETTING));
+}
+
+export function getSqlSlowNotificationMs(resource: vscode.Uri): number {
+  const value = vscode.workspace.getConfiguration(undefined, getConfigurationResource(resource))
+    .get<unknown>(SQL_SLOW_NOTIFICATION_SETTING);
+  const milliseconds = integerAtLeast(value, DEFAULT_SLOW_NOTIFICATION_MS, 1);
+  return milliseconds <= 2_147_483_647 ? milliseconds : DEFAULT_SLOW_NOTIFICATION_MS;
+}
+
+export function isPlainSqlEnabled(resource: vscode.Uri): boolean {
+  return vscode.workspace.getConfiguration('aiopsSqlJson', getConfigurationResource(resource)).get('plainSql.enabled', true);
+}
+
+export function affectsSqlConfiguration(event: vscode.ConfigurationChangeEvent): boolean {
+  const sections = ['keyPatterns', 'multilineStrings', 'dialect', 'plainSql', 'schemaValidation', 'schemaFiles',
+    'udfs', 'placeholderPatterns', 'placeholders', 'format'];
+  return sections.some((section) => event.affectsConfiguration(`aiopsSqlJson.${section}`));
+}
 
 export type FormatCase = 'preserve' | 'upper' | 'lower';
 export type LayoutMode = 'compact' | 'expanded';

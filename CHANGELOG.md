@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.0.26
+
+- Added SQL analysis progress to the status bar for `.sql` and `.sql.json` files. Slow analysis continues with a cancellable notification after `aiopsSqlJson.analysis.slowNotificationMs`, which defaults to 2,000 ms.
+- Added **AIOps SQL JSON: Force Reparse SQL** to reparse every SQL region in the current file, including unchanged content. Cancelling pauses SQL analysis until you close the file or retry from the status bar or Command Palette. JSON diagnostics and lexical highlighting continue during the pause.
+- Made shared Schema indexing independently cancellable and retryable. Dependent files continue with the last successful index when available, or with syntax checks alone.
+- Added `aiopsSqlJson.analysis.maxWorkers` to control parallel analysis across files and Schema indexes. The default `auto` mode uses the extension host's CPU and effective memory. A positive integer sets the limit directly. Changing the setting resizes the pool while in-flight tasks continue.
+
 ## 0.0.25
 
 - Fixed freezes caused by large string literals in Spark SQL. Function source names and ranges are captured during parsing, including parser copies and rewritten calls, without searching expression text with a regular expression.

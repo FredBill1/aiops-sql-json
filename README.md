@@ -20,7 +20,7 @@ A VS Code extension for AIOps Spark job configurations. It lets strings in `*.sq
 - Warns when unindented continuation lines concatenate SQL words or when `--` comments cross physical lines.
 - Formats regular SQL and complete SQL JSON documents with dialect-aware, token-preserving layout rules.
 - Formats JSON structure while preserving non-SQL multiline string contents exactly, and places every recognized SQL block on the line after its opening double quote.
-- Runs SQL analysis and formatting in a background worker, with a separate lexer worker for highlighting. Requests are shared for the current document version and cancelled after edits. If a parser exceeds its time limit, the worker is restarted and diagnostics report that analysis is incomplete. Temporary worker startup and communication failures can recover for the same document version.
+- Runs SQL analysis, navigation, completion, formatting, and Schema indexing in background workers. A separate lexer worker supplies highlighting. The SQL status bar shows when analysis is queued, running, ready, paused, or failed.
 
 ## Installation
 
@@ -35,11 +35,21 @@ npm run build
 
 Press `F5` to launch a new VS Code window with the development version installed.
 
-The **Run Extension** launch configuration allows SQL workers to remain paused in the debugger. When the development extension host has an active inspector, startup and execution deadlines are disabled; continuing the debugger lets the pending SQL request finish. Document edits and cancellation still discard stale work, and worker memory limits remain enabled. Installed extensions and integration tests always enforce deadlines.
+The **Run Extension** launch configuration allows workers to remain paused in the debugger. An inspected development host suspends the lexical worker's startup and execution deadlines. Continuing the debugger lets the pending request finish. The parser workers use cancellable progress notifications in both development and installed extensions.
 
-Use **Run Extension (Production Deadlines)** to exercise the normal startup, analysis, and formatting limits while developing. Its `AIOPS_SQL_JSON_ENFORCE_TIMEOUTS=1` environment variable forces deadline enforcement even when the debugger is attached. Both launch configurations retain worker source maps and breakpoints.
+Use **Run Extension (Production Deadlines)** to exercise the lexical worker's production deadlines while developing. Its `AIOPS_SQL_JSON_ENFORCE_TIMEOUTS=1` environment variable enables those deadlines with the debugger attached. Both launch configurations support worker source maps and breakpoints.
 
-The **AIOps SQL JSON** Output channel records the selected deadline policy and worker lifecycle metadata such as lane, epoch, phase, operation, elapsed time, and error code. SQL text, document paths, and exception messages are excluded.
+The **AIOps SQL JSON** Output channel records the analysis worker limit, the selected deadline policy, and worker lifecycle metadata such as lane, epoch, phase, operation, elapsed time, and error code. SQL text, document paths, and exception messages are excluded.
+
+## Analysis progress and retry
+
+`aiopsSqlJson.analysis.maxWorkers` controls how many documents and shared Schema indexes can be parsed at once. In `auto` mode, the extension uses the smaller of half the extension host's available CPU parallelism and one worker per 4 GiB of effective memory, rounded down to a minimum of one. Effective memory accounts for a reported process memory limit. Set a positive integer in User or Remote User settings to select the limit directly. Workers start as tasks arrive. When you lower the limit, running tasks finish before excess workers exit. Each document is analyzed serially, and highlighting has a dedicated lexer worker.
+
+Click **SQL Waiting…** or **SQL Analyzing…** in the status bar to open progress with a **Cancel** button. A progress notification also opens automatically when work has occupied a worker for the configured `aiopsSqlJson.analysis.slowNotificationMs`. That interval includes worker startup. The notification closes when the work finishes.
+
+Cancelling pauses SQL analysis, completion, hover, Go to Definition, and formatting for that file until you retry or close it. You can keep editing, and JSON validation and lexical highlighting continue. Click **SQL Paused** and choose **Retry**, or run **AIOps SQL JSON: Force Reparse SQL** from the Command Palette. The command also reparses an already analyzed file, including every embedded SQL region.
+
+Shared Schema indexing has its own progress notification. If you cancel an index, dependent files continue with its last successful Schema or with syntax checks alone. Click **Schema Paused** and choose **Retry** for the relevant index, or use **AIOps SQL JSON: Force Rebuild Schema Index** to rebuild the applicable indexes.
 
 ## Multiline strings and SQL
 
@@ -76,6 +86,8 @@ For the same reason, an SQL `--` comment does not end at the visible line bounda
 | `aiopsSqlJson.multilineStrings.allowAll` | `true` | Allows physical line breaks in every JSON string. Disable it to allow them only in SQL strings selected by `keyPatterns`. |
 | `aiopsSqlJson.dialect` | `"spark"` | SQL dialect used for embedded SQL and regular `.sql` files. |
 | `aiopsSqlJson.plainSql.enabled` | `true` | Enables this extension's diagnostics, semantic highlighting, completion, Hover, and definitions for regular `.sql` files. |
+| `aiopsSqlJson.analysis.slowNotificationMs` | `2000` | Milliseconds before showing a cancellable progress notification for parsing or Schema indexing. |
+| `aiopsSqlJson.analysis.maxWorkers` | `"auto"` | Concurrent SQL parsing and Schema indexing workers on the extension host. Accepts `"auto"` or a positive integer and takes effect without reloading. |
 | `aiopsSqlJson.schemaValidation.enabled` | `false` | Enables strict offline Schema completion and validation. No database connection or SQL execution is performed. |
 | `aiopsSqlJson.schemaValidation.completionOnly` | `false` | Keeps Schema-aware completion while suppressing all Schema-derived query and DDL diagnostics. Has no effect unless Schema validation is enabled. |
 | `aiopsSqlJson.schemaFiles` | `["${workspaceFolder}/schema/*.sql"]` | Globs for `.sql` files containing explicit tables and inferable views. Relative globs are resolved from the resource's workspace folder. |

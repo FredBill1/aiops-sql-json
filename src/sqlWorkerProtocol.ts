@@ -83,7 +83,7 @@ interface SchemaRequest {
 
 export type SqlWorkerOperation =
   | { operation: 'tokens'; snapshot: SqlDocumentSnapshot }
-  | ({ operation: 'analyze'; snapshot: SqlDocumentSnapshot; options: SqlAnalysisOptions } & SchemaRequest)
+  | ({ operation: 'analyze'; snapshot: SqlDocumentSnapshot; options: SqlAnalysisOptions; freshParse?: boolean } & SchemaRequest)
   | ({ operation: 'completion'; snapshot: SqlDocumentSnapshot; offset: number; options: SqlCompletionOptions } & SchemaRequest)
   | ({ operation: 'symbol'; snapshot: SqlDocumentSnapshot; offset: number; options: SqlAnalysisOptions } & SchemaRequest)
   | { operation: 'format'; snapshot: SqlDocumentSnapshot; format: SqlFormatConfiguration; editor: EditorFormattingOptions }

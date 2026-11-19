@@ -2,7 +2,7 @@ import { url as inspectorUrl } from 'node:inspector';
 
 import * as vscode from 'vscode';
 
-import { getExtensionConfiguration } from './config';
+import { getExtensionConfiguration, getSqlWorkerLimit, SQL_MAX_WORKERS_SETTING } from './config';
 import { DiagnosticController } from './diagnostics';
 import { SqlDocumentFormattingProvider } from './formattingProvider';
 import { SqlBracketDecorationController } from './bracketDecorations';
@@ -13,6 +13,7 @@ import { JsonCompletionProvider, JsonHoverProvider } from './providers';
 import { SqlSchemaService, type SchemaRebuildRequest } from './schemaService';
 import { SEMANTIC_TOKEN_LEGEND, SqlSemanticTokensProvider } from './semanticTokens';
 import { SqlCompletionProvider } from './sqlCompletion';
+import { FORCE_REPARSE_COMMAND, SqlAnalysisProgress } from './sqlAnalysisProgress';
 import { SqlDefinitionProvider, SqlHoverProvider } from './sqlNavigation';
 import { SqlService } from './sqlService';
 import { resolveSqlDeadlinePolicy, serializeSqlWorkerMetadata, type SqlExtensionMode } from './sqlDeadlinePolicy';
@@ -40,8 +41,11 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   const output = vscode.window.createOutputChannel('AIOps SQL JSON');
   output.appendLine(JSON.stringify({ event: 'deadline-policy', extensionMode, policy: deadlinePolicy }));
+  const workerLimit = getSqlWorkerLimit();
+  output.appendLine(JSON.stringify({ event: 'analysis-worker-limit', ...workerLimit }));
   const sqlService = new SqlService({
     analysisWorkerPath: context.asAbsolutePath('dist/sqlAnalysisWorker.js'),
+    analysisWorkerLimit: workerLimit.limit,
     lexicalWorkerPath: context.asAbsolutePath('dist/sqlLexicalWorker.js'),
     deadlinePolicy,
     onWorkerEvent: (event) => output.appendLine(serializeSqlWorkerMetadata(event)),
@@ -49,8 +53,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const jsonServices = new JsonServiceManager();
   const editingContexts = new SqlEditingContextService(jsonServices);
   const semanticTokens = new SqlSemanticTokensProvider(jsonServices, sqlService);
-  const schemas = new SqlSchemaService(sqlService);
-  const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh(), schemas, sqlService);
+  const progress = new SqlAnalysisProgress();
+  const schemas = new SqlSchemaService(sqlService, progress);
+  const diagnostics = new DiagnosticController(jsonServices, () => semanticTokens.refresh(), schemas, sqlService, progress);
   const bracketDecorations = new SqlBracketDecorationController(editingContexts);
   const editingCommands = new SqlEditingCommands(editingContexts);
 
@@ -60,8 +65,24 @@ export function activate(context: vscode.ExtensionContext): void {
     semanticTokens,
     schemas,
     diagnostics,
+    progress,
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration(SQL_MAX_WORKERS_SETTING)) return;
+      const limit = getSqlWorkerLimit();
+      sqlService.setAnalysisWorkerLimit(limit.limit);
+      output.appendLine(JSON.stringify({ event: 'analysis-worker-limit', ...limit }));
+    }),
+    progress.registerStatusBar({
+      schemaKey: (document) => schemas.getIndexKey(document.uri, getExtensionConfiguration(document.uri)),
+      retryDocument: (document) => diagnostics.forceReparse(document),
+      retrySchema: (document) => schemas.retryIndex(document.uri, getExtensionConfiguration(document.uri)),
+    }),
     bracketDecorations,
     editingCommands,
+    vscode.commands.registerCommand(FORCE_REPARSE_COMMAND, () => {
+      const document = vscode.window.activeTextEditor?.document;
+      if (document) diagnostics.forceReparse(document);
+    }),
     vscode.commands.registerCommand(REBUILD_SCHEMA_INDEX_COMMAND, async () => {
       const resource = commandResource();
       if (!resource || !getExtensionConfiguration(resource).schemaValidationEnabled) {
@@ -76,19 +97,14 @@ export function activate(context: vscode.ExtensionContext): void {
           resource: document.uri,
           configuration: getExtensionConfiguration(document.uri),
         }));
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: 'AIOps SQL JSON: Rebuilding Schema index…',
-          cancellable: false,
-        },
-        () => schemas.rebuild(requests),
-      );
+      await schemas.rebuild(requests);
       const snapshots = await Promise.all(requests.map((request) => schemas.getSchema(
         request.resource, request.configuration, true,
       )));
       if (snapshots.some((snapshot) => schemas.getSchemaFailure(snapshot))) {
         void vscode.window.showWarningMessage('AIOps SQL JSON: Schema index rebuild could not complete. See SQL diagnostics for details.');
+      } else if (requests.some(({ resource, configuration }) => schemas.isIndexPaused(resource, configuration))) {
+        void vscode.window.showInformationMessage('AIOps SQL JSON: Schema indexing paused.');
       } else {
         void vscode.window.showInformationMessage('AIOps SQL JSON: Schema index rebuilt.');
       }
@@ -106,7 +122,7 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.languages.registerCompletionItemProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlCompletionProvider(jsonServices, schemas, sqlService),
+      new SqlCompletionProvider(jsonServices, schemas, sqlService, progress),
       ' ',
       '.',
       '(',
@@ -115,15 +131,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.languages.registerHoverProvider(SQL_JSON_SELECTOR, new JsonHoverProvider(jsonServices)),
     vscode.languages.registerHoverProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlHoverProvider(jsonServices, schemas, sqlService),
+      new SqlHoverProvider(jsonServices, schemas, sqlService, progress),
     ),
     vscode.languages.registerDefinitionProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlDefinitionProvider(jsonServices, schemas, sqlService),
+      new SqlDefinitionProvider(jsonServices, schemas, sqlService, progress),
     ),
     vscode.languages.registerDocumentFormattingEditProvider(
       [...SQL_JSON_SELECTOR, ...SQL_SELECTOR],
-      new SqlDocumentFormattingProvider(sqlService),
+      new SqlDocumentFormattingProvider(sqlService, progress),
     ),
   );
 }

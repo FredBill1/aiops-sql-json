@@ -3,10 +3,11 @@ import * as vscode from 'vscode';
 import { getExtensionConfiguration } from './config';
 import type { JsonServiceManager } from './jsonService';
 import type { SqlSchemaService } from './schemaService';
+import type { SqlAnalysisProgress } from './sqlAnalysisProgress';
 import { getSqlDocumentContext, type SqlDocumentContext } from './sqlDocumentContext';
 import type { SchemaColumn, SqlSymbolDefinition, SqlSymbolResolution } from './sqlSchemaCore';
 import type { SqlService } from './sqlService';
-import { sqlDocumentSnapshot } from './sqlServiceContext';
+import { isSqlRequestCancelled, sqlDocumentSnapshot, waitForSqlRequest } from './sqlServiceContext';
 
 const CURRENT_SQL_DOCUMENT_SOURCE = 'aiops-sql-current:';
 
@@ -15,6 +16,7 @@ export class SqlHoverProvider implements vscode.HoverProvider {
     private readonly jsonServices: JsonServiceManager,
     private readonly schemas: SqlSchemaService,
     private readonly sqlService: SqlService,
+    private readonly progress: SqlAnalysisProgress,
   ) {}
 
   async provideHover(
@@ -23,24 +25,33 @@ export class SqlHoverProvider implements vscode.HoverProvider {
     token: vscode.CancellationToken,
   ): Promise<vscode.Hover | undefined> {
     const configuration = getExtensionConfiguration(document.uri);
-    if (document.languageId === 'sql' && !configuration.plainSqlEnabled) return undefined;
+    if (token.isCancellationRequested || this.progress.isDocumentPaused(document)
+      || (document.languageId === 'sql' && !configuration.plainSqlEnabled)) return undefined;
     const context = getSqlDocumentContext(document, position, this.jsonServices, configuration);
     if (!context) return undefined;
+    const request = this.progress.beginDocument(document, token);
+    if (!request) return undefined;
     const version = document.version;
     const generation = this.sqlService.generation;
     const snapshotRequest = sqlDocumentSnapshot(document, configuration, context.sqlText, context.regionKey);
+    let outcome: 'ready' | 'failed' | undefined;
     try {
-      const snapshot = await this.schemas.getSchema(document.uri, configuration, false);
-      if (token.isCancellationRequested || document.isClosed || document.version !== version
+      const snapshot = await waitForSqlRequest(this.schemas.getSchema(document.uri, configuration), request.cancellation);
+      if (request.cancellation.isCancellationRequested || document.isClosed || document.version !== version
         || this.sqlService.generation !== generation) return undefined;
       const symbol = await this.sqlService.symbol(snapshotRequest, context.sqlOffset,
-        { schemaKey: this.schemas.getSchemaKey(snapshot), udfs: configuration.udfs }, token);
-      if (!symbol || document.isClosed || document.version !== version || token.isCancellationRequested
+        { schemaKey: this.schemas.getSchemaKey(snapshot), udfs: configuration.udfs }, request);
+      if (document.isClosed || document.version !== version || request.cancellation.isCancellationRequested
         || this.sqlService.generation !== generation) return undefined;
+      outcome = 'ready';
+      if (!symbol) return undefined;
       const contents = renderSqlHover(symbol);
       return new vscode.Hover(contents, context.toDocumentRange(symbol.reference.start, symbol.reference.end));
-    } catch {
+    } catch (error) {
+      if (!isSqlRequestCancelled(error)) outcome = 'failed';
       return undefined;
+    } finally {
+      request.finish(outcome);
     }
   }
 }
@@ -50,6 +61,7 @@ export class SqlDefinitionProvider implements vscode.DefinitionProvider {
     private readonly jsonServices: JsonServiceManager,
     private readonly schemas: SqlSchemaService,
     private readonly sqlService: SqlService,
+    private readonly progress: SqlAnalysisProgress,
   ) {}
 
   async provideDefinition(
@@ -58,34 +70,43 @@ export class SqlDefinitionProvider implements vscode.DefinitionProvider {
     token: vscode.CancellationToken,
   ): Promise<vscode.DefinitionLink[] | undefined> {
     const configuration = getExtensionConfiguration(document.uri);
-    if (document.languageId === 'sql' && !configuration.plainSqlEnabled) return undefined;
+    if (token.isCancellationRequested || this.progress.isDocumentPaused(document)
+      || (document.languageId === 'sql' && !configuration.plainSqlEnabled)) return undefined;
     const context = getSqlDocumentContext(document, position, this.jsonServices, configuration);
     if (!context) return undefined;
+    const request = this.progress.beginDocument(document, token);
+    if (!request) return undefined;
     const version = document.version;
     const generation = this.sqlService.generation;
     const snapshotRequest = sqlDocumentSnapshot(document, configuration, context.sqlText, context.regionKey);
+    let outcome: 'ready' | 'failed' | undefined;
     try {
-      const snapshot = await this.schemas.getSchema(document.uri, configuration, true);
-      if (token.isCancellationRequested || document.isClosed || document.version !== version
+      const snapshot = await waitForSqlRequest(this.schemas.getSchema(document.uri, configuration, true), request.cancellation);
+      if (request.cancellation.isCancellationRequested || document.isClosed || document.version !== version
         || this.sqlService.generation !== generation || !this.schemas.isSchemaCurrent(snapshot)) return undefined;
       const symbol = await this.sqlService.symbol(snapshotRequest, context.sqlOffset,
-        { schemaKey: this.schemas.getSchemaKey(snapshot), udfs: configuration.udfs }, token);
-      if (!symbol || symbol.definitions.length === 0 || document.isClosed || document.version !== version
-        || token.isCancellationRequested || this.sqlService.generation !== generation
+        { schemaKey: this.schemas.getSchemaKey(snapshot), udfs: configuration.udfs }, request);
+      if (document.isClosed || document.version !== version
+        || request.cancellation.isCancellationRequested || this.sqlService.generation !== generation
         || !this.schemas.isSchemaCurrent(snapshot)) return undefined;
+      outcome = 'ready';
+      if (!symbol || symbol.definitions.length === 0) return undefined;
       const originSelectionRange = context.toDocumentRange(symbol.reference.start, symbol.reference.end);
-      const candidates = await Promise.all(symbol.definitions.map((definition) => definitionLink(
+      const candidates = await waitForSqlRequest(Promise.all(symbol.definitions.map((definition) => definitionLink(
         definition,
         document,
         context,
         originSelectionRange,
-      )));
-      if (token.isCancellationRequested || document.isClosed || document.version !== version
+      ))), request.cancellation);
+      if (request.cancellation.isCancellationRequested || document.isClosed || document.version !== version
         || this.sqlService.generation !== generation || !this.schemas.isSchemaCurrent(snapshot)) return undefined;
       const links = deduplicateLinks(candidates.filter((link): link is vscode.DefinitionLink => Boolean(link)));
       return links.length > 0 ? links : undefined;
-    } catch {
+    } catch (error) {
+      if (!isSqlRequestCancelled(error)) outcome = 'failed';
       return undefined;
+    } finally {
+      request.finish(outcome);
     }
   }
 }

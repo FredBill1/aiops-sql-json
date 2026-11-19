@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ExtensionConfiguration } from '../../src/config';
 import { SqlSchemaService } from '../../src/schemaService';
+import type { SqlAnalysisProgress, SqlAnalysisRequest } from '../../src/sqlAnalysisProgress';
 import { SqlServiceError, type SqlService } from '../../src/sqlService';
 import type { SchemaSnapshot } from '../../src/sqlSchemaCore';
 import { commentFormat } from './sql-comment-whitespace.cases';
@@ -96,9 +97,28 @@ function createService() {
     releaseSchema: vi.fn<SqlService['releaseSchema']>(),
     onDidRecover: vi.fn<SqlService['onDidRecover']>(recovery.event),
   };
-  const service = new SqlSchemaService(worker as unknown as SqlService);
+  const paused = new Set<string>();
+  const active = new Map<string, SqlAnalysisRequest>();
+  const progress = {
+    beginSchema(key: string): SqlAnalysisRequest | undefined {
+      if (paused.has(key)) return undefined;
+      let cancelled = false;
+      const changes = new host.EventEmitter<void>();
+      const request: SqlAnalysisRequest = {
+        cancellation: { get isCancellationRequested() { return cancelled; }, onCancellationRequested: changes.event },
+        cancel() { cancelled = true; changes.fire(); },
+        finish() { if (active.get(key) === request) active.delete(key); changes.dispose(); },
+      };
+      active.set(key, request);
+      return request;
+    },
+    resumeSchema: (key: string) => paused.delete(key),
+    isSchemaPaused: (key: string) => paused.has(key),
+    pause(key: string) { paused.add(key); active.get(key)?.cancel(); },
+  };
+  const service = new SqlSchemaService(worker as unknown as SqlService, progress as unknown as SqlAnalysisProgress);
   services.push(service);
-  return { service, worker, recovery };
+  return { service, worker, recovery, progress };
 }
 
 function snapshot(name: string): SchemaSnapshot {
@@ -127,6 +147,56 @@ async function untilCalled(mock: { mock: { calls: unknown[][] } }, count: number
 }
 
 describe('SQL Schema worker lifecycle', () => {
+  it('unblocks all waiters after cancellation and keeps using the last good shared index until retry', async () => {
+    const { service, worker, progress } = createService();
+    const original = snapshot('original');
+    const replacement = snapshot('replacement');
+    const stopped = deferred<SchemaSnapshot>();
+    const otherResource = host.Uri.file('/queries/another.sql') as unknown as vscode.Uri;
+    const key = service.getIndexKey(resource, configuration)!;
+    expect(service.getIndexKey(otherResource, configuration)).toBe(key);
+    worker.buildSchema.mockResolvedValueOnce(original).mockReturnValueOnce(stopped.promise).mockResolvedValueOnce(replacement);
+    await service.getSchema(resource, configuration, true);
+    const originalWorkerKey = service.getSchemaKey(original);
+    const rebuilding = service.rebuild([{ resource, configuration }]);
+    const awaitingFresh = service.getSchema(otherResource, configuration, true);
+    await untilCalled(worker.buildSchema, 2);
+
+    progress.pause(key);
+    await rebuilding;
+    expect((await awaitingFresh).tables).toEqual([]);
+    expect(await service.getSchema(resource, configuration)).toBe(original);
+    expect(await service.getSchema(otherResource, configuration)).toBe(original);
+    expect(worker.releaseSchema).not.toHaveBeenCalledWith(originalWorkerKey);
+    host.change.fire({ document: { uri: host.ddlUri } });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(await service.getSchema(resource, configuration)).toBe(original);
+    expect(worker.buildSchema).toHaveBeenCalledTimes(2);
+
+    await service.retryIndex(otherResource, configuration);
+    stopped.resolve(snapshot('late result'));
+    expect(await service.getSchema(resource, configuration)).toBe(replacement);
+    expect(service.isIndexPaused(resource, configuration)).toBe(false);
+    expect(worker.buildSchema).toHaveBeenCalledTimes(3);
+  });
+
+  it('returns an empty Schema after a first-build cancellation and resumes with the rebuild command', async () => {
+    const { service, worker, progress } = createService();
+    const stopped = deferred<SchemaSnapshot>();
+    const replacement = snapshot('replacement');
+    worker.buildSchema.mockReturnValueOnce(stopped.promise).mockResolvedValueOnce(replacement);
+    const waiting = service.getSchema(resource, configuration);
+    await untilCalled(worker.buildSchema, 1);
+    progress.pause(service.getIndexKey(resource, configuration)!);
+    const fallback = await waiting;
+    expect(fallback.tables).toEqual([]);
+    expect(service.getSchemaFailure(fallback)).toBeUndefined();
+    expect(await service.getSchema(resource, configuration)).toBe(fallback);
+    await service.rebuild([{ resource, configuration }]);
+    expect(await service.getSchema(resource, configuration)).toBe(replacement);
+    stopped.resolve(snapshot('late result'));
+  });
+
   it('retries an infrastructure failure after its cooldown without changing the Schema generation', async () => {
     const { service, worker } = createService();
     const recovered = snapshot('recovered');

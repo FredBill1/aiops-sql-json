@@ -11,6 +11,7 @@ import { analyzeSql, getSqlSuggestions } from './sql';
 import { getSqlCatalog } from './sqlCatalog';
 import { formatSql } from './sqlFormatting';
 import { formatSqlJson } from './sqlJsonFormatting';
+import { resetSqlParser } from './sqlParserFactory';
 import {
   analyzeSqlSemantics, collectSqlFieldNames, createSchemaSnapshot, formatSqlDataType,
   getSqlSchemaAtOffset, getSqlScopeInfo, getSqlSymbolAtOffset, parseDdlSchema,
@@ -78,6 +79,7 @@ runSqlWorker((request) => {
   if (request.schemaKey) parentPort!.postMessage({ kind: 'schemaReady', id: request.id, epoch: request.epoch });
   const udfs = request.options.udfs ?? [];
   if (request.operation === 'analyze') {
+    if (request.freshParse) resetSqlParser(snapshot.dialect);
     const sql = analyzeSql(snapshot.text, snapshot.dialect, placeholders);
     return {
       sql,

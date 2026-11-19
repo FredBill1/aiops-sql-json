@@ -29,6 +29,10 @@ export interface ParserLike {
 
 const parserCache = new Map<SqlDialect, ParserLike>();
 
+export function resetSqlParser(dialect: SqlDialect): void {
+  parserCache.delete(dialect);
+}
+
 export function getSqlParser(dialect: SqlDialect): ParserLike {
   const existing = parserCache.get(dialect);
   if (existing) return existing;

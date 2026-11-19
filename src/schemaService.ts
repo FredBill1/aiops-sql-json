@@ -10,9 +10,10 @@ import {
   type SchemaPatternContext,
 } from './schemaPatterns';
 import { getResourceWorkspaceFolder } from './resourceContext';
+import type { SqlAnalysisProgress, SqlAnalysisRequest } from './sqlAnalysisProgress';
 import type { SchemaIssue, SchemaSnapshot } from './sqlSchemaCore';
 import { SqlServiceError, type SqlService } from './sqlService';
-import { sqlServiceFailureMessage } from './sqlServiceContext';
+import { sqlServiceFailureMessage, waitForSqlRequest } from './sqlServiceContext';
 
 const EMPTY_SCHEMA: SchemaSnapshot = { tables: [], issues: [] };
 
@@ -20,11 +21,14 @@ interface SchemaBuildResult {
   snapshot: SchemaSnapshot;
   sources?: readonly { uri: vscode.Uri; text: string }[];
   failure?: string;
+  cancelled?: boolean;
 }
 
 interface SchemaCacheEntry {
   generation: number;
   promise: Promise<SchemaBuildResult>;
+  request: SqlAnalysisRequest;
+  workerKey?: string;
   committed: boolean;
   failure?: SqlServiceError;
 }
@@ -53,7 +57,7 @@ export class SqlSchemaService implements vscode.Disposable {
   private readonly schemaFailures = new WeakMap<SchemaSnapshot, string>();
   private readonly workerSchemaKeys = new Set<string>();
 
-  constructor(private readonly sqlService: SqlService) {
+  constructor(private readonly sqlService: SqlService, private readonly progress: SqlAnalysisProgress) {
     this.disposables.push(
       sqlService.onDidRecover((event) => {
         if (event.lane !== 'analysis') return;
@@ -95,38 +99,42 @@ export class SqlSchemaService implements vscode.Disposable {
       && this.schemaGenerations.get(snapshot) === this.generation);
   }
 
+  getIndexKey(resource: vscode.Uri, configuration: ExtensionConfiguration): string | undefined {
+    return resolveSchemaIndex(resource, configuration)?.key;
+  }
+
+  isIndexPaused(resource: vscode.Uri, configuration: ExtensionConfiguration): boolean {
+    const key = this.getIndexKey(resource, configuration);
+    return key !== undefined && this.progress.isSchemaPaused(key);
+  }
+
+  async retryIndex(resource: vscode.Uri, configuration: ExtensionConfiguration): Promise<void> {
+    const key = this.getIndexKey(resource, configuration);
+    if (!key || !this.progress.isSchemaPaused(key)) return;
+    const previous = this.cache.get(key);
+    this.cache.delete(key);
+    if (previous?.workerKey) this.releaseUnusedWorkerSchema(previous.workerKey);
+    this.progress.resumeSchema(key);
+    await this.getSchema(resource, configuration, true);
+  }
+
   async getSchema(
     resource: vscode.Uri,
     configuration: ExtensionConfiguration,
     waitForFresh = false,
   ): Promise<SchemaSnapshot> {
-    if (!configuration.schemaValidationEnabled) {
-      return EMPTY_SCHEMA;
-    }
-    if (configuration.schemaFileGlobs.length === 0) {
-      return EMPTY_SCHEMA;
-    }
-    // Definition requests opt into the newest known generation. If a watched
-    // DDL change is still inside the debounce window, promote it immediately
-    // instead of returning a snapshot whose offsets are already known stale.
-    if (waitForFresh && this.invalidationTimer) {
-      this.beginGeneration();
-    }
-    const resolved = resolveSchemaPatterns(configuration.schemaFileGlobs, createPatternContext(resource));
+    const index = resolveSchemaIndex(resource, configuration);
+    if (!index) return EMPTY_SCHEMA;
+    const { resolved, key } = index;
     this.reportPatternIssues(
       resolved.issues,
       JSON.stringify({ schemaFiles: configuration.schemaFileGlobs }),
     );
-    if (resolved.patterns.length === 0) return EMPTY_SCHEMA;
-    const key = JSON.stringify({
-      dialect: configuration.dialect,
-      patterns: resolved.patterns.map((pattern) => ({
-        base: pattern.baseLocation,
-        glob: pattern.glob,
-      })),
-      udfs: configuration.udfs,
-      schemaDiagnostics: !configuration.schemaValidationCompletionOnly,
-    });
+    if (!key) return EMPTY_SCHEMA;
+    const fallback = this.lastGood.get(key) ?? EMPTY_SCHEMA;
+    if (this.progress.isSchemaPaused(key)) return waitForFresh && !this.isSchemaCurrent(fallback) ? EMPTY_SCHEMA : fallback;
+    // Promote a watched DDL change immediately when a caller needs current offsets.
+    if (waitForFresh && this.invalidationTimer) this.beginGeneration();
     let existing = this.cache.get(key);
     if (existing?.failure?.retryable && (existing.failure.retryAfter ?? 0) <= Date.now()) {
       this.cache.delete(key);
@@ -142,10 +150,15 @@ export class SqlSchemaService implements vscode.Disposable {
     for (const pattern of resolved.patterns) {
       this.ensureWatchers(pattern);
     }
-    const fallback = this.lastGood.get(key) ?? EMPTY_SCHEMA;
+    const request = this.progress.beginSchema(key, resource);
+    if (!request) return fallback;
     const entry: SchemaCacheEntry = {
       generation: this.generation,
-      promise: this.buildSchema(resolved.patterns, configuration, this.generation).catch((error: unknown) => {
+      request,
+      promise: waitForSqlRequest(Promise.resolve().then(() => (
+        this.buildSchema(resolved.patterns, configuration, entry)
+      )), request.cancellation).catch((error: unknown) => {
+        if (request.cancellation.isCancellationRequested) return { snapshot: fallback, cancelled: true };
         entry.failure = error instanceof SqlServiceError ? error : undefined;
         // A failed build is distinct from a successfully indexed empty Schema.
         const snapshot = { ...fallback };
@@ -157,7 +170,7 @@ export class SqlSchemaService implements vscode.Disposable {
         const failure = sqlServiceFailureMessage(error);
         this.schemaFailures.set(snapshot, failure);
         return { snapshot, failure };
-      }),
+      }).finally(() => request.finish()),
       committed: false,
     };
     this.cache.set(key, entry);
@@ -171,6 +184,10 @@ export class SqlSchemaService implements vscode.Disposable {
   async rebuild(requests: readonly SchemaRebuildRequest[]): Promise<void> {
     this.beginGeneration();
     const enabledRequests = requests.filter((request) => request.configuration.schemaValidationEnabled);
+    for (const { resource, configuration } of enabledRequests) {
+      const key = this.getIndexKey(resource, configuration);
+      if (key) this.progress.resumeSchema(key);
+    }
     while (true) {
       const rebuildGeneration = this.generation;
       await Promise.all(enabledRequests.map((request) => this.getSchema(
@@ -203,20 +220,28 @@ export class SqlSchemaService implements vscode.Disposable {
   private async buildSchema(
     patterns: readonly ResolvedSchemaPattern[],
     configuration: ExtensionConfiguration,
-    generation: number,
+    entry: SchemaCacheEntry,
   ): Promise<SchemaBuildResult> {
+    const { generation, request } = entry;
+    const checkCurrent = (): void => {
+      if (request.cancellation.isCancellationRequested || generation !== this.generation) {
+        throw new SqlServiceError('stale', 'SQL Schema build was superseded.');
+      }
+    };
     const uris = new Map<string, vscode.Uri>();
     for (const pattern of patterns) {
+      checkCurrent();
       const matches = await vscode.workspace.findFiles(new vscode.RelativePattern(
         uriFromLocation(pattern.baseLocation),
         pattern.glob,
-      ));
+      ), undefined, undefined, request.cancellation);
       for (const uri of matches) {
         if (uri.path.toLocaleLowerCase().endsWith('.sql')) {
           uris.set(uri.toString(), uri);
         }
       }
     }
+    checkCurrent();
     const parsed = await Promise.all([...uris.values()].sort((left, right) => (
       left.toString().localeCompare(right.toString())
     )).map(async (uri) => {
@@ -227,6 +252,7 @@ export class SqlSchemaService implements vscode.Disposable {
       const text = openDocument?.getText() ?? new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
       return { uri, text };
     }));
+    checkCurrent();
     const key = JSON.stringify({
       generation,
       dialect: configuration.dialect,
@@ -236,7 +262,7 @@ export class SqlSchemaService implements vscode.Disposable {
         hash: createHash('sha256').update(item.text).digest('hex'),
       })),
     });
-    if (generation !== this.generation) throw new Error('SQL Schema generation was superseded.');
+    entry.workerKey = key;
     this.workerSchemaKeys.add(key);
     let snapshot: SchemaSnapshot;
     try {
@@ -245,14 +271,13 @@ export class SqlSchemaService implements vscode.Disposable {
         parsed.map((item) => ({ source: item.uri.toString(), text: item.text })),
         configuration.dialect,
         configuration.udfs,
+        request,
       );
+      checkCurrent();
     } catch (error) {
-      this.releaseWorkerSchema(key);
+      entry.workerKey = undefined;
+      this.releaseUnusedWorkerSchema(key);
       throw error;
-    }
-    if (generation !== this.generation) {
-      this.releaseWorkerSchema(key);
-      throw new Error('SQL Schema generation was superseded.');
     }
     this.schemaKeys.set(snapshot, key);
     this.schemaGenerations.set(snapshot, generation);
@@ -271,16 +296,19 @@ export class SqlSchemaService implements vscode.Disposable {
     if (entry.generation !== this.generation || this.cache.get(key) !== entry) {
       return this.lastGood.get(key) ?? EMPTY_SCHEMA;
     }
+    if (result.cancelled) {
+      this.cache.delete(key);
+      if (entry.workerKey) this.releaseUnusedWorkerSchema(entry.workerKey);
+      this.changedEmitter.fire();
+      return result.snapshot;
+    }
     if (!entry.committed) {
       entry.committed = true;
       if (!result.failure) {
         const previous = this.lastGood.get(key);
         this.lastGood.set(key, result.snapshot);
         const previousKey = previous && this.schemaKeys.get(previous);
-        if (previousKey && previousKey !== this.schemaKeys.get(result.snapshot)
-          && ![...this.lastGood.values()].some((snapshot) => this.schemaKeys.get(snapshot) === previousKey)) {
-          this.releaseWorkerSchema(previousKey);
-        }
+        if (previousKey && previousKey !== this.schemaKeys.get(result.snapshot)) this.releaseUnusedWorkerSchema(previousKey);
       }
       if (result.sources) {
         for (const source of result.sources) {
@@ -418,9 +446,9 @@ export class SqlSchemaService implements vscode.Disposable {
       this.invalidationTimer = undefined;
     }
     this.generation += 1;
+    this.cancelBuilds();
     for (const key of this.workerSchemaKeys) this.sqlService.releaseSchema(key);
     this.workerSchemaKeys.clear();
-    this.cache.clear();
     this.lastGood.clear();
     this.schemaUris.clear();
     this.diagnosticContributions.clear();
@@ -437,17 +465,43 @@ export class SqlSchemaService implements vscode.Disposable {
       this.invalidationTimer = undefined;
     }
     this.generation += 1;
-    this.cache.clear();
+    this.cancelBuilds();
     const retained = new Set([...this.lastGood.values()].map((snapshot) => this.schemaKeys.get(snapshot)));
     for (const key of this.workerSchemaKeys) {
       if (!retained.has(key)) this.releaseWorkerSchema(key);
     }
   }
 
-  private releaseWorkerSchema(key: string): void {
-    this.workerSchemaKeys.delete(key);
-    this.sqlService.releaseSchema(key);
+  private cancelBuilds(): void {
+    const entries = [...this.cache.values()];
+    this.cache.clear();
+    for (const { request } of entries) request.cancel();
   }
+
+  private releaseUnusedWorkerSchema(key: string): void {
+    if ([...this.cache.values()].some((entry) => entry.workerKey === key)
+      || [...this.lastGood.values()].some((snapshot) => this.schemaKeys.get(snapshot) === key)) return;
+    this.releaseWorkerSchema(key);
+  }
+
+  private releaseWorkerSchema(key: string): void {
+    if (this.workerSchemaKeys.delete(key)) this.sqlService.releaseSchema(key);
+  }
+}
+
+function resolveSchemaIndex(resource: vscode.Uri, configuration: ExtensionConfiguration): {
+  resolved: ReturnType<typeof resolveSchemaPatterns>;
+  key?: string;
+} | undefined {
+  if (!configuration.schemaValidationEnabled || !configuration.schemaFileGlobs.length) return undefined;
+  const resolved = resolveSchemaPatterns(configuration.schemaFileGlobs, createPatternContext(resource));
+  const key = resolved.patterns.length ? JSON.stringify({
+    dialect: configuration.dialect,
+    patterns: resolved.patterns.map(({ baseLocation, glob }) => ({ base: baseLocation, glob })),
+    udfs: configuration.udfs,
+    schemaDiagnostics: !configuration.schemaValidationCompletionOnly,
+  }) : undefined;
+  return { resolved, key };
 }
 
 function positionAt(text: string, requestedOffset: number): vscode.Position {

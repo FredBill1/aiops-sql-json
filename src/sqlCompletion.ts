@@ -3,12 +3,13 @@ import * as vscode from 'vscode';
 import { getExtensionConfiguration } from './config';
 import type { JsonServiceManager } from './jsonService';
 import type { SqlSchemaService } from './schemaService';
+import type { SqlAnalysisProgress } from './sqlAnalysisProgress';
 import { formatSqlFunctionSignature } from './sqlFunctionSignatures';
 import { getSqlDocumentContext } from './sqlDocumentContext';
 import type { RelationBinding, SchemaTable } from './sqlSchemaCore';
 import type { SqlService } from './sqlService';
 import type { SqlCompletionResult } from './sqlWorkerProtocol';
-import { sqlDocumentSnapshot } from './sqlServiceContext';
+import { isSqlRequestCancelled, sqlDocumentSnapshot, waitForSqlRequest } from './sqlServiceContext';
 
 interface CompletionContext {
   allFieldNames: readonly string[];
@@ -20,6 +21,7 @@ export class SqlCompletionProvider implements vscode.CompletionItemProvider {
     private readonly jsonServices: JsonServiceManager,
     private readonly schemas: SqlSchemaService,
     private readonly sqlService: SqlService,
+    private readonly progress: SqlAnalysisProgress,
   ) {}
 
   async provideCompletionItems(
@@ -28,33 +30,41 @@ export class SqlCompletionProvider implements vscode.CompletionItemProvider {
     token: vscode.CancellationToken,
   ): Promise<vscode.CompletionList | undefined> {
     const configuration = getExtensionConfiguration(document.uri);
-    if (document.languageId === 'sql' && !configuration.plainSqlEnabled) {
+    if (token.isCancellationRequested || this.progress.isDocumentPaused(document)
+      || (document.languageId === 'sql' && !configuration.plainSqlEnabled)) {
       return undefined;
     }
     const documentContext = getSqlDocumentContext(document, position, this.jsonServices, configuration);
     if (!documentContext) return undefined;
+    const request = this.progress.beginDocument(document, token);
+    if (!request) return undefined;
     const version = document.version;
     const generation = this.sqlService.generation;
+    let outcome: 'ready' | 'failed' | undefined;
     try {
       const snapshot = sqlDocumentSnapshot(document, configuration, documentContext.sqlText, documentContext.regionKey);
-      const schema = await this.schemas.getSchema(document.uri, configuration);
-      if (token.isCancellationRequested || document.isClosed || document.version !== version
+      const schema = await waitForSqlRequest(this.schemas.getSchema(document.uri, configuration), request.cancellation);
+      if (request.cancellation.isCancellationRequested || document.isClosed || document.version !== version
         || this.sqlService.generation !== generation) return undefined;
       const result = await this.sqlService.completion(snapshot, documentContext.sqlOffset, {
         allSqlTexts: documentContext.allSqlTexts,
         schemaKey: this.schemas.getSchemaKey(schema),
         udfs: configuration.udfs,
-      }, token);
-      if (token.isCancellationRequested || document.isClosed || document.version !== version
+      }, request);
+      if (request.cancellation.isCancellationRequested || document.isClosed || document.version !== version
         || this.sqlService.generation !== generation) return undefined;
       const context: CompletionContext = {
         allFieldNames: result.fields,
         toDocumentRange: documentContext.toDocumentRange,
       };
       const completion = buildCompletionItems(context, configuration, result);
+      outcome = 'ready';
       return new vscode.CompletionList(completion.items, completion.prefix.length === 0);
-    } catch {
+    } catch (error) {
+      if (!isSqlRequestCancelled(error)) outcome = 'failed';
       return undefined;
+    } finally {
+      request.finish(outcome);
     }
   }
 
